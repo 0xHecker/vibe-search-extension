@@ -104,9 +104,7 @@ const Search = () => {
         combinedVectorArray.set(info.vector, i * VECTOR_DIMENSION);
       });
       setStatus("Embeddings generated. Writing to OPFS...");
-      opfsWorker.current?.postMessage({ type: "ADD_VECTORS", payload: combinedVectorArray }, [
-        combinedVectorArray.buffer,
-      ]);
+      opfsWorker.current?.postMessage({ type: "ADD_VECTORS", payload: combinedVectorArray });
     };
 
     opfsWorker.current.onmessage = handleWorkerMessage;

@@ -3,13 +3,17 @@ export class OpfsHandler {
   private fileHandle: FileSystemFileHandle | null = null;
   private accessHandle: FileSystemSyncAccessHandle | null = null;
 
-  async open(fileName: string) {
+  async open(fileName: string, truncate = false) {
     if (!self.navigator || !("storage" in self.navigator)) {
       throw new Error("OPFS is not available in this context.");
     }
     const root = await self.navigator.storage.getDirectory();
     this.fileHandle = await root.getFileHandle(fileName, { create: true });
     this.accessHandle = await this.fileHandle.createSyncAccessHandle();
+
+    if (truncate) {
+      this.accessHandle.truncate(0);
+    }
   }
 
   getSize(): number {
@@ -54,6 +58,23 @@ export class OpfsHandler {
       throw new Error("File not open");
     }
     this.accessHandle.flush();
+  }
+
+  truncate() {
+    if (!this.accessHandle) {
+      throw new Error("File not open");
+    }
+    this.accessHandle.truncate(0);
+  }
+
+  async deleteSelf() {
+    if (!this.fileHandle) {
+      throw new Error("File not open, cannot delete.");
+    }
+    const fileName = this.fileHandle.name;
+    this.close();
+    const root = await self.navigator.storage.getDirectory();
+    await root.removeEntry(fileName);
   }
 
   close() {

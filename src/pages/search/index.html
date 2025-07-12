@@ -1,0 +1,65 @@
+<html>
+  <head>
+    <title>Cooperhire</title>
+    <meta charset="UTF-8" />
+    <link rel="stylesheet" href="/src/assets/styles/tailwind.css" />
+  </head>
+  <body>
+    <div class="relative min-h-screen bg-black overflow-hidden">
+      <div class="absolute inset-0 bg-gradient"></div>
+      <div
+        class="absolute inset-0 opacity-70 mix-blend-overlay noise-overlay"
+      ></div>
+
+      <div class="relative flex min-h-screen flex-col">
+        <main class="flex-1">
+          <div class="container mx-auto px-4 py-16">
+            <div class="mb-12 text-center" style="width: 100%">
+              <h1 class="text-6xl font-bold tracking-tight text-white"></h1>
+              <p
+                class="mt-4 text-base text-white/60"
+                id="status-text"
+                style="font-size: 1.25rem"
+              >
+                Initializing...
+              </p>
+            </div>
+
+            <div class="mx-auto" style="max-width: 100%">
+              <div class="relative">
+                <svg
+                  class="search-icon"
+                  width="20"
+                  height="20"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="rgba(255,255,255,0.4)"
+                  stroke-width="2"
+                >
+                  <circle cx="11" cy="11" r="8"></circle>
+                  <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
+                </svg>
+                <input
+                  type="search"
+                  placeholder="search sentences..."
+                  id="search-input"
+                  class="search-input h-14 w-full rounded-full pl-12 pr-6 text-lg"
+                  style="width: 100%"
+                  disabled
+                />
+              </div>
+
+              <div class="mt-8" id="search-results">
+                <div class="tweet-grid">
+                  <!-- Search results will be inserted here -->
+                </div>
+                <div style="height: 100px"></div>
+              </div>
+            </div>
+          </div>
+        </main>
+      </div>
+    </div>
+    <script type="module" src="./index.tsx"></script>
+  </body>
+</html>

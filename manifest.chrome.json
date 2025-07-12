@@ -1,0 +1,7 @@
+{
+  "background": {
+    "service_worker": "src/workers/background.ts",
+    "type": "module"
+  },
+  "host_permissions": ["https://huggingface.co/*"]
+}

@@ -13,11 +13,13 @@
     "module": "esnext",
     "moduleResolution": "bundler",
     "resolveJsonModule": true,
+    "isolatedModules": true,
     "noEmit": true,
     "jsx": "react-jsx",
     "baseUrl": ".",
     "paths": {
       "@src/*": ["src/*"],
+      "@src": ["src"],
       "@assets/*": ["src/assets/*"],
       "@locales/*": ["src/locales/*"],
       "@pages/*": ["src/pages/*"]
@@ -29,5 +31,5 @@
     "vite.config.base.ts",
     "vite.config.chrome.ts",
     "vite.config.firefox.ts"
-  ],
+  ]
 }

@@ -1,14 +1,20 @@
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect } from "react";
 import { Card, CardContent, CardHeader, CardTitle } from "@src/components/ui/card";
 import { Button } from "@src/components/ui/button";
 import { VECTOR_DIMENSION } from "@src/common/constants";
 
-interface EmbeddingInfo {
-  sentence: string;
-  vector: number[]; // As sent from offscreen.ts
+// --- Base64 Conversion Utility ---
+function base64ToArrayBuffer(base64: string): ArrayBuffer {
+  const binary_string = window.atob(base64);
+  const len = binary_string.length;
+  const bytes = new Uint8Array(len);
+  for (let i = 0; i < len; i++) {
+    bytes[i] = binary_string.charCodeAt(i);
+  }
+  return bytes.buffer;
 }
 
-const sentencesForDisplay = [
+const initialSentences = [
   "The quick brown fox jumps over the lazy dog.",
   "A stitch in time saves nine.",
   "Actions speak louder than words.",
@@ -32,115 +38,102 @@ const sentencesForDisplay = [
 ];
 
 const Search = () => {
-  const [sentences, setSentences] = useState<string[]>(sentencesForDisplay);
+  const [sentences] = useState<string[]>(initialSentences);
   const [vectors, setVectors] = useState<Float32Array | null>(null);
-  const [status, setStatus] = useState("Initializing worker...");
-  const opfsWorker = useRef<Worker | null>(null);
+  const [status, setStatus] = useState("Initializing...");
+
+  const sendMessageToOffscreen = (message: any, callback: (response: any) => void) => {
+    chrome.runtime.sendMessage({ ...message, target: "offscreen" }, callback);
+  };
+
+  const handleOffscreenResponse = (response: any) => {
+    if (!response || !response.success) {
+      setStatus(`Error: ${response?.error || "Unknown error from offscreen document"}`);
+      return;
+    }
+
+    const { type, payload, count } = response;
+
+    switch (type) {
+      case "GET_VECTOR_COUNT_COMPLETE":
+        if (count === 0) {
+          setStatus("No vectors found. Generating new embeddings...");
+          sendMessageToOffscreen(
+            { type: "GENERATE_EMBEDDINGS", payload: { sentences: initialSentences } },
+            handleOffscreenResponse
+          );
+        } else {
+          setStatus(`Found ${count} existing vectors. Loading...`);
+          sendMessageToOffscreen({ type: "GET_ALL_VECTORS" }, handleOffscreenResponse);
+        }
+        break;
+      case "ADD_VECTORS_COMPLETE":
+        setStatus(`${count} vectors stored securely in OPFS. Loading...`);
+        sendMessageToOffscreen({ type: "GET_ALL_VECTORS" }, handleOffscreenResponse);
+        break;
+      case "GET_ALL_VECTORS_COMPLETE":
+        if (payload) {
+          const buffer = base64ToArrayBuffer(payload);
+          setVectors(new Float32Array(buffer));
+          const vectorCount = buffer.byteLength / 4 / VECTOR_DIMENSION;
+          setStatus(`Displaying ${vectorCount} vectors from OPFS.`);
+        } else {
+          setStatus("Could not load vectors.");
+        }
+        break;
+      case "CLEAR_COMPLETE":
+        setStatus("Storage cleared. Reloading...");
+        window.location.reload();
+        break;
+      case "DOWNLOAD_COMPLETE":
+        if (payload) {
+          const blob = new Blob([payload], { type: "application/octet-stream" });
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement("a");
+          a.href = url;
+          a.download = "vectors.bin";
+          document.body.appendChild(a);
+          a.click();
+          document.body.removeChild(a);
+          URL.revokeObjectURL(url);
+          setStatus("Download complete.");
+        } else {
+          setStatus("No file to download.");
+        }
+        break;
+    }
+  };
 
   useEffect(() => {
-    opfsWorker.current = new Worker(new URL("@src/workers/opfs.worker.ts", import.meta.url), {
-      type: "module",
-    });
-
-    const handleWorkerMessage = (event: MessageEvent) => {
-      const { success, type, payload, error, count } = event.data;
-      if (!success) {
-        setStatus(`Worker error: ${error}`);
-        return;
-      }
-
-      switch (type) {
-        case "GET_VECTOR_COUNT_COMPLETE":
-          if (count === 0) {
-            setStatus("No vectors found. Generating new embeddings...");
-            chrome.runtime.sendMessage(
-              { type: "INITIALIZE", target: "offscreen" },
-              handleOffscreenResponse
-            );
-          } else {
-            setStatus(`Found ${count} existing vectors. Loading...`);
-            opfsWorker.current?.postMessage({ type: "GET_ALL_VECTORS" });
-          }
-          break;
-        case "ADD_VECTORS_COMPLETE":
-          setStatus(`${count} vectors stored securely in OPFS. Loading...`);
-          opfsWorker.current?.postMessage({ type: "GET_ALL_VECTORS" });
-          break;
-        case "GET_ALL_VECTORS_COMPLETE":
-          setVectors(new Float32Array(payload));
-          const vectorCount = payload.byteLength / 4 / VECTOR_DIMENSION;
-          setStatus(`Displaying ${vectorCount} vectors from OPFS.`);
-          break;
-        case "CLEAR_COMPLETE":
-          setStatus("Storage cleared. Reloading...");
-          window.location.reload();
-          break;
-        case "DOWNLOAD_COMPLETE":
-          if (payload) {
-            const blob = new Blob([payload], { type: "application/octet-stream" });
-            const url = URL.createObjectURL(blob);
-            const a = document.createElement("a");
-            a.href = url;
-            a.download = "vectors.bin";
-            document.body.appendChild(a);
-            a.click();
-            document.body.removeChild(a);
-            URL.revokeObjectURL(url);
-          } else {
-            setStatus("No file to download.");
-          }
-          break;
-      }
-    };
-
-    const handleOffscreenResponse = (response: any) => {
-      if (!response || !response.success) {
-        setStatus(`Initialization failed: ${response?.error || "Unknown error"}`);
-        return;
-      }
-      const embeddingInfos: EmbeddingInfo[] = response.payload;
-      const combinedVectorArray = new Float32Array(embeddingInfos.length * VECTOR_DIMENSION);
-      embeddingInfos.forEach((info, i) => {
-        combinedVectorArray.set(info.vector, i * VECTOR_DIMENSION);
-      });
-      setStatus("Embeddings generated. Writing to OPFS...");
-      opfsWorker.current?.postMessage({ type: "ADD_VECTORS", payload: combinedVectorArray });
-    };
-
-    opfsWorker.current.onmessage = handleWorkerMessage;
-
     // Start the process by checking the vector count
-    opfsWorker.current.postMessage({ type: "GET_VECTOR_COUNT" });
-
-    return () => {
-      opfsWorker.current?.terminate();
-    };
+    sendMessageToOffscreen({ type: "GET_VECTOR_COUNT" }, handleOffscreenResponse);
   }, []);
 
   const handleClear = () => {
     setStatus("Clearing storage...");
-    opfsWorker.current?.postMessage({ type: "CLEAR_STORAGE" });
+    sendMessageToOffscreen({ type: "CLEAR_STORAGE" }, handleOffscreenResponse);
   };
 
   const handleDownload = () => {
-    opfsWorker.current?.postMessage({ type: "DOWNLOAD_FILE" });
+    setStatus("Requesting file for download...");
+    sendMessageToOffscreen({ type: "DOWNLOAD_FILE" }, handleOffscreenResponse);
   };
 
   const renderVectorList = () => {
     if (!vectors || vectors.length === 0) {
-      return <p>No vectors to display.</p>;
+      return <p className="text-white/60">No vectors to display.</p>;
     }
     const numVectors = vectors.length / VECTOR_DIMENSION;
     return (
-      <ul className="mt-4">
+      <ul className="mt-4 space-y-2">
         {Array.from({ length: numVectors }).map((_, i) => {
           const sentence = sentences[i] || `Vector ${i + 1}`;
           const vectorSlice = vectors.subarray(i * VECTOR_DIMENSION, (i + 1) * VECTOR_DIMENSION);
           return (
-            <li key={i} className="border-b p-2">
-              <p className="font-bold">{sentence}</p>
-              <p className="text-sm text-gray-500 truncate">
-                Vector (first 100): [{Array.from(vectorSlice.slice(0, 100)).join(", ")}]
+            <li key={i} className="rounded-lg border border-white/10 bg-white/5 p-3">
+              <p className="font-bold text-white">{sentence}</p>
+              <p className="truncate text-sm text-white/50">
+                [{Array.from(vectorSlice.slice(0, 10)).join(", ")}...]
               </p>
             </li>
           );
@@ -151,21 +144,21 @@ const Search = () => {
 
   return (
     <div className="container mx-auto p-4">
-      <Card>
+      <Card className="border-white/10 bg-transparent text-white">
         <CardHeader>
-          <CardTitle>Binary Vector Store</CardTitle>
+          <CardTitle>OPFS Vector Store</CardTitle>
         </CardHeader>
         <CardContent>
-          <div className="flex justify-between items-center mb-4">
-            <p>{status}</p>
+          <div className="mb-4 flex items-center justify-between">
+            <p className="text-white/80">{status}</p>
             <div className="flex gap-2">
-              <Button onClick={handleDownload}>Download .bin File</Button>
+              <Button onClick={handleDownload}>Download .bin</Button>
               <Button variant="destructive" onClick={handleClear}>
                 Clear Storage
               </Button>
             </div>
           </div>
-          {renderVectorList()}
+          <div className="max-h-[60vh] overflow-y-auto pr-2">{renderVectorList()}</div>
         </CardContent>
       </Card>
     </div>

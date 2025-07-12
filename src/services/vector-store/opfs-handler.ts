@@ -1,87 +1,73 @@
-// Low-level OPFS file I/O
+// Low-level OPFS file I/O using ASYNCHRONOUS methods
 export class OpfsHandler {
   private fileHandle: FileSystemFileHandle | null = null;
-  private accessHandle: FileSystemSyncAccessHandle | null = null;
+  private fileName: string | null = null;
 
-  async open(fileName: string, truncate = false) {
+  async open(fileName: string, truncate = false): Promise<void> {
     if (!self.navigator || !("storage" in self.navigator)) {
       throw new Error("OPFS is not available in this context.");
     }
+    this.fileName = fileName;
     const root = await self.navigator.storage.getDirectory();
     this.fileHandle = await root.getFileHandle(fileName, { create: true });
-    this.accessHandle = await this.fileHandle.createSyncAccessHandle();
 
     if (truncate) {
-      this.accessHandle.truncate(0);
+      await this.truncate();
     }
   }
 
-  getSize(): number {
-    if (!this.accessHandle) {
-      throw new Error("File not open");
-    }
-    return this.accessHandle.getSize();
-  }
-
-  read(buffer: ArrayBuffer | SharedArrayBuffer, offset: number) {
-    if (!this.accessHandle) {
-      throw new Error("File not open");
-    }
-    // OPFS only works with ArrayBuffer, so we might need to copy
-    if (buffer instanceof SharedArrayBuffer) {
-      const tempBuffer = new ArrayBuffer(buffer.byteLength);
-      this.accessHandle.read(tempBuffer, { at: offset });
-      const tempView = new Uint8Array(tempBuffer);
-      const sharedView = new Uint8Array(buffer);
-      sharedView.set(tempView);
-    } else {
-      this.accessHandle.read(buffer, { at: offset });
-    }
-  }
-
-  write(buffer: ArrayBuffer | SharedArrayBuffer, offset: number) {
-    if (!this.accessHandle) {
-      throw new Error("File not open");
-    }
-    if (buffer instanceof SharedArrayBuffer) {
-      // Create a non-shared copy for writing
-      const writeBuffer = new ArrayBuffer(buffer.byteLength);
-      new Uint8Array(writeBuffer).set(new Uint8Array(buffer));
-      this.accessHandle.write(writeBuffer, { at: offset });
-    } else {
-      this.accessHandle.write(buffer, { at: offset });
-    }
-  }
-
-  flush() {
-    if (!this.accessHandle) {
-      throw new Error("File not open");
-    }
-    this.accessHandle.flush();
-  }
-
-  truncate() {
-    if (!this.accessHandle) {
-      throw new Error("File not open");
-    }
-    this.accessHandle.truncate(0);
-  }
-
-  async deleteSelf() {
+  async getSize(): Promise<number> {
     if (!this.fileHandle) {
-      throw new Error("File not open, cannot delete.");
+      throw new Error("File not open");
     }
-    const fileName = this.fileHandle.name;
-    this.close();
-    const root = await self.navigator.storage.getDirectory();
-    await root.removeEntry(fileName);
+    const file = await this.fileHandle.getFile();
+    return file.size;
   }
 
-  close() {
-    if (this.accessHandle) {
-      this.accessHandle.close();
-      this.accessHandle = null;
-      this.fileHandle = null;
+  async read(buffer: ArrayBuffer, offset: number): Promise<void> {
+    if (!this.fileHandle) {
+      throw new Error("File not open");
     }
+    const file = await this.fileHandle.getFile();
+    const slice = file.slice(offset, offset + buffer.byteLength);
+    const readBuffer = await slice.arrayBuffer();
+    new Uint8Array(buffer).set(new Uint8Array(readBuffer));
+  }
+
+  async write(buffer: ArrayBuffer, offset: number): Promise<void> {
+    if (!this.fileHandle) {
+      throw new Error("File not open");
+    }
+    const writable = await this.fileHandle.createWritable({ keepExistingData: true });
+    await writable.write({ type: "write", position: offset, data: buffer });
+    await writable.close();
+  }
+
+  async truncate(size = 0): Promise<void> {
+    if (!this.fileHandle) {
+      throw new Error("File not open");
+    }
+    const writable = await this.fileHandle.createWritable();
+    await writable.truncate(size);
+    await writable.close();
+  }
+
+  async deleteSelf(): Promise<void> {
+    if (!this.fileHandle || !this.fileName) {
+      // If there's no handle, there's nothing to do.
+      return;
+    }
+    // Store the name, then release the handle FIRST.
+    const fileNameToDelete = this.fileName;
+    this.fileHandle = null;
+    this.fileName = null;
+
+    const root = await self.navigator.storage.getDirectory();
+    await root.removeEntry(fileNameToDelete);
+  }
+
+  close(): void {
+    this.fileHandle = null;
+    this.fileName = null;
   }
 }

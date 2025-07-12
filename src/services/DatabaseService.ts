@@ -1,11 +1,4 @@
-import {
-  createRxDatabase,
-  addRxPlugin,
-  RxDatabase,
-  RxCollection,
-  RxStorage,
-  removeRxDatabase,
-} from "rxdb";
+import { createRxDatabase, addRxPlugin, RxDatabase, RxCollection, RxStorage } from "rxdb";
 import { getRxStorageDexie } from "rxdb/plugins/storage-dexie";
 import { RxDBDevModePlugin } from "rxdb/plugins/dev-mode";
 import { wrappedValidateZSchemaStorage } from "rxdb/plugins/validate-z-schema";
@@ -21,14 +14,8 @@ import { itemSchema, ItemDocType } from "@src/schemas/item_schema";
 import { folderSchema, FolderDocType } from "@src/schemas/folder_schema";
 import { tagSchema, TagDocType } from "@src/schemas/tag_schema";
 import { itemTagSchema, ItemTagDocType } from "@src/schemas/item_tag_schema";
-import {
-  searchHistorySchema,
-  SearchHistoryDocType,
-} from "@src/schemas/search_history_schema";
-import {
-  flashcardSchema,
-  FlashcardDocType,
-} from "@src/schemas/flashcard_schema";
+import { searchHistorySchema, SearchHistoryDocType } from "@src/schemas/search_history_schema";
+import { flashcardSchema, FlashcardDocType } from "@src/schemas/flashcard_schema";
 
 // Define collection types
 export type ItemCollection = RxCollection<ItemDocType>;

@@ -1,6 +1,7 @@
 import { useState, useEffect } from "react";
 import { Card, CardContent, CardHeader, CardTitle } from "@src/components/ui/card";
 import { Button } from "@src/components/ui/button";
+import { Input } from "@src/components/ui/input";
 import { VECTOR_DIMENSION } from "@src/common/constants";
 
 // --- Base64 Conversion Utility ---
@@ -37,13 +38,23 @@ const initialSentences = [
   "Where there's a will, there's a way.",
 ];
 
+interface SearchResult {
+  index: number;
+  score: number;
+}
+
 const Search = () => {
   const [sentences] = useState<string[]>(initialSentences);
   const [vectors, setVectors] = useState<Float32Array | null>(null);
   const [status, setStatus] = useState("Initializing...");
+  const [searchQuery, setSearchQuery] = useState("");
+  const [searchResults, setSearchResults] = useState<SearchResult[]>([]);
 
-  const sendMessageToOffscreen = (message: any, callback: (response: any) => void) => {
-    chrome.runtime.sendMessage({ ...message, target: "offscreen" }, callback);
+  const callService = (service: string, type: string, payload?: any) => {
+    chrome.runtime.sendMessage(
+      { service, type, payload, target: "offscreen" },
+      handleOffscreenResponse
+    );
   };
 
   const handleOffscreenResponse = (response: any) => {
@@ -52,26 +63,23 @@ const Search = () => {
       return;
     }
 
-    const { type, payload, count } = response;
+    const { type, payload } = response;
 
     switch (type) {
-      case "GET_VECTOR_COUNT_COMPLETE":
-        if (count === 0) {
+      case "vectorStore_getVectorCount_COMPLETE":
+        if (payload === 0) {
           setStatus("No vectors found. Generating new embeddings...");
-          sendMessageToOffscreen(
-            { type: "GENERATE_EMBEDDINGS", payload: { sentences: initialSentences } },
-            handleOffscreenResponse
-          );
+          callService("vectorStore", "generateAndStoreEmbeddings", { sentences: initialSentences });
         } else {
-          setStatus(`Found ${count} existing vectors. Loading...`);
-          sendMessageToOffscreen({ type: "GET_ALL_VECTORS" }, handleOffscreenResponse);
+          setStatus(`Found ${payload} existing vectors. Loading...`);
+          callService("vectorStore", "getAllVectors");
         }
         break;
-      case "ADD_VECTORS_COMPLETE":
-        setStatus(`${count} vectors stored securely in OPFS. Loading...`);
-        sendMessageToOffscreen({ type: "GET_ALL_VECTORS" }, handleOffscreenResponse);
+      case "vectorStore_generateAndStoreEmbeddings_COMPLETE":
+        setStatus(`${payload} vectors stored securely in OPFS. Loading...`);
+        callService("vectorStore", "getAllVectors");
         break;
-      case "GET_ALL_VECTORS_COMPLETE":
+      case "vectorStore_getAllVectors_COMPLETE":
         if (payload) {
           const buffer = base64ToArrayBuffer(payload);
           setVectors(new Float32Array(buffer));
@@ -81,13 +89,17 @@ const Search = () => {
           setStatus("Could not load vectors.");
         }
         break;
-      case "CLEAR_COMPLETE":
+      case "vectorStore_search_COMPLETE":
+        setSearchResults(payload);
+        break;
+      case "vectorStore_clearStorage_COMPLETE":
         setStatus("Storage cleared. Reloading...");
         window.location.reload();
         break;
-      case "DOWNLOAD_COMPLETE":
+      case "vectorStore_downloadFile_COMPLETE":
         if (payload) {
-          const blob = new Blob([payload], { type: "application/octet-stream" });
+          const buffer = base64ToArrayBuffer(payload);
+          const blob = new Blob([buffer], { type: "application/octet-stream" });
           const url = URL.createObjectURL(blob);
           const a = document.createElement("a");
           a.href = url;
@@ -105,36 +117,56 @@ const Search = () => {
   };
 
   useEffect(() => {
-    // Start the process by checking the vector count
-    sendMessageToOffscreen({ type: "GET_VECTOR_COUNT" }, handleOffscreenResponse);
+    callService("vectorStore", "getVectorCount");
   }, []);
+
+  // Debounced search effect
+  useEffect(() => {
+    if (!vectors || !searchQuery) {
+      setSearchResults([]);
+      return;
+    }
+    const handler = setTimeout(() => {
+      callService("vectorStore", "search", { query: searchQuery, topK: 5 });
+    }, 300);
+    return () => clearTimeout(handler);
+  }, [searchQuery, vectors]);
 
   const handleClear = () => {
     setStatus("Clearing storage...");
-    sendMessageToOffscreen({ type: "CLEAR_STORAGE" }, handleOffscreenResponse);
+    callService("vectorStore", "clearStorage");
   };
 
   const handleDownload = () => {
     setStatus("Requesting file for download...");
-    sendMessageToOffscreen({ type: "DOWNLOAD_FILE" }, handleOffscreenResponse);
+    callService("vectorStore", "downloadFile");
   };
 
-  const renderVectorList = () => {
-    if (!vectors || vectors.length === 0) {
-      return <p className="text-white/60">No vectors to display.</p>;
+  const renderResults = () => {
+    const items = searchQuery
+      ? searchResults
+      : vectors
+      ? initialSentences.map((_, i) => ({ index: i, score: 1 }))
+      : [];
+
+    if (items.length === 0) {
+      return (
+        <p className="text-white/60">
+          {searchQuery ? `No results for "${searchQuery}"` : "Loading vectors..."}
+        </p>
+      );
     }
-    const numVectors = vectors.length / VECTOR_DIMENSION;
+
     return (
       <ul className="mt-4 space-y-2">
-        {Array.from({ length: numVectors }).map((_, i) => {
-          const sentence = sentences[i] || `Vector ${i + 1}`;
-          const vectorSlice = vectors.subarray(i * VECTOR_DIMENSION, (i + 1) * VECTOR_DIMENSION);
+        {items.map((result) => {
+          const sentence = sentences[result.index];
           return (
-            <li key={i} className="rounded-lg border border-white/10 bg-white/5 p-3">
+            <li key={result.index} className="rounded-lg border border-white/10 bg-white/5 p-3">
               <p className="font-bold text-white">{sentence}</p>
-              <p className="truncate text-sm text-white/50">
-                [{Array.from(vectorSlice.slice(0, 10)).join(", ")}...]
-              </p>
+              {searchQuery && (
+                <p className="text-sm text-green-400">Score: {result.score.toFixed(4)}</p>
+              )}
             </li>
           );
         })}
@@ -146,7 +178,7 @@ const Search = () => {
     <div className="container mx-auto p-4">
       <Card className="border-white/10 bg-transparent text-white">
         <CardHeader>
-          <CardTitle>OPFS Vector Store</CardTitle>
+          <CardTitle>Semantic Search</CardTitle>
         </CardHeader>
         <CardContent>
           <div className="mb-4 flex items-center justify-between">
@@ -158,7 +190,17 @@ const Search = () => {
               </Button>
             </div>
           </div>
-          <div className="max-h-[60vh] overflow-y-auto pr-2">{renderVectorList()}</div>
+          <div className="relative">
+            <Input
+              type="search"
+              placeholder="Search for a concept..."
+              className="h-12 w-full text-lg"
+              value={searchQuery}
+              onChange={(e) => setSearchQuery(e.target.value)}
+              disabled={!vectors}
+            />
+          </div>
+          <div className="max-h-[60vh] overflow-y-auto pr-2">{renderResults()}</div>
         </CardContent>
       </Card>
     </div>

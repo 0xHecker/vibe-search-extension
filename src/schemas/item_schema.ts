@@ -38,13 +38,13 @@ export type ItemDocType = {
   serverVersion: number;
   createdAt: number;
   updatedAt: number;
+  deletedAt: number;
 };
 
 export const itemSchema: RxJsonSchema<ItemDocType> = {
   title: "item schema",
   version: 0,
-  description:
-    "Describes a single saved item (bookmark, note, social media post)",
+  description: "Describes a single saved item (bookmark, note, social media post)",
   primaryKey: "id",
   type: "object",
   properties: {
@@ -93,7 +93,7 @@ export const itemSchema: RxJsonSchema<ItemDocType> = {
       },
     },
     // Content Chunking
-    parentId: { type: "string", ref: "items", default: null, maxLength: 100 },
+    parentId: { type: ["string", "null"], ref: "items", default: null, maxLength: 100 },
     chunkOrder: { type: "number" },
     vector_index: {
       type: "number",
@@ -118,6 +118,13 @@ export const itemSchema: RxJsonSchema<ItemDocType> = {
       maximum: Number.MAX_SAFE_INTEGER - 1,
       multipleOf: 1,
     },
+    deletedAt: {
+      type: "number",
+      default: 0,
+      multipleOf: 1,
+      minimum: 0,
+      maximum: Number.MAX_SAFE_INTEGER - 1,
+    },
   },
   required: [
     "id",
@@ -130,7 +137,7 @@ export const itemSchema: RxJsonSchema<ItemDocType> = {
     "folderId",
     "vector_index",
     "userId",
-    "parentId",
+    "deletedAt",
   ],
   indexes: [
     "createdAt",
@@ -141,8 +148,8 @@ export const itemSchema: RxJsonSchema<ItemDocType> = {
     "isEmbedded",
     "isDirty",
     "userId",
-    "parentId",
     "vector_index",
+    "deletedAt",
   ],
   attachments: {},
 };

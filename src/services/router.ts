@@ -46,7 +46,8 @@ export class OffscreenRouter {
         }
 
         try {
-          const result = await method(payload);
+          // Use .call() to ensure the 'this' context is correctly bound to the service instance
+          const result = await method.call(targetService, payload);
           sendResponse({ success: true, type: `${service}_${type}_COMPLETE`, payload: result });
         } catch (e) {
           const error = e instanceof Error ? e.message : "An unknown error occurred";

@@ -25,21 +25,50 @@ async function setupOffscreenDocument(path: string) {
   }
 }
 
+// --- Periodic Sync Alarm ---
+const SYNC_ALARM_NAME = "vector-sync-alarm";
+
+// Create the alarm when the extension is installed or updated.
+chrome.runtime.onInstalled.addListener(() => {
+  chrome.alarms.create(SYNC_ALARM_NAME, {
+    periodInMinutes: 6 * 60, // Run every 6 hours
+  });
+});
+
+// Listen for the alarm and send a message to the offscreen document to trigger the sync.
+chrome.alarms.onAlarm.addListener((alarm) => {
+  if (alarm.name === SYNC_ALARM_NAME) {
+    console.log("Periodic sync alarm triggered. Sending message to offscreen document.");
+    (async () => {
+      await setupOffscreenDocument(OFFSCREEN_DOCUMENT_PATH);
+      chrome.runtime.sendMessage({
+        service: "sync",
+        type: "rebuildAndCompact",
+        target: "offscreen",
+        isForwarded: true,
+      });
+    })();
+  }
+});
+
 // The main message handler for the background script
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-  // Do not process messages that are not targeted for the offscreen document.
-  if (message.target !== "offscreen") {
+  // Ignore messages that are not targeted for the offscreen document or that have already been forwarded.
+  if (message.target !== "offscreen" || message.isForwarded) {
     return;
-  }
-
-  // This is a forwarded message that the offscreen document should handle.
-  // We can resolve the promise with `undefined` to avoid a warning.
-  if (message.isForwarded) {
-    return Promise.resolve(undefined);
   }
 
   (async () => {
     try {
+      // In development, ensure the offscreen document is fresh so updated services are available
+      try {
+        if ((import.meta as any)?.env?.MODE === "development") {
+          await (chrome.offscreen as any).closeDocument?.();
+        }
+      } catch (e) {
+        // ignore if not supported
+      }
+
       await setupOffscreenDocument(OFFSCREEN_DOCUMENT_PATH);
 
       // Forward the message to the offscreen document and await the response.

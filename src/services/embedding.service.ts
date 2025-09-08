@@ -25,22 +25,21 @@ class EmbeddingService {
 
   public generateEmbeddings = async (payload: { sentences: string[] }): Promise<Float32Array> => {
     const { sentences } = payload;
+    if (sentences.length === 0) {
+      return new Float32Array();
+    }
     const embeddingPipeline = await this.initialize();
 
-    console.log(`Embedding ${sentences.length} sentences...`);
-    const combinedVectorArray = new Float32Array(sentences.length * VECTOR_DIMENSION);
+    console.log(`Embedding a batch of ${sentences.length} sentences...`);
 
-    for (let i = 0; i < sentences.length; i++) {
-      const sentence = sentences[i];
-      const embedding = await embeddingPipeline(sentence, {
-        pooling: "mean",
-        normalize: true,
-      });
-      combinedVectorArray.set(embedding.data as Float32Array, i * VECTOR_DIMENSION);
-    }
+    const embeddings = await embeddingPipeline(sentences, {
+      pooling: "mean",
+      normalize: true,
+    });
 
     console.log("Embeddings generated.");
-    return combinedVectorArray;
+    // The result is a single Tensor, so we can just return its data.
+    return embeddings.data as Float32Array;
   };
 }
 

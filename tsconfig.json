@@ -33,6 +33,12 @@
       "@src": [
         "src"
       ],
+      "@components/*": [
+        "src/components/*"
+      ],
+      "@icons/*": [
+        "src/components/icons/*"
+      ],
       "@assets/*": [
         "src/assets/*"
       ],

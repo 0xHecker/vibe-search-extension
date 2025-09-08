@@ -25,7 +25,7 @@ export const folderSchema: RxJsonSchema<FolderDocType> = {
     userId: { type: "string", default: null, maxLength: 1000 },
     name: { type: "string" },
     parentId: {
-      type: "string",
+      type: ["string", "null"],
       ref: "folders",
       default: null,
       maxLength: 1000,
@@ -56,15 +56,6 @@ export const folderSchema: RxJsonSchema<FolderDocType> = {
       multipleOf: 1,
     },
   },
-  required: [
-    "id",
-    "name",
-    "type",
-    "createdAt",
-    "updatedAt",
-    "isDirty",
-    "parentId",
-    "userId",
-  ],
-  indexes: ["parentId", "isDirty", "userId", "type"],
+  required: ["id", "name", "type", "createdAt", "updatedAt", "isDirty", "parentId", "userId"],
+  indexes: ["isDirty", "userId", "type"],
 };

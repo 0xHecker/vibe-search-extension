@@ -24,6 +24,7 @@ class VectorStoreService {
   private opfsHandler = new OpfsHandler();
   private isInitialized = false;
   private generationPromise: Promise<any> | null = null;
+  private lockPromise: Promise<any> = Promise.resolve();
 
   // Vector file properties
   private vectorBuffer: ArrayBuffer | null = null;
@@ -49,17 +50,25 @@ class VectorStoreService {
     );
   }
 
-  private async createNewVectorFile(): Promise<void> {
-    console.log("Creating new vector file.");
-    this.vectorCount = 0;
+  public async createNewVectorFile(fileName = "vectors.bin"): Promise<void> {
+    console.log(`Creating new vector file: ${fileName}`);
+    const opfsHandler = new OpfsHandler();
+    await opfsHandler.open(fileName, true); // Truncate if exists
+
     const header = new ArrayBuffer(this.HEADER_SIZE);
     const headerView = new DataView(header);
     headerView.setUint32(0, this.MAGIC_NUMBER, true);
     headerView.setUint32(4, this.VERSION, true);
     headerView.setUint32(8, VECTOR_DIMENSION, true);
-    headerView.setUint32(12, this.vectorCount, true);
-    await this.opfsHandler.write(header, 0);
-    this.vectorBuffer = new ArrayBuffer(0);
+    headerView.setUint32(12, 0, true); // Always 0 for a new file
+    await opfsHandler.write(header, 0);
+    opfsHandler.close();
+
+    // If we are creating the main file, reset the in-memory state
+    if (fileName === "vectors.bin") {
+      this.vectorCount = 0;
+      this.vectorBuffer = new ArrayBuffer(0);
+    }
   }
 
   private async loadVectorFile(fileSize: number): Promise<void> {
@@ -88,30 +97,51 @@ class VectorStoreService {
     }
   }
 
+  private async withLock<T>(fn: () => Promise<T>): Promise<T> {
+    const run = async () => {
+      try {
+        return await fn();
+      } finally {
+        this.lockPromise = Promise.resolve();
+      }
+    };
+    const p = this.lockPromise.then(run, run);
+    this.lockPromise = p;
+    return p;
+  }
+
+  /**
+   * Appends a new set of vectors to the end of the `vectors.bin` file.
+   * This is an "append-only" operation, used for adding new or updated items
+   * quickly without rebuilding the entire file. This operation is protected by a lock
+   * to prevent race conditions with the rebuild process.
+   */
   private async addVectors(newVectorsBuffer: Float32Array): Promise<void> {
-    if (!this.vectorBuffer) throw new Error("Vector buffer not initialized.");
+    return this.withLock(async () => {
+      if (!this.vectorBuffer) throw new Error("Vector buffer not initialized.");
 
-    const newVectorCount = newVectorsBuffer.length / VECTOR_DIMENSION;
-    const appendOffset = this.HEADER_SIZE + this.vectorBuffer.byteLength;
-    await this.opfsHandler.write(newVectorsBuffer.buffer as ArrayBuffer, appendOffset);
+      const newVectorCount = newVectorsBuffer.length / VECTOR_DIMENSION;
+      const appendOffset = this.HEADER_SIZE + this.vectorBuffer.byteLength;
+      await this.opfsHandler.write(newVectorsBuffer.buffer as ArrayBuffer, appendOffset);
 
-    const newTotalCount = this.vectorCount + newVectorCount;
-    const countBuffer = new ArrayBuffer(4);
-    new DataView(countBuffer).setUint32(0, newTotalCount, true);
-    await this.opfsHandler.write(countBuffer, 12);
+      const newTotalCount = this.vectorCount + newVectorCount;
+      const countBuffer = new ArrayBuffer(4);
+      new DataView(countBuffer).setUint32(0, newTotalCount, true);
+      await this.opfsHandler.write(countBuffer, 12);
 
-    // Update in-memory cache
-    const newCacheBuffer = new ArrayBuffer(
-      this.vectorBuffer.byteLength + newVectorsBuffer.byteLength
-    );
-    new Uint8Array(newCacheBuffer).set(new Uint8Array(this.vectorBuffer));
-    new Uint8Array(newCacheBuffer).set(
-      new Uint8Array(newVectorsBuffer.buffer),
-      this.vectorBuffer.byteLength
-    );
+      // Update in-memory cache
+      const newCacheBuffer = new ArrayBuffer(
+        this.vectorBuffer.byteLength + newVectorsBuffer.byteLength
+      );
+      new Uint8Array(newCacheBuffer).set(new Uint8Array(this.vectorBuffer));
+      new Uint8Array(newCacheBuffer).set(
+        new Uint8Array(newVectorsBuffer.buffer),
+        this.vectorBuffer.byteLength
+      );
 
-    this.vectorBuffer = newCacheBuffer;
-    this.vectorCount = newTotalCount;
+      this.vectorBuffer = newCacheBuffer;
+      this.vectorCount = newTotalCount;
+    });
   }
 
   // --- Public Service Methods ---
@@ -161,6 +191,89 @@ class VectorStoreService {
       });
     }
     return this.generationPromise;
+  };
+
+  /**
+   * Rebuilds the vector store from scratch. It re-embeds dirty items and copies
+   * vectors for clean items into a new, compacted file. This is a key part of the
+   * garbage collection process. This operation is protected by a lock to prevent
+   * race conditions with the append-only `addVectors` operation.
+   */
+  public rebuildVectors = async (
+    destFile: string,
+    dirtyItems: { id: string; textContent: string }[],
+    cleanItems: { id: string; vector_index: number }[]
+  ): Promise<{ newIndexMap: { id: string; vector_index: number }[] }> => {
+    return this.withLock(async () => {
+      const destOpfs = new OpfsHandler();
+      await destOpfs.open(destFile);
+
+      const newIndexMap: { id: string; vector_index: number }[] = [];
+      let newVectorCount = 0;
+      const vectorSizeBytes = VECTOR_DIMENSION * 4;
+
+      // Re-embed dirty items
+      if (dirtyItems.length > 0) {
+        const sentences = dirtyItems.map((item) => item.textContent);
+        const embeddings = await embeddingService.generateEmbeddings({ sentences });
+        const destOffset = this.HEADER_SIZE + newVectorCount * vectorSizeBytes;
+        await destOpfs.write(embeddings.buffer as ArrayBuffer, destOffset);
+        for (let i = 0; i < dirtyItems.length; i++) {
+          newIndexMap.push({ id: dirtyItems[i].id, vector_index: newVectorCount });
+          newVectorCount++;
+        }
+      }
+
+      // Copy clean vectors
+      const sourceOpfs = new OpfsHandler();
+      await sourceOpfs.open("vectors.bin");
+      const vectorBuffer = new ArrayBuffer(vectorSizeBytes);
+
+      for (const item of cleanItems) {
+        if (item.vector_index === undefined || item.vector_index < 0) continue;
+        const sourceOffset = this.HEADER_SIZE + item.vector_index * vectorSizeBytes;
+        await sourceOpfs.read(vectorBuffer, sourceOffset);
+        const destOffset = this.HEADER_SIZE + newVectorCount * vectorSizeBytes;
+        await destOpfs.write(vectorBuffer, destOffset);
+        newIndexMap.push({ id: item.id, vector_index: newVectorCount });
+        newVectorCount++;
+      }
+
+      // Write the new count to the header
+      const countBuffer = new ArrayBuffer(4);
+      new DataView(countBuffer).setUint32(0, newVectorCount, true);
+      await destOpfs.write(countBuffer, 12);
+
+      sourceOpfs.close();
+      destOpfs.close();
+
+      return { newIndexMap };
+    });
+  };
+
+  public renameFile = async (oldName: string, newName: string): Promise<void> => {
+    // OPFS doesn't have a direct rename. We have to copy and delete.
+    const oldOpfs = new OpfsHandler();
+    await oldOpfs.open(oldName);
+    const size = await oldOpfs.getSize();
+    const buffer = new ArrayBuffer(size);
+    await oldOpfs.read(buffer, 0);
+
+    const newOpfs = new OpfsHandler();
+    await newOpfs.open(newName, true); // Truncate new file
+    await newOpfs.write(buffer, 0);
+
+    oldOpfs.close();
+    newOpfs.close();
+
+    await this.deleteFile(oldName);
+  };
+
+  public deleteFile = async (fileName: string): Promise<void> => {
+    const opfsHandler = new OpfsHandler();
+    await opfsHandler.open(fileName);
+    await opfsHandler.deleteSelf();
+    opfsHandler.close();
   };
 
   public search = async (payload: { query: string; topK: number }): Promise<SearchResult[]> => {

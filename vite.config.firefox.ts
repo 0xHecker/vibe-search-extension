@@ -16,7 +16,7 @@ const manifest: ManifestV3Export = {
 };
 
 if (isDev) {
-  manifest.name = "Cooperhire (Dev)";
+  manifest.name = "Vibesearch (Dev)";
   manifest.action = {
     ...manifest.action,
     default_icon: {

@@ -3,11 +3,13 @@ import { getRxStorageDexie } from "rxdb/plugins/storage-dexie";
 import { RxDBDevModePlugin } from "rxdb/plugins/dev-mode";
 import { wrappedValidateZSchemaStorage } from "rxdb/plugins/validate-z-schema";
 import { RxDBMigrationSchemaPlugin } from "rxdb/plugins/migration-schema";
+import { RxDBLocalDocumentsPlugin } from "rxdb/plugins/local-documents";
 
 if (import.meta.env.MODE === "development") {
   addRxPlugin(RxDBDevModePlugin);
 }
 addRxPlugin(RxDBMigrationSchemaPlugin);
+addRxPlugin(RxDBLocalDocumentsPlugin);
 
 // Import schemas
 import { itemSchema, ItemDocType } from "@src/schemas/item_schema";
@@ -16,6 +18,7 @@ import { tagSchema, TagDocType } from "@src/schemas/tag_schema";
 import { itemTagSchema, ItemTagDocType } from "@src/schemas/item_tag_schema";
 import { searchHistorySchema, SearchHistoryDocType } from "@src/schemas/search_history_schema";
 import { flashcardSchema, FlashcardDocType } from "@src/schemas/flashcard_schema";
+import { deletedItemSchema, DeletedItemDocType } from "@src/schemas/deleted_item_schema";
 
 // Define collection types
 export type ItemCollection = RxCollection<ItemDocType>;
@@ -24,6 +27,7 @@ export type TagCollection = RxCollection<TagDocType>;
 export type ItemTagCollection = RxCollection<ItemTagDocType>;
 export type SearchHistoryCollection = RxCollection<SearchHistoryDocType>;
 export type FlashcardCollection = RxCollection<FlashcardDocType>;
+export type DeletedItemCollection = RxCollection<DeletedItemDocType>;
 
 // Define database collections
 export type MyDatabaseCollections = {
@@ -33,6 +37,7 @@ export type MyDatabaseCollections = {
   item_tags: ItemTagCollection;
   search_history: SearchHistoryCollection;
   flashcards: FlashcardCollection;
+  deleted_items: DeletedItemCollection;
 };
 
 export type MyDatabase = RxDatabase<MyDatabaseCollections>;
@@ -48,6 +53,7 @@ const createDatabase = async () => {
   const db = await createRxDatabase<MyDatabaseCollections>({
     name: "vibesearchdb",
     storage,
+    localDocuments: true,
   });
 
   await db.addCollections({
@@ -69,6 +75,9 @@ const createDatabase = async () => {
     flashcards: {
       schema: flashcardSchema,
     },
+    deleted_items: {
+      schema: deletedItemSchema,
+    },
   });
 
   return db;
@@ -83,6 +92,24 @@ export const getDb = (): Promise<MyDatabase> => {
 
 export const addDummyData = async () => {
   const db = await getDb();
+
+  // Add a dummy folder first
+  const folderId = "folder1";
+  const now = Date.now();
+  const dummyFolder: FolderDocType = {
+    id: folderId,
+    name: "My First Tab Group",
+    userId: "user1",
+    parentId: null,
+    type: "folder",
+    isLocked: false,
+    isDirty: false,
+    serverVersion: 0,
+    createdAt: now,
+    updatedAt: now,
+  };
+  await db.folders.insert(dummyFolder);
+
   const quotes = [
     "The only way to do great work is to love what you do.",
     "Innovation distinguishes between a leader and a follower.",
@@ -123,7 +150,7 @@ export const addDummyData = async () => {
     textContent: quote,
     url: `https://example.com/quote-${i}`,
     source: "note" as const,
-    folderId: "folder1",
+    folderId: folderId,
     isFavorite: false,
     parentId: null,
     isEmbedded: false,
@@ -132,8 +159,14 @@ export const addDummyData = async () => {
     createdAt: Date.now(),
     updatedAt: Date.now(),
     vector_index: -1,
+    deletedAt: 0,
   }));
 
-  await db.items.bulkInsert(dummyItems);
-  console.log("Added 30 dummy quotes to the database.");
+  console.log("Inserting dummy items...");
+  try {
+    await db.items.bulkInsert(dummyItems);
+  } catch (e) {
+    console.error("Failed to insert dummy items:", e);
+  }
+  console.log("Finished inserting dummy items.");
 };

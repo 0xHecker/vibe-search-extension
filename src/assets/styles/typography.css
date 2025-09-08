@@ -1,0 +1,277 @@
+@font-face {
+  font-family: "Neutral Sans";
+  font-style: normal;
+  font-weight: 400;
+  src: url("/fonts/NeutralSans-Regular.woff2") format("woff2");
+}
+
+@font-face {
+  font-family: "Neutral Sans";
+  font-style: normal;
+  font-weight: 500;
+  src: url("/fonts/NeutralSans-Meidum.woff2") format("woff2");
+}
+
+@font-face {
+  font-family: "Neutral Sans";
+  font-style: normal;
+  font-weight: 700;
+  src: url("/fonts/NeutralSans-Bold.woff2") format("woff2");
+}
+
+@font-face {
+  font-family: "Garamontio";
+  font-style: normal;
+  font-weight: 400;
+  src: url("/fonts/garamontio.woff2") format("woff2");
+}
+
+@font-face {
+  font-family: "Garamontio";
+  font-style: italic;
+  font-weight: 400;
+  src: url("/fonts/Metal-Regular.woff2") format("woff2");
+}
+
+@font-face {
+  font-family: "Inter";
+  font-style: normal;
+  font-weight: 600;
+  src: url("/fonts/Inter-SemiBold.woff2") format("woff2");
+}
+
+@font-face {
+  font-family: "Inter";
+  font-style: normal;
+  font-weight: 700;
+  src: url("/fonts/Inter-Bold.woff2") format("woff2");
+}
+
+@layer components {
+  /*
+    Font Family Utilities
+  */
+  .font-sans {
+    font-family: var(--font-sans);
+  }
+  .font-serif {
+    font-family: var(--font-serif);
+  }
+  .font-mono {
+    font-family: var(--font-mono);
+  }
+
+  /*
+    Display Text Styles
+  */
+  .txt-display-1 {
+    font-weight: 600;
+    font-size: 40px;
+    line-height: 48px;
+    font-family: var(--font-sans-bold);
+    letter-spacing: 0.4px;
+  }
+  @media (min-width: 768px) {
+    .txt-display-1 {
+      font-size: 64px;
+      line-height: 76px;
+      letter-spacing: 0.64px;
+    }
+  }
+  @media (min-width: 1024px) {
+    .txt-display-1 {
+      font-size: 84px;
+      line-height: 96px;
+      letter-spacing: 0.84px;
+    }
+  }
+  @media (min-width: 1280px) {
+    .txt-display-1 {
+      font-size: 96px;
+      line-height: 112px;
+      letter-spacing: 0.96px;
+    }
+  }
+
+  .txt-display-2 {
+    font-weight: 600;
+    font-size: 36px;
+    line-height: 44px;
+    font-family: var(--font-sans-bold);
+    letter-spacing: 0.36px;
+  }
+  @media (min-width: 768px) {
+    .txt-display-2 {
+      font-size: 48px;
+      line-height: 56px;
+      letter-spacing: 0.48px;
+    }
+  }
+  @media (min-width: 1024px) {
+    .txt-display-2 {
+      font-size: 56px;
+      line-height: 64px;
+      letter-spacing: 0.56px;
+    }
+  }
+  @media (min-width: 1280px) {
+    .txt-display-2 {
+      font-size: 64px;
+      line-height: 72px;
+      letter-spacing: 0.72px;
+    }
+  }
+
+  .txt-display-3 {
+    font-weight: 600;
+    font-size: 32px;
+    line-height: 36px;
+    font-family: var(--font-sans-bold);
+    letter-spacing: 0.32px;
+  }
+  @media (min-width: 768px) {
+    .txt-display-3 {
+      font-size: 36px;
+      line-height: 48px;
+      letter-spacing: 0.36px;
+    }
+  }
+  @media (min-width: 1024px) {
+    .txt-display-3 {
+      font-size: 44px;
+      line-height: 52px;
+      letter-spacing: 0.44px;
+    }
+  }
+  @media (min-width: 1280px) {
+    .txt-display-3 {
+      font-size: 48px;
+      line-height: 56px;
+      letter-spacing: 0.48px;
+    }
+  }
+
+  /*
+    Title Text Styles
+  */
+  .txt-title-1 {
+    font-weight: 600;
+    font-size: 24px;
+    line-height: 32px;
+    font-family: var(--font-sans-bold);
+    letter-spacing: 0.24px;
+  }
+  @media (min-width: 1024px) {
+    .txt-title-1 {
+      font-size: 32px;
+      line-height: 40px;
+      letter-spacing: 0.32px;
+    }
+  }
+
+  .txt-title-2 {
+    font-weight: 600;
+    font-size: 20px;
+    line-height: 28px;
+    font-family: var(--font-sans-bold);
+    letter-spacing: 0.2px;
+  }
+  @media (min-width: 1024px) {
+    .txt-title-2 {
+      font-size: 24px;
+      line-height: 32px;
+      letter-spacing: 0.24px;
+    }
+  }
+
+  .txt-title-3 {
+    font-weight: 600;
+    font-size: 18px;
+    line-height: 24px;
+    font-family: var(--font-sans-bold);
+    letter-spacing: 0.18px;
+  }
+  @media (min-width: 1024px) {
+    .txt-title-3 {
+      font-size: 20px;
+      line-height: 28px;
+      letter-spacing: 0.2px;
+    }
+  }
+
+  /*
+    Body Text Styles
+  */
+  .txt-body-strong-1 {
+    font-weight: 700;
+    font-size: 16px;
+    line-height: 24px;
+    font-family: var(--font-sans-bold);
+    letter-spacing: 0.16px;
+  }
+
+  .txt-body-strong-2 {
+    font-weight: 700;
+    font-size: 14px;
+    line-height: 20px;
+    font-family: var(--font-sans-bold);
+    letter-spacing: 0.14px;
+  }
+
+  .txt-body-1 {
+    font-weight: 400;
+    font-size: 16px;
+    line-height: 24px;
+    letter-spacing: 0.16px;
+  }
+
+  .txt-body-2 {
+    font-weight: 400;
+    font-size: 14px;
+    line-height: 20px;
+    letter-spacing: 0.14px;
+  }
+
+  .txt-body-3 {
+    font-weight: 400;
+    font-size: 16px;
+    line-height: 24px;
+    letter-spacing: 0.14px;
+  }
+
+  /*
+    Caption and Paragraph Styles
+  */
+  .txt-caption-1 {
+    font-weight: 400;
+    font-size: 12px;
+    line-height: 16px;
+    letter-spacing: 0.12px;
+  }
+  @media (min-width: 1280px) {
+    .txt-caption-1 {
+      line-height: 20px;
+    }
+  }
+
+  .txt-caption-2 {
+    font-weight: 400;
+    font-size: 10px;
+    line-height: 16px;
+    letter-spacing: 0.1px;
+  }
+
+  .txt-paragraph-1 {
+    font-weight: 400;
+    font-size: 14px;
+    line-height: 24px;
+    letter-spacing: 0.14px;
+  }
+  @media (min-width: 1024px) {
+    .txt-paragraph-1 {
+      font-size: 16px;
+      line-height: 28px;
+      letter-spacing: 0.16px;
+    }
+  }
+}

@@ -82,6 +82,7 @@
   --color-background-neutral-faded: var(--background-neutral-faded);
   --color-background-highlight: var(--background-highlight);
   --color-background-highlight-faded: var(--background-highlight-faded);
+  --color-background-inverse: var(--background-inverse);
 
   --color-foreground-primary: var(--foreground-primary);
   --color-foreground-neutral: var(--foreground-neutral);
@@ -131,6 +132,7 @@
   --background-highlight: var(--color-gray-30);
   --background-highlight-faded: var(--color-gray-20);
   --background-positive: var(--color-background-positive);
+  --background-inverse: var(--color-gray-800);
 
   --foreground-primary: var(--color-accent);
   --foreground-neutral: var(--color-gray-800);
@@ -178,6 +180,7 @@
   --background-highlight: var(--color-gray-30);
   --background-highlight-faded: var(--color-gray-20);
   --background-positive: var(--color-background-positive);
+  --background-inverse: var(--color-gray-800);
 
   --foreground-primary: var(--color-accent);
   --foreground-neutral: var(--color-gray-800);
@@ -208,5 +211,10 @@
     --tw-shadow: var(--shadow-card-color);
     box-shadow: var(--tw-inset-shadow), var(--tw-inset-ring-shadow), var(--tw-ring-offset-shadow),
       var(--tw-ring-shadow), var(--tw-shadow);
+  }
+
+  /* Subtle drop-shadow to lift very light icons on bright backgrounds */
+  .icon-light-shadow {
+    filter: drop-shadow(0 0 1px rgba(0, 0, 0, 0.3)) drop-shadow(0 0 1px rgba(0, 0, 0, 0.2));
   }
 }

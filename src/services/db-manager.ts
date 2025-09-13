@@ -131,7 +131,49 @@ class DatabaseManager {
         console.error("DB: Failed to insert items:", result.error);
         throw new Error(`Failed to insert ${result.error.length} items.`);
       }
+      try {
+        chrome.runtime.sendMessage({ type: "DB_CHANGE", scope: "items" });
+      } catch {}
     }
+  }
+
+  async addItemToFolder(payload: {
+    item: Omit<ItemDocType, "id" | "createdAt" | "updatedAt" | "vector_index" | "deletedAt"> & {
+      id?: string;
+    };
+  }): Promise<ItemDocType> {
+    const db = await getDb();
+    const now = Date.now();
+    const item: ItemDocType = {
+      id: payload.item.id ?? crypto.randomUUID?.() ?? `${now}`,
+      userId: payload.item.userId ?? null,
+      title: payload.item.title ?? "Untitled",
+      textContent: payload.item.textContent ?? "",
+      url: payload.item.url,
+      source: payload.item.source,
+      folderId: payload.item.folderId,
+      isFavorite: payload.item.isFavorite ?? false,
+      authorUsername: payload.item.authorUsername,
+      likes: payload.item.likes,
+      upvotes: payload.item.upvotes,
+      media: payload.item.media,
+      iconUrl: (payload.item as any).iconUrl,
+      displayImageUrl: (payload.item as any).displayImageUrl,
+      parentId: payload.item.parentId ?? null,
+      chunkOrder: payload.item.chunkOrder,
+      vector_index: -1,
+      isEmbedded: false,
+      isDirty: true,
+      serverVersion: 0,
+      createdAt: now,
+      updatedAt: now,
+      deletedAt: 0,
+    };
+    await db.items.insert(item);
+    try {
+      chrome.runtime.sendMessage({ type: "DB_CHANGE", scope: "items" });
+    } catch {}
+    return item;
   }
 
   /**
@@ -144,6 +186,7 @@ class DatabaseManager {
     parentId?: string | null;
     type?: FolderDocType["type"];
     isLocked?: boolean;
+    isPinned?: boolean;
   }): Promise<FolderDocType> {
     const db = await getDb();
     const now = Date.now();
@@ -154,6 +197,7 @@ class DatabaseManager {
       parentId: payload.parentId ?? null,
       type: payload.type ?? "folder",
       isLocked: payload.isLocked ?? false,
+      isPinned: payload.isPinned ?? false,
       isDirty: false,
       serverVersion: 0,
       createdAt: now,
@@ -161,7 +205,45 @@ class DatabaseManager {
     };
 
     await db.folders.insert(folder);
+    try {
+      chrome.runtime.sendMessage({ type: "DB_CHANGE", scope: "folders" });
+    } catch {}
     return folder;
+  }
+
+  async toggleFolderPinned(payload: { id: string; value?: boolean }): Promise<void> {
+    const db = await getDb();
+    const doc = await db.folders.findOne(payload.id).exec();
+    if (!doc) return;
+    const current = doc.toMutableJSON();
+    const nextPinned = payload.value ?? !current.isPinned;
+    await doc.patch({ isPinned: nextPinned, updatedAt: Date.now() });
+    try {
+      chrome.runtime.sendMessage({ type: "DB_CHANGE", scope: "folders" });
+    } catch {}
+  }
+
+  async toggleFolderLocked(payload: { id: string; value?: boolean }): Promise<void> {
+    const db = await getDb();
+    const doc = await db.folders.findOne(payload.id).exec();
+    if (!doc) return;
+    const current = doc.toMutableJSON();
+    const nextLocked = payload.value ?? !current.isLocked;
+    await doc.patch({ isLocked: nextLocked, updatedAt: Date.now() });
+    try {
+      chrome.runtime.sendMessage({ type: "DB_CHANGE", scope: "folders" });
+    } catch {}
+  }
+
+  async updateFolderName(payload: { id: string; name: string }): Promise<void> {
+    const db = await getDb();
+    const doc = await db.folders.findOne(payload.id).exec();
+    if (!doc) return;
+    const safeName = (payload.name || "").slice(0, 80);
+    await doc.patch({ name: safeName, updatedAt: Date.now() });
+    try {
+      chrome.runtime.sendMessage({ type: "DB_CHANGE", scope: "folders" });
+    } catch {}
   }
 }
 

@@ -21,9 +21,14 @@ const Search = () => {
         type: "getAllFolders",
         target: "offscreen",
       });
-      console.log("Folders response:", foldersResponse);
       if (foldersResponse?.success) {
-        setFolders(foldersResponse.payload);
+        setFolders(
+          (foldersResponse.payload as FolderDocType[]).slice().sort((a, b) => {
+            // Pinned first, within each group order by createdAt desc
+            if (!!a.isPinned !== !!b.isPinned) return a.isPinned ? -1 : 1;
+            return b.createdAt - a.createdAt;
+          })
+        );
       }
 
       const itemsResponse = await chrome.runtime.sendMessage({
@@ -43,6 +48,14 @@ const Search = () => {
         setIsOpen(result.sidePanelOpen);
       }
     });
+    // Live reactivity via RxDB queryChangeDetector: listen for changes broadcast from offscreen
+    const onMessage = (msg: any) => {
+      if (msg?.type === "DB_CHANGE" && (msg.scope === "folders" || msg.scope === "items")) {
+        fetchData();
+      }
+    };
+    chrome.runtime.onMessage.addListener(onMessage);
+    return () => chrome.runtime.onMessage.removeListener(onMessage);
   }, []);
 
   const togglePanel = () => {

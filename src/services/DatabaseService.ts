@@ -59,9 +59,28 @@ const createDatabase = async () => {
   await db.addCollections({
     items: {
       schema: itemSchema,
+      migrationStrategies: {
+        1: (oldDoc: any) => {
+          // Ensure icon fields exist and types match
+          if (typeof oldDoc.iconUrl === "undefined") oldDoc.iconUrl = "";
+          if (typeof oldDoc.displayImageUrl === "undefined") oldDoc.displayImageUrl = "";
+          // Keep vector_index and other fields as-is
+          return oldDoc;
+        },
+      },
     },
     folders: {
       schema: folderSchema,
+      migrationStrategies: {
+        1: (oldDoc: any) => {
+          // parentId can be null now; if missing, set to null
+          if (typeof oldDoc.parentId === "undefined") oldDoc.parentId = null;
+          // Add isPinned default false
+          if (typeof oldDoc.isPinned === "undefined") oldDoc.isPinned = false;
+          // Keep the rest intact
+          return oldDoc;
+        },
+      },
     },
     tags: {
       schema: tagSchema,
@@ -92,24 +111,6 @@ export const getDb = (): Promise<MyDatabase> => {
 
 export const addDummyData = async () => {
   const db = await getDb();
-
-  // Add a dummy folder first
-  const folderId = "folder1";
-  const now = Date.now();
-  const dummyFolder: FolderDocType = {
-    id: folderId,
-    name: "My First Tab Group",
-    userId: "user1",
-    parentId: null,
-    type: "folder",
-    isLocked: false,
-    isDirty: false,
-    serverVersion: 0,
-    createdAt: now,
-    updatedAt: now,
-  };
-  await db.folders.insert(dummyFolder);
-
   const quotes = [
     "The only way to do great work is to love what you do.",
     "Innovation distinguishes between a leader and a follower.",
@@ -150,7 +151,7 @@ export const addDummyData = async () => {
     textContent: quote,
     url: `https://example.com/quote-${i}`,
     source: "note" as const,
-    folderId: folderId,
+    folderId: "folder1",
     isFavorite: false,
     parentId: null,
     isEmbedded: false,

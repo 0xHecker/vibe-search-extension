@@ -1,12 +1,4 @@
-export const Checkmark = ({
-  fillColor = "#C6C6C6",
-  className,
-  size = 24,
-}: {
-  fillColor: string;
-  className?: string;
-  size?: number;
-}) => {
+export const Checkmark = ({ className, size = 24 }: { className?: string; size?: number }) => {
   return (
     <svg
       width={size}
@@ -20,7 +12,7 @@ export const Checkmark = ({
         fillRule="evenodd"
         clipRule="evenodd"
         d="M19.3209 4.24472C20.0143 4.69807 20.2088 5.62768 19.7555 6.32105L11.2555 19.321C10.9972 19.7161 10.5681 19.9665 10.0971 19.997C9.62616 20.0276 9.16828 19.8347 8.86114 19.4764L4.36114 14.2264C3.82201 13.5974 3.89485 12.6504 4.52384 12.1113C5.15283 11.5722 6.09978 11.645 6.63891 12.274L9.83828 16.0066L17.2446 4.6793C17.6979 3.98593 18.6275 3.79136 19.3209 4.24472Z"
-        fill={fillColor}
+        fill={"currentColor"}
       />
     </svg>
   );

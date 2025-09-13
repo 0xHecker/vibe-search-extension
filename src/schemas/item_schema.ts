@@ -30,6 +30,8 @@ export type ItemDocType = {
     s3Url?: string;
     expiresAt?: number;
   }[];
+  iconUrl?: string;
+  displayImageUrl?: string;
   parentId: string | null;
   chunkOrder?: number;
   vector_index?: number;
@@ -43,7 +45,7 @@ export type ItemDocType = {
 
 export const itemSchema: RxJsonSchema<ItemDocType> = {
   title: "item schema",
-  version: 0,
+  version: 1,
   description: "Describes a single saved item (bookmark, note, social media post)",
   primaryKey: "id",
   type: "object",
@@ -105,6 +107,8 @@ export const itemSchema: RxJsonSchema<ItemDocType> = {
     isEmbedded: { type: "boolean", default: false },
     isDirty: { type: "boolean", default: false },
     serverVersion: { type: "number", default: 0 },
+    iconUrl: { type: "string" },
+    displayImageUrl: { type: "string" },
     // Timestamps
     createdAt: {
       type: "integer",

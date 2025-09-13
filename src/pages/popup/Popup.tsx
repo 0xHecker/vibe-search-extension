@@ -35,8 +35,12 @@ const Popup = () => {
   };
 
   const buildItemsFromTabs = (tabs: chrome.tabs.Tab[], folderId: string) => {
+    console.log(tabs);
     const itemsToSave = tabs
-      .filter((tab) => tab.url && !tab.url.startsWith("chrome://"))
+      .filter(
+        (tab) =>
+          tab.url && !tab.url.startsWith("chrome://") && !tab.url.startsWith("chrome-extension://")
+      )
       .map(
         (tab) =>
           ({
@@ -45,6 +49,7 @@ const Popup = () => {
             title: tab.title || "No Title",
             textContent: "",
             url: tab.url!,
+            iconUrl: tab.favIconUrl || "",
             source: "web" as const,
             folderId,
             isFavorite: false,
@@ -81,12 +86,11 @@ const Popup = () => {
   };
 
   const createFolder = async (name: string): Promise<FolderDocType> => {
-    const folderId = uuidv4();
     const response = await chrome.runtime.sendMessage({
-      service: "dbManager",
-      type: "createFolder",
+      service: "folders",
+      type: "create",
       target: "offscreen",
-      payload: { id: folderId, name, userId: "user1" },
+      payload: { name, userId: "user1" },
     });
     if (!response?.success) {
       throw new Error(response?.error || "Failed to create folder");
@@ -108,8 +112,8 @@ const Popup = () => {
         return;
       }
       const response = await chrome.runtime.sendMessage({
-        service: "dbManager",
-        type: "addItems",
+        service: "items",
+        type: "addMany",
         target: "offscreen",
         payload: { items },
       });

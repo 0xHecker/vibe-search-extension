@@ -4,6 +4,8 @@ import { embeddingService } from "@src/services/embedding.service";
 import { databaseManager } from "@src/services/db-manager";
 import { getDb, addDummyData } from "@src/services/DatabaseService";
 import { syncService } from "@src/services/sync.service";
+import { itemsController } from "@src/services/controllers/items.controller";
+import { foldersController } from "@src/services/controllers/folders.controller";
 
 const sendStatusUpdate = (message: string) => {
   chrome.runtime.sendMessage({ type: "STATUS_UPDATE", payload: message });
@@ -18,6 +20,8 @@ router.registerService("vectorStore", vectorStoreService);
 router.registerService("embedding", embeddingService);
 router.registerService("dbManager", databaseManager);
 router.registerService("sync", syncService);
+router.registerService("items", itemsController);
+router.registerService("folders", foldersController);
 // To add a new service (e.g., for RxDB or image classification),
 // you would simply create the service and register it here.
 // router.registerService("imageClassifier", imageClassificationService);
@@ -134,6 +138,18 @@ const initializeApp = async () => {
     // Initial embedding process
     await embedNewItems();
     await embedDirtyItems();
+
+    // Broadcast RxDB changes to UI clients for reactivity
+    try {
+      db.folders.$.subscribe(() => {
+        chrome.runtime.sendMessage({ type: "DB_CHANGE", scope: "folders" });
+      });
+      db.items.$.subscribe(() => {
+        chrome.runtime.sendMessage({ type: "DB_CHANGE", scope: "items" });
+      });
+    } catch (e) {
+      console.warn("Failed to attach RxDB change subscriptions", e);
+    }
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : "An unknown error occurred";
     console.error("Error during offscreen initialization:", error);

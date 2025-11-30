@@ -13,9 +13,14 @@ const Search = () => {
   const [isOpen, setIsOpen] = useState(true);
   const [folders, setFolders] = useState<FolderDocType[]>([]);
   const [items, setItems] = useState<ItemDocType[]>([]);
+  const [isLoading, setIsLoading] = useState(true);
 
   useEffect(() => {
     const fetchData = async () => {
+      setIsLoading(true);
+      // Also trigger a metadata fetch in the background
+      // Disable aggressive global metadata fetch on every load; background has a queue now
+
       const foldersResponse = await chrome.runtime.sendMessage({
         service: "dbManager",
         type: "getAllFolders",
@@ -39,6 +44,7 @@ const Search = () => {
       if (itemsResponse?.success) {
         setItems(itemsResponse.payload);
       }
+      setIsLoading(false);
     };
 
     fetchData();
@@ -97,7 +103,7 @@ const Search = () => {
       <button
         onClick={togglePanel}
         className={cn(
-          "fixed top-34 p-1 z-50 shadow-sm shadow-foreground-muted/60 rounded-semi bg-background-page-secondary transition-all duration-400 ease-in-out group cursor-pointer",
+          "fixed top-34 p-1 z-50 shadow-sm shadow-foreground-muted/60 rounded-semi bg-background-page-secondary transition-all duration-400 ease-in-out group cursor-pointer focus-visible:ring-2 focus-visible:ring-border-neutral/80 focus-visible:ring-offset-1",
           {
             "left-[calc(1rem+240px+8px)]": isOpen,
             "left-2": !isOpen,
@@ -109,7 +115,7 @@ const Search = () => {
       >
         <ChevronRight
           className={cn(
-            "h-5 w-5 transition-all duration-300 text-foreground-tertiary group-hover:text-foreground-icon",
+            "h-5 w-5 transition-all duration-300 text-foreground-tertiary gkb roup-hover:text-foreground-icon",
             {
               "rotate-180": isOpen,
             }

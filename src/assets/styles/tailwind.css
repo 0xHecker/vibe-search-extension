@@ -4,6 +4,11 @@
 
 @custom-variant dark (&:where([data-theme="dark"] *));
 
+:root {
+  --shadow-modal: 0px 20px 35px rgba(15, 23, 42, 0.18);
+  --shadow-modal-dark: 0px 20px 35px rgba(15, 23, 42, 0.4);
+}
+
 @theme {
   --animate-spin-slow: spin 20s linear infinite;
 
@@ -17,6 +22,7 @@
 @theme inline {
   --radius-xs: calc(var(--radius) / 2);
   --radius-sm: calc(var(--radius));
+  --radius-sm-semi: 6px;
   --radius-md: calc(var(--radius) * 2);
   --radius-semi: 10px;
   --radius-lg: calc(var(--radius) * 3);
@@ -26,8 +32,9 @@
   --color-gray-20: oklch(0.9791 0 0); /*#f8f8f8*/
   --color-gray-30: oklch(0.9642 0 0); /*#f3f3f3*/
   --color-gray-40: oklch(0.9655 0.0079 106.55); /*#f4f4ee*/
-  --color-gray-50: oklch(0.8699 0 0); /*#d4d4d4*/
   --color-gray-45: oklch(0.893 0.0022 17.2); /*#DDDBDB */
+  --color-gray-50: oklch(0.8699 0 0); /*#d4d4d4*/
+  --color-gray-55: oklch(0.8853 0 0); /*#d9d9d9*/
   --color-gray-100: oklch(0.8266 0 0); /*#c6c6c6*/
   --color-gray-200: oklch(0.7572 0 0); /*#b0b0b0*/
   --color-gray-300: oklch(0.724 0.0057 106.54); /*#a6a6a2*/
@@ -113,7 +120,7 @@
     "Segoe UI Emoji", "Segoe UI Symbol", "Noto Color Emoji";
   --font-sans-bold: "Inter", ui-sans-serif, system-ui, sans-serif, "Apple Color Emoji",
     "Segoe UI Emoji", "Segoe UI Symbol", "Noto Color Emoji";
-  --font-serif: "Garamontio", ui-serif, Georgia, Cambria, "Times New Roman", Times, serif;
+  --font-serif: "Metal", ui-serif, Georgia, Cambria, "Times New Roman", Times, serif;
   --font-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono",
     "Courier New", monospace;
 }

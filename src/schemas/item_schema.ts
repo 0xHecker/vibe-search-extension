@@ -16,7 +16,8 @@ export type ItemDocType = {
     | "tiktok"
     | "substack"
     | "linkedin"
-    | "github";
+    | "github"
+    | "article";
   folderId: string;
   isFavorite: boolean;
   authorUsername?: string;
@@ -36,6 +37,7 @@ export type ItemDocType = {
   chunkOrder?: number;
   vector_index?: number;
   isEmbedded: boolean;
+  isMetaFetched: boolean;
   isDirty: boolean;
   serverVersion: number;
   createdAt: number;
@@ -45,7 +47,7 @@ export type ItemDocType = {
 
 export const itemSchema: RxJsonSchema<ItemDocType> = {
   title: "item schema",
-  version: 1,
+  version: 0,
   description: "Describes a single saved item (bookmark, note, social media post)",
   primaryKey: "id",
   type: "object",
@@ -68,6 +70,7 @@ export const itemSchema: RxJsonSchema<ItemDocType> = {
         "substack",
         "linkedin",
         "github",
+        "article",
       ],
       maxLength: 20,
     },
@@ -105,6 +108,7 @@ export const itemSchema: RxJsonSchema<ItemDocType> = {
     },
     // AI and Sync fields
     isEmbedded: { type: "boolean", default: false },
+    isMetaFetched: { type: "boolean", default: false },
     isDirty: { type: "boolean", default: false },
     serverVersion: { type: "number", default: 0 },
     iconUrl: { type: "string" },
@@ -137,6 +141,7 @@ export const itemSchema: RxJsonSchema<ItemDocType> = {
     "updatedAt",
     "isFavorite",
     "isEmbedded",
+    "isMetaFetched",
     "isDirty",
     "folderId",
     "vector_index",
@@ -150,6 +155,7 @@ export const itemSchema: RxJsonSchema<ItemDocType> = {
     "folderId",
     "isFavorite",
     "isEmbedded",
+    "isMetaFetched",
     "isDirty",
     "userId",
     "vector_index",

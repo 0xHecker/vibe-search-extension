@@ -1,49 +1,53 @@
-const OFFSCREEN_DOCUMENT_PATH = "src/pages/offscreen/offscreen.html";
+import { scheduleForProcessing } from "@src/services/metadata-pipeline";
+import { setupOffscreenDocument, OFFSCREEN_DOCUMENT_PATH } from "@src/services/offscreen-helper";
 
-let creating: Promise<void> | null; // A promise that resolves when the offscreen document is created
-
-async function setupOffscreenDocument(path: string) {
-  const existingContexts = await (chrome.runtime as any).getContexts({
-    contextTypes: ["OFFSCREEN_DOCUMENT"],
-    documentUrls: [chrome.runtime.getURL(path)],
-  });
-
-  if (existingContexts.length > 0) {
-    return;
-  }
-
-  if (creating) {
-    await creating;
-  } else {
-    creating = (chrome.offscreen as any).createDocument({
-      url: path,
-      reasons: ["WORKERS"],
-      justification: "Persistent OPFS access for vector processing",
-    });
-    await creating;
-    creating = null;
-  }
-}
-
-// --- Periodic Sync Alarm ---
+// --- Alarms ---
 const SYNC_ALARM_NAME = "vector-sync-alarm";
+const EMBEDDING_ALARM_NAME = "embedding-alarm";
 
-// Create the alarm when the extension is installed or updated.
+// Create the alarms when the extension is installed or updated.
 chrome.runtime.onInstalled.addListener(() => {
+  // For periodic vector store compaction
   chrome.alarms.create(SYNC_ALARM_NAME, {
     periodInMinutes: 6 * 60, // Run every 6 hours
   });
+  // For periodic embedding of new/dirty items
+  chrome.alarms.create(EMBEDDING_ALARM_NAME, {
+    periodInMinutes: 5, // Run every 5 minutes to catch any missed embeddings
+  });
 });
 
-// Listen for the alarm and send a message to the offscreen document to trigger the sync.
+chrome.runtime.onStartup.addListener(() => {
+  // Trigger embedding check on startup
+  (async () => {
+    await setupOffscreenDocument();
+    chrome.runtime.sendMessage({
+      type: "TRIGGER_EMBEDDING",
+      target: "offscreen",
+      isForwarded: true,
+    });
+  })();
+});
+
+// Listen for alarms and send messages to the offscreen document to trigger tasks.
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === SYNC_ALARM_NAME) {
-    console.log("Periodic sync alarm triggered. Sending message to offscreen document.");
+    console.log("[Background] Periodic sync alarm triggered.");
     (async () => {
-      await setupOffscreenDocument(OFFSCREEN_DOCUMENT_PATH);
+      await setupOffscreenDocument();
       chrome.runtime.sendMessage({
         service: "sync",
         type: "rebuildAndCompact",
+        target: "offscreen",
+        isForwarded: true,
+      });
+    })();
+  } else if (alarm.name === EMBEDDING_ALARM_NAME) {
+    console.log("[Background] Periodic embedding alarm triggered.");
+    (async () => {
+      await setupOffscreenDocument();
+      chrome.runtime.sendMessage({
+        type: "TRIGGER_EMBEDDING",
         target: "offscreen",
         isForwarded: true,
       });
@@ -53,6 +57,12 @@ chrome.alarms.onAlarm.addListener((alarm) => {
 
 // The main message handler for the background script
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (message.target === "background" && message.type === "FETCH_METADATA") {
+    const { urls, revalidate } = message.payload || { urls: [], revalidate: false };
+    scheduleForProcessing(urls, revalidate === true);
+    return;
+  }
+
   // Ignore messages that are not targeted for the offscreen document or that have already been forwarded.
   if (message.target !== "offscreen" || message.isForwarded) {
     return;
@@ -69,7 +79,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         // ignore if not supported
       }
 
-      await setupOffscreenDocument(OFFSCREEN_DOCUMENT_PATH);
+      await setupOffscreenDocument();
 
       // Forward the message to the offscreen document and await the response.
       const response = await chrome.runtime.sendMessage({

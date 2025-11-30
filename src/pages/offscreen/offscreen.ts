@@ -2,16 +2,19 @@ import { OffscreenRouter } from "@src/services/router";
 import { vectorStoreService } from "@src/services/vector-store.service";
 import { embeddingService } from "@src/services/embedding.service";
 import { databaseManager } from "@src/services/db-manager";
-import { getDb, addDummyData } from "@src/services/DatabaseService";
+import { getDb } from "@src/services/DatabaseService";
 import { syncService } from "@src/services/sync.service";
 import { itemsController } from "@src/services/controllers/items.controller";
 import { foldersController } from "@src/services/controllers/folders.controller";
+import { tagsController } from "@src/services/controllers/tags.controller";
 
 const sendStatusUpdate = (message: string) => {
-  chrome.runtime.sendMessage({ type: "STATUS_UPDATE", payload: message });
+  try {
+    chrome.runtime.sendMessage({ type: "STATUS_UPDATE", payload: message });
+  } catch {}
 };
 
-console.log("Offscreen document script loaded.");
+console.log("[Offscreen] Document script loaded.");
 
 const router = new OffscreenRouter();
 
@@ -22,137 +25,164 @@ router.registerService("dbManager", databaseManager);
 router.registerService("sync", syncService);
 router.registerService("items", itemsController);
 router.registerService("folders", foldersController);
-// To add a new service (e.g., for RxDB or image classification),
-// you would simply create the service and register it here.
-// router.registerService("imageClassifier", imageClassificationService);
+router.registerService("tags", tagsController);
 
 // Start listening for messages.
 router.listen();
 
-const BATCH_SIZE = 100; // Process 100 items at a time
+// --- Robust Embedding Queue ---
+const EMBEDDING_BATCH_SIZE = 20; // Process 20 items at a time for embeddings
+let isEmbeddingRunning = false;
+let embeddingScheduled = false;
 
 /**
- * Philosophy: The embedding process is split into two parts for a balance of
- * responsiveness and long-term efficiency.
- *
- * 1. Immediate "Append-Only" Updates:
- *    - `embedNewItems`: Handles items that have never been embedded before.
- *    - `embedDirtyItems`: Handles items that have been edited.
- *    Both functions immediately generate embeddings and APPEND them to the end of
- *    the vector file. This makes changes searchable almost instantly. The old
- *    vectors from dirty items are left as orphans, to be cleaned up later.
- *
- * 2. Periodic "Rebuild and Compact":
- *    - A scheduled alarm triggers the `syncService.rebuildAndCompact` method.
- *    - This process acts as a garbage collector, rebuilding the vector file with
- *      only the most current vectors, discarding all orphans and deleted item
- *      vectors. This keeps the store lean and efficient.
+ * Process all pending embeddings in batches.
+ * This function is designed to be called frequently and will
+ * handle both new items and dirty items efficiently.
  */
-const embedNewItems = async () => {
-  sendStatusUpdate("Checking for new items to embed...");
-  let totalProcessed = 0;
-
-  while (true) {
-    const itemsToEmbed = await databaseManager.getItemsToEmbed();
-    const batch = itemsToEmbed.slice(0, BATCH_SIZE);
-
-    if (batch.length === 0) {
-      if (totalProcessed > 0) {
-        sendStatusUpdate(`Finished embedding new items. Total processed: ${totalProcessed}`);
-      }
-      break;
-    }
-
-    sendStatusUpdate(
-      `Found ${itemsToEmbed.length} new items. Processing batch of ${batch.length}...`
-    );
-
-    try {
-      const startingVectorIndex = await vectorStoreService.getVectorCount();
-      const sentences = batch.map((item: { textContent: string }) => item.textContent);
-      await vectorStoreService.generateAndStoreEmbeddings({ sentences });
-
-      const updates = batch.map((item: { id: string }, i: number) => ({
-        id: item.id,
-        vector_index: startingVectorIndex + i,
-        isEmbedded: true,
-        isDirty: false,
-      }));
-
-      await databaseManager.bulkUpdateItems(updates);
-      totalProcessed += batch.length;
-      sendStatusUpdate(`Batch of new items embedded. Total processed: ${totalProcessed}`);
-    } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : "An unknown error occurred";
-      console.error("Error embedding new items batch:", error);
-      sendStatusUpdate(`EMBEDDING FAILED on new items batch: ${errorMessage}`);
-      break;
-    }
-  }
-};
-
-const embedDirtyItems = async () => {
-  sendStatusUpdate("Checking for dirty items to re-embed...");
-  const dirtyItems = await databaseManager.getDirtyItems();
-
-  if (dirtyItems.length === 0) {
+const processEmbeddingQueue = async () => {
+  if (isEmbeddingRunning) {
+    // Already running, schedule another run when done
+    embeddingScheduled = true;
     return;
   }
 
-  sendStatusUpdate(`Found ${dirtyItems.length} dirty items. Re-embedding...`);
+  isEmbeddingRunning = true;
+  embeddingScheduled = false;
+
   try {
-    const startingVectorIndex = await vectorStoreService.getVectorCount();
-    const sentences = dirtyItems.map((item: { textContent: string }) => item.textContent);
-    await vectorStoreService.generateAndStoreEmbeddings({ sentences });
+    // Process new items (not yet embedded)
+    let totalNewProcessed = 0;
+    while (true) {
+      const itemsToEmbed = await databaseManager.getItemsToEmbed();
+      const batch = itemsToEmbed.slice(0, EMBEDDING_BATCH_SIZE);
 
-    const updates = dirtyItems.map((item: { id: string }, i: number) => ({
-      id: item.id,
-      vector_index: startingVectorIndex + i,
-      isDirty: false,
-    }));
+      if (batch.length === 0) break;
 
-    await databaseManager.bulkUpdateItems(updates);
-    sendStatusUpdate(`${dirtyItems.length} dirty items have been re-embedded.`);
-  } catch (error) {
-    const errorMessage = error instanceof Error ? error.message : "An unknown error occurred";
-    console.error("Error re-embedding dirty items:", error);
-    sendStatusUpdate(`RE-EMBEDDING FAILED: ${errorMessage}`);
+      console.log(
+        `[Offscreen] Embedding ${batch.length} new items (${itemsToEmbed.length} total pending)...`
+      );
+
+      try {
+        const startingVectorIndex = await vectorStoreService.getVectorCount();
+        const sentences = batch.map((item: { textContent: string }) => item.textContent || "");
+        await vectorStoreService.generateAndStoreEmbeddings({ sentences });
+
+        const updates = batch.map((item: { id: string }, i: number) => ({
+          id: item.id,
+          vector_index: startingVectorIndex + i,
+          isEmbedded: true,
+          isDirty: false,
+        }));
+
+        await databaseManager.bulkUpdateItems(updates);
+        totalNewProcessed += batch.length;
+
+        // Notify UI of progress
+        sendStatusUpdate(`Embedded ${totalNewProcessed} new items...`);
+      } catch (error) {
+        console.error("[Offscreen] Error embedding new items batch:", error);
+        break;
+      }
+    }
+
+    if (totalNewProcessed > 0) {
+      console.log(`[Offscreen] Finished embedding ${totalNewProcessed} new items`);
+    }
+
+    // Process dirty items (need re-embedding)
+    const dirtyItems = await databaseManager.getDirtyItems();
+    if (dirtyItems.length > 0) {
+      console.log(`[Offscreen] Re-embedding ${dirtyItems.length} dirty items...`);
+
+      // Process dirty items in batches too
+      for (let i = 0; i < dirtyItems.length; i += EMBEDDING_BATCH_SIZE) {
+        const batch = dirtyItems.slice(i, i + EMBEDDING_BATCH_SIZE);
+
+        try {
+          const startingVectorIndex = await vectorStoreService.getVectorCount();
+          const sentences = batch.map((item: { textContent: string }) => item.textContent || "");
+          await vectorStoreService.generateAndStoreEmbeddings({ sentences });
+
+          const updates = batch.map((item: { id: string }, idx: number) => ({
+            id: item.id,
+            vector_index: startingVectorIndex + idx,
+            isDirty: false,
+          }));
+
+          await databaseManager.bulkUpdateItems(updates);
+        } catch (error) {
+          console.error("[Offscreen] Error re-embedding dirty items batch:", error);
+          break;
+        }
+      }
+
+      console.log(`[Offscreen] Finished re-embedding ${dirtyItems.length} dirty items`);
+    }
+  } finally {
+    isEmbeddingRunning = false;
+
+    // If another embedding was requested while we were running, run again
+    if (embeddingScheduled) {
+      setTimeout(processEmbeddingQueue, 100);
+    }
   }
 };
+
+/**
+ * Trigger embedding processing. Safe to call frequently -
+ * will debounce and batch automatically.
+ */
+export const triggerEmbedding = () => {
+  if (isEmbeddingRunning) {
+    embeddingScheduled = true;
+  } else {
+    // Small delay to allow batch accumulation
+    setTimeout(processEmbeddingQueue, 200);
+  }
+};
+
+// Listen for direct embedding trigger messages
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (message.type === "TRIGGER_EMBEDDING" && message.isForwarded) {
+    console.log("[Offscreen] Received TRIGGER_EMBEDDING message");
+    triggerEmbedding();
+    sendResponse({ success: true });
+    return true;
+  }
+});
 
 const initializeApp = async () => {
   try {
     sendStatusUpdate("Initializing database...");
     const db = await getDb();
-    sendStatusUpdate("Database initialized. Checking for seed data...");
-    const items = await db.items.find().exec();
+    sendStatusUpdate("Database initialized.");
 
-    if (items.length === 0) {
-      sendStatusUpdate("No items found. Seeding database...");
-      await addDummyData();
-      sendStatusUpdate("Database seeded successfully.");
-    } else {
-      sendStatusUpdate(`Found ${items.length} items in the database.`);
-    }
+    const items = await db.items.find().exec();
+    console.log(`[Offscreen] Found ${items.length} items in the database.`);
 
     // Initial embedding process
-    await embedNewItems();
-    await embedDirtyItems();
+    await processEmbeddingQueue();
 
-    // Broadcast RxDB changes to UI clients for reactivity
-    try {
-      db.folders.$.subscribe(() => {
-        chrome.runtime.sendMessage({ type: "DB_CHANGE", scope: "folders" });
-      });
-      db.items.$.subscribe(() => {
+    // Subscribe to item changes and trigger embedding
+    db.items.$.subscribe(() => {
+      try {
         chrome.runtime.sendMessage({ type: "DB_CHANGE", scope: "items" });
-      });
-    } catch (e) {
-      console.warn("Failed to attach RxDB change subscriptions", e);
-    }
+      } catch {}
+      // Trigger embedding when items change
+      triggerEmbedding();
+    });
+
+    db.folders.$.subscribe(() => {
+      try {
+        chrome.runtime.sendMessage({ type: "DB_CHANGE", scope: "folders" });
+      } catch {}
+    });
+
+    console.log("[Offscreen] Initialization complete with auto-embedding enabled.");
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : "An unknown error occurred";
-    console.error("Error during offscreen initialization:", error);
+    console.error("[Offscreen] Error during initialization:", error);
     sendStatusUpdate(`Error: ${errorMessage}`);
   }
 };

@@ -14,7 +14,7 @@
   "icons": {
     "128": "icon-128.png"
   },
-  "permissions": ["storage", "activeTab", "tabs", "scripting", "offscreen", "alarms"],
+  "permissions": ["storage", "activeTab", "tabs", "tabGroups", "scripting", "offscreen", "alarms"],
   "devtools_page": "src/pages/devtools/index.html",
   "web_accessible_resources": [
     {
@@ -29,6 +29,6 @@
     }
   ],
   "content_security_policy": {
-    "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'; worker-src 'self'; connect-src 'self' https://huggingface.co https://cas-bridge.xethub.hf.co https://cdn.jsdelivr.net"
+    "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'; worker-src 'self'; connect-src 'self' https://huggingface.co https://cas-bridge.xethub.hf.co https://cdn.jsdelivr.net https://meta.vibesearch.app"
   }
 }

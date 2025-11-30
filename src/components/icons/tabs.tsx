@@ -31,8 +31,8 @@ export const Tabs = ({
         fill={fillColor}
       />
       <path
-        fill-rule="evenodd"
-        clip-rule="evenodd"
+        fillRule="evenodd"
+        clipRule="evenodd"
         d="M2 8C2 5.79086 3.79086 4 6 4H18C20.2091 4 22 5.79086 22 8V16C22 18.2091 20.2091 20 18 20H6C3.79086 20 2 18.2091 2 16V8ZM18 6C19.1046 6 20 6.89543 20 8V10H4V8C4 6.89543 4.89543 6 6 6H18Z"
         fill={fillColor}
       />

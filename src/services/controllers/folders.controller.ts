@@ -1,6 +1,7 @@
 import { getDb } from "@src/services/DatabaseService";
 import { FolderDocType } from "@src/schemas/folder_schema";
 import { v4 as uuidv4 } from "uuid";
+import { databaseManager } from "@src/services/db-manager";
 
 export class FoldersController {
   [key: string]: any;
@@ -20,6 +21,7 @@ export class FoldersController {
       type: "folder",
       isLocked: false,
       isPinned: false,
+      isCollapsed: false,
       isDirty: false,
       serverVersion: 0,
       createdAt: now,
@@ -32,35 +34,80 @@ export class FoldersController {
     return folder;
   }
 
-  async setPinned(payload: { id: string; value: boolean }): Promise<void> {
+  async setPinned(payload: { id: string; value: boolean }): Promise<{ success: boolean }> {
     const db = await getDb();
     const doc = await db.folders.findOne(payload.id).exec();
-    if (!doc) return;
+    if (!doc) return { success: false };
     await doc.patch({ isPinned: payload.value, updatedAt: Date.now() });
     try {
       chrome.runtime.sendMessage({ type: "DB_CHANGE", scope: "folders" });
     } catch {}
+    return { success: true };
   }
 
-  async setLocked(payload: { id: string; value: boolean }): Promise<void> {
+  async setLocked(payload: { id: string; value: boolean }): Promise<{ success: boolean }> {
     const db = await getDb();
     const doc = await db.folders.findOne(payload.id).exec();
-    if (!doc) return;
+    if (!doc) return { success: false };
     await doc.patch({ isLocked: payload.value, updatedAt: Date.now() });
     try {
       chrome.runtime.sendMessage({ type: "DB_CHANGE", scope: "folders" });
     } catch {}
+    return { success: true };
   }
 
-  async rename(payload: { id: string; name: string }): Promise<void> {
+  async setCollapsed(payload: { id: string; value: boolean }): Promise<{ success: boolean }> {
     const db = await getDb();
     const doc = await db.folders.findOne(payload.id).exec();
-    if (!doc) return;
+    if (!doc) return { success: false };
+    await doc.patch({ isCollapsed: payload.value, updatedAt: Date.now() });
+    try {
+      chrome.runtime.sendMessage({ type: "DB_CHANGE", scope: "folders" });
+    } catch {}
+    return { success: true };
+  }
+
+  async rename(payload: { id: string; name: string }): Promise<{ success: boolean }> {
+    const db = await getDb();
+    const doc = await db.folders.findOne(payload.id).exec();
+    if (!doc) return { success: false };
     const name = payload.name.trim().slice(0, 80);
     await doc.patch({ name, updatedAt: Date.now() });
     try {
       chrome.runtime.sendMessage({ type: "DB_CHANGE", scope: "folders" });
     } catch {}
+    return { success: true };
+  }
+
+  /**
+   * Deletes a folder and optionally soft-deletes all items inside it.
+   * Respects the folder's locked state; locked folders will not be deleted.
+   */
+  async delete(payload: {
+    id: string;
+    alsoDeleteItems?: boolean;
+  }): Promise<{ success: boolean; error?: string }> {
+    const db = await getDb();
+    const doc = await db.folders.findOne(payload.id).exec();
+    if (!doc) return { success: false, error: "NOT_FOUND" };
+    const current = doc.toMutableJSON();
+    if (current.isLocked) return { success: false, error: "LOCKED" };
+
+    const alsoDeleteItems = payload.alsoDeleteItems !== false;
+    if (alsoDeleteItems) {
+      const items = await db.items
+        .find({ selector: { folderId: { $eq: payload.id }, deletedAt: { $eq: 0 } } })
+        .exec();
+      for (const item of items) {
+        await databaseManager.deleteItem({ id: item.primary });
+      }
+    }
+
+    await doc.remove();
+    try {
+      chrome.runtime.sendMessage({ type: "DB_CHANGE", scope: "folders" });
+    } catch {}
+    return { success: true };
   }
 }
 

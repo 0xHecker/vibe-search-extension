@@ -20,14 +20,7 @@
 }
 
 @font-face {
-  font-family: "Garamontio";
-  font-style: normal;
-  font-weight: 400;
-  src: url("/fonts/garamontio.woff2") format("woff2");
-}
-
-@font-face {
-  font-family: "Garamontio";
+  font-family: "Metal";
   font-style: italic;
   font-weight: 400;
   src: url("/fonts/Metal-Regular.woff2") format("woff2");

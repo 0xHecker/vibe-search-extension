@@ -56,7 +56,7 @@ const TooltipContent = React.forwardRef(
       className,
       side = "top",
       align = "center",
-      bgColor = "bg-background-inverse",
+      bgColor,
       sideOffset = 2,
       children,
       ...props
@@ -71,24 +71,19 @@ const TooltipContent = React.forwardRef(
   ) => {
     return (
       <TooltipPrimitive.Content
-        ref={ref}
+        ref={ref as React.Ref<HTMLDivElement>}
         sideOffset={sideOffset}
         className={cn(
-          "relative z-50 overflow-hidden p-2 animate-in fade-in-0 zoom-in-95 data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=closed]:zoom-out-95 data-[side=bottom]:slide-in-from-top-2 data-[side=left]:slide-in-from-right-2 data-[side=right]:slide-in-from-left-2 data-[side=top]:slide-in-from-bottom-2",
+          "relative z-50 overflow-hidden animate-in fade-in-0 zoom-in-95 data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=closed]:zoom-out-95 data-[side=bottom]:slide-in-from-top-2 data-[side=left]:slide-in-from-right-2 data-[side=right]:slide-in-from-left-2 data-[side=top]:slide-in-from-bottom-2",
           className
         )}
         {...{ align, side }}
         {...props}
       >
-        <TooltipPrimitive.Arrow asChild>
-          <span className={getArrowClasses({ side, align })}>
-            <TooltipArrow className={bgColor} />
-          </span>
-        </TooltipPrimitive.Arrow>
         <div
           className={cn(
-            "bg-background-inverse text-background-neutral text-sm rounded-md px-3 py-2 shadow-lg",
-            bgColor
+            "text-background-neutral text-xs rounded-md px-1.5 py-0.5 shadow-md",
+            bgColor ?? "bg-background-inverse/75"
           )}
         >
           {children}

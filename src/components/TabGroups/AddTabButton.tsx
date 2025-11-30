@@ -7,6 +7,7 @@ import { cn } from "@src/lib/utils";
 export const AddTabButton = ({ folderId }: { folderId: string }) => {
   const [isExpanded, setIsExpanded] = useState(false);
   const [url, setUrl] = useState("");
+  const [isAdding, setIsAdding] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
@@ -17,8 +18,11 @@ export const AddTabButton = ({ folderId }: { folderId: string }) => {
 
   const handleAdd = async () => {
     const trimmed = url.trim();
-    if (!trimmed) return;
+    if (!trimmed || isAdding) return;
+    setIsAdding(true);
     try {
+      // Insert the item immediately - metadata will be fetched asynchronously
+      // by the addToFolder method which triggers FETCH_METADATA
       await chrome.runtime.sendMessage({
         service: "items",
         type: "addToFolder",
@@ -34,6 +38,8 @@ export const AddTabButton = ({ folderId }: { folderId: string }) => {
       setIsExpanded(false);
     } catch (e) {
       console.error("Failed to add tab", e);
+    } finally {
+      setIsAdding(false);
     }
   };
 
@@ -48,6 +54,7 @@ export const AddTabButton = ({ folderId }: { folderId: string }) => {
         size="icon"
         variant="secondary"
         onClick={() => setIsExpanded(!isExpanded)}
+        disabled={isAdding}
         className={cn(
           "flex-shrink-0 h-6 w-6",
           isExpanded ? "shadow-none hover:bg-background-neutral hover:shadow-none" : ""
@@ -65,6 +72,7 @@ export const AddTabButton = ({ folderId }: { folderId: string }) => {
           if (e.key === "Enter") handleAdd();
         }}
         onBlur={() => setIsExpanded(false)}
+        disabled={isAdding}
         className={cn(
           "flex-grow w-full bg-transparent pl-0 py-1 placeholder:text-sm text-sm border-none outline-none hover:bg-transparent focus:bg-transparent hover:shadow-none focus:shadow-none transition-opacity duration-300",
           isExpanded ? "opacity-100" : "opacity-0"

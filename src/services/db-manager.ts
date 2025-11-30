@@ -1,4 +1,4 @@
-import { getDb, addDummyData } from "@src/services/DatabaseService";
+import { getDb } from "@src/services/DatabaseService";
 import { ItemDocType } from "@src/schemas/item_schema";
 import { FolderDocType } from "@src/schemas/folder_schema";
 
@@ -163,6 +163,7 @@ class DatabaseManager {
       chunkOrder: payload.item.chunkOrder,
       vector_index: -1,
       isEmbedded: false,
+      isMetaFetched: false,
       isDirty: true,
       serverVersion: 0,
       createdAt: now,
@@ -198,6 +199,7 @@ class DatabaseManager {
       type: payload.type ?? "folder",
       isLocked: payload.isLocked ?? false,
       isPinned: payload.isPinned ?? false,
+      isCollapsed: false,
       isDirty: false,
       serverVersion: 0,
       createdAt: now,

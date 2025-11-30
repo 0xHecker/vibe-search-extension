@@ -55,6 +55,7 @@ const Popup = () => {
             isFavorite: false,
             parentId: null,
             isEmbedded: false,
+            isMetaFetched: false,
             isDirty: true,
             serverVersion: 0,
             createdAt: Date.now(),

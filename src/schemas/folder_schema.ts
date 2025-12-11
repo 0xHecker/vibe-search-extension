@@ -5,6 +5,7 @@ export type FolderDocType = {
   name: string;
   parentId: string | null;
   type: "folder" | "tab_group";
+  sortOrder: number;
   isLocked: boolean;
   isPinned: boolean;
   isCollapsed: boolean;
@@ -18,7 +19,7 @@ export type FolderDocType = {
 
 export const folderSchema: RxJsonSchema<FolderDocType> = {
   title: "folder schema",
-  version: 1,
+  version: 4,
   description: "Describes a folder for organizing items or a group of tabs",
   primaryKey: "id",
   type: "object",
@@ -39,6 +40,13 @@ export const folderSchema: RxJsonSchema<FolderDocType> = {
       enum: ["folder", "tab_group"],
       default: "folder",
       maxLength: 50,
+    },
+    sortOrder: {
+      type: "integer",
+      multipleOf: 1,
+      minimum: 0,
+      maximum: Number.MAX_SAFE_INTEGER - 1,
+      default: 0,
     },
     // Security
     isLocked: { type: "boolean", default: false },
@@ -71,6 +79,7 @@ export const folderSchema: RxJsonSchema<FolderDocType> = {
     "userId",
     "isPinned",
     "isCollapsed",
+    "sortOrder",
   ],
-  indexes: ["isDirty", "userId", "type", "isPinned", "isCollapsed"],
+  indexes: ["isDirty", "userId", "type", "isPinned", "isCollapsed", "sortOrder"],
 };

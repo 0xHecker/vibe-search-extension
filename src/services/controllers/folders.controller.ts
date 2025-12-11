@@ -19,6 +19,7 @@ export class FoldersController {
       userId: payload.userId ?? null,
       parentId: payload.parentId ?? null,
       type: "folder",
+      sortOrder: now,
       isLocked: false,
       isPinned: false,
       isCollapsed: false,
@@ -104,6 +105,32 @@ export class FoldersController {
     }
 
     await doc.remove();
+    try {
+      chrome.runtime.sendMessage({ type: "DB_CHANGE", scope: "folders" });
+    } catch {}
+    return { success: true };
+  }
+
+  async reorder(payload: { orderedIds: string[] }): Promise<{ success: boolean }> {
+    const db = await getDb();
+    const docs = await db.folders.find().exec();
+    if (docs.length === 0) return { success: true };
+    const allIds = docs.map((d) => d.primary);
+    const provided = payload.orderedIds || [];
+    const remainder = allIds.filter((id) => !provided.includes(id));
+    const finalOrder = [...provided, ...remainder];
+    const now = Date.now();
+
+    for (let i = 0; i < finalOrder.length; i++) {
+      const id = finalOrder[i];
+      const doc = await db.folders.findOne(id).exec();
+      if (!doc) continue;
+      const current = doc.toMutableJSON() as FolderDocType;
+      const nextOrder = i;
+      if (current.sortOrder !== nextOrder) {
+        await doc.patch({ sortOrder: nextOrder, updatedAt: now });
+      }
+    }
     try {
       chrome.runtime.sendMessage({ type: "DB_CHANGE", scope: "folders" });
     } catch {}

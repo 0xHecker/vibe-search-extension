@@ -1,5 +1,5 @@
 import { ItemDocType } from "@src/schemas/item_schema";
-import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { ImportIcon } from "@icons/import";
 import { DotsVertical } from "@icons/dots-vertical";
 import { Button } from "../ui/button";
@@ -8,7 +8,6 @@ import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
-  DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "../ui/dropdown-menu";
 import { Tooltip, TooltipTrigger, TooltipContent } from "../ui/tooltip";
@@ -21,8 +20,13 @@ import {
   ContextMenuTrigger,
   ContextMenuContent,
   ContextMenuItem,
+  ContextMenuSeparator,
 } from "@components/ui/context-menu";
 import { TagEditorDialog } from "@components/TabGroups/TagEditorDialog";
+import { useSelection } from "./SelectionContext";
+import { WebsitePreview } from "./WebsitePreview";
+import { useSortable } from "@dnd-kit/sortable";
+import { CSS } from "@dnd-kit/utilities";
 
 export const GridItem = ({
   item,
@@ -37,16 +41,40 @@ export const GridItem = ({
   const [heights, setHeights] = useState({ collapsed: 0, expanded: 0 });
   const [isDeleteDialogOpen, setIsDeleteDialogOpen] = useState(false);
   const [deleteScope, setDeleteScope] = useState<"current" | "all">("current");
-  const [isSelected, setIsSelected] = useState(false);
   const [isMenuOpen, setIsMenuOpen] = useState(false);
   const [isTagEditorOpen, setIsTagEditorOpen] = useState(false);
+  const [isPreviewOpen, setIsPreviewOpen] = useState(false);
   const [tags, setTags] = useState<{ id: string; name: string }[]>([]);
   const [isRefreshing, setIsRefreshing] = useState(false);
 
+  const { isSelectionMode, isSelected, toggleItem, selectItem, selectedIds } = useSelection();
+  const itemIsSelected = isSelected(item.id);
   const isLoading = !item.isMetaFetched || isRefreshing;
+  const { attributes, listeners, setNodeRef, transform, transition, isDragging, isOver } =
+    useSortable({
+      id: item.id,
+      data: {
+        type: "item",
+        item,
+        folderId: item.folderId,
+        selectedIds: isSelectionMode ? Array.from(selectedIds) : [item.id],
+      },
+    });
+  const style = {
+    transform: CSS.Transform.toString(transform),
+    transition,
+  };
 
   const handleMenuOpenChange = (open: boolean) => {
     setIsMenuOpen(open);
+  };
+
+  const handleSelect = () => {
+    selectItem(item.id);
+  };
+
+  const handleToggleSelect = () => {
+    toggleItem(item.id);
   };
 
   const renderMenu = () => (
@@ -63,6 +91,7 @@ export const GridItem = ({
         </Button>
       </DropdownMenuTrigger>
       <DropdownMenuContent sideOffset={4} align="start" className="min-w-[170px]">
+        <DropdownMenuItem onSelect={handleSelect}>Select</DropdownMenuItem>
         <DropdownMenuItem
           onSelect={() => {
             try {
@@ -76,8 +105,9 @@ export const GridItem = ({
         </DropdownMenuItem>
         <DropdownMenuItem onSelect={() => setIsTagEditorOpen(true)}>Edit tags</DropdownMenuItem>
         <DropdownMenuItem onSelect={handleRefreshMetadata}>Refresh metadata</DropdownMenuItem>
-        <DropdownMenuItem disabled>View in side panel</DropdownMenuItem>
-        <DropdownMenuItem disabled>Select item</DropdownMenuItem>
+        <DropdownMenuItem onSelect={() => setIsPreviewOpen(true)}>
+          View in side panel
+        </DropdownMenuItem>
         <DropdownMenuItem disabled>Edit</DropdownMenuItem>
         <DropdownMenuItem
           variant="destructive"
@@ -115,6 +145,7 @@ export const GridItem = ({
   useLayoutEffect(() => {
     recomputeHeights();
   }, [recomputeHeights, item.textContent]);
+
   useEffect(() => {
     const el = textRef.current;
     if (!el) return;
@@ -162,7 +193,6 @@ export const GridItem = ({
         type: "FETCH_METADATA",
         payload: { urls: [item.url], revalidate: true },
       });
-      // The item will update via DB subscription, but add a timeout fallback
       setTimeout(() => setIsRefreshing(false), 10000);
     } catch (error) {
       console.error("Failed to refresh metadata", error);
@@ -174,46 +204,69 @@ export const GridItem = ({
     <ContextMenu>
       <ContextMenuTrigger asChild>
         <div
+          ref={setNodeRef}
+          style={style}
           className={cn(
-            "group/card max-w-[350px] bg-platinum rounded-semi shadow-card relative",
-            isLoading && "opacity-80"
+            "group/card max-w-[350px] rounded-semi shadow-card relative transition-all duration-200",
+            isLoading && "opacity-80",
+            itemIsSelected ? "bg-violet-500/10 ring-2 ring-violet-500/40" : "bg-platinum",
+            isDragging && "ring-2 ring-accent/50 shadow-2xl shadow-black/20 scale-[1.01]",
+            isOver &&
+              !isDragging &&
+              "ring-1 ring-accent/40 shadow-md shadow-black/10 bg-background-neutral"
           )}
           data-observe="item"
           data-url={item.url}
+          {...attributes}
+          {...listeners}
         >
-          <div className="absolute left-4 top-4 z-20">
+          {/* Selection checkbox - visible on hover or in selection mode */}
+          <div
+            className={cn(
+              "absolute left-4 top-4 z-20 transition-opacity duration-200",
+              isSelectionMode || itemIsSelected
+                ? "opacity-100"
+                : "opacity-0 group-hover/card:opacity-100"
+            )}
+          >
             <div className="relative">
               <Checkbox
                 className={cn(
                   "size-4 rounded-[6px] bg-background-neutral text-foreground-neutral shadow-sm transition-all duration-200",
                   "border border-border-neutral-faded cursor-pointer shadow-sm",
                   "data-[state=checked]:border-accent-secondary data-[state=checked]:bg-accent-secondary data-[state=checked]:text-background-neutral",
-                  "group-hover/card:opacity-100",
-                  isSelected ? "opacity-100" : "opacity-0",
                   "focus-visible:ring-2 focus-visible:ring-border-neutral/80 focus-visible:ring-offset-1"
                 )}
-                checked={isSelected}
-                onCheckedChange={(checked) => {
-                  setIsSelected(Boolean(checked));
-                }}
+                checked={itemIsSelected}
+                onCheckedChange={() => handleToggleSelect()}
                 aria-label="Select tab card"
               />
+              {/* Invisible expanded click area for better UX */}
               <div
                 className="absolute -left-1 -top-1 -right-4 -bottom-4 cursor-pointer"
-                onClick={() => setIsSelected(!isSelected)}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  handleToggleSelect();
+                }}
                 aria-label="Select tab card"
                 aria-hidden="true"
               />
             </div>
           </div>
 
+          {/* Action buttons */}
           <div
             className={cn(
               "absolute right-3 top-3 z-20 flex items-center gap-2 text-foreground-tertiary transition-all duration-200",
               "opacity-0 group-hover/card:opacity-100"
             )}
           >
-            <Button variant={"ghost"} className="size-5 p-1" aria-label="Preview tab">
+            <Button
+              variant={"ghost"}
+              className="size-5 p-1"
+              aria-label="Preview tab"
+              onClick={() => setIsPreviewOpen(true)}
+            >
               <EyeOpen size={20} />
             </Button>
             <Button
@@ -236,7 +289,6 @@ export const GridItem = ({
                 alt={item.title}
                 className="w-full object-cover rounded-sm-semi"
                 onError={(e) => {
-                  // hide broken image
                   e.currentTarget.style.display = "none";
                 }}
               />
@@ -293,7 +345,7 @@ export const GridItem = ({
                           <img
                             src={item.iconUrl}
                             alt=""
-                            className="h-3 w-3 rounded-sm object-contain flex-shrink-0]" //[filter:grayscale(100%)
+                            className="h-3 w-3 rounded-sm object-contain flex-shrink-0"
                             onError={(e) => {
                               e.currentTarget.style.display = "none";
                             }}
@@ -347,20 +399,24 @@ export const GridItem = ({
               </div>
             </div>
           </div>
-          <div className="flex flex-row flex-wrap gap-1 rounded-semi px-2 py-1">
-            {tags.map((t) => (
-              <div
-                key={t.id}
-                className="rounded-md w-fit px-2 bg-gray-10 hover:bg-gray-40 transition-all cursor-pointer text-xs text-foreground-secondary"
-              >
-                {t.name}
-              </div>
-            ))}
-          </div>
+          {tags.length > 0 && (
+            <div className="flex flex-row flex-wrap gap-1 rounded-semi px-2 py-1">
+              {tags.map((t) => (
+                <div
+                  key={t.id}
+                  className="rounded-md w-fit px-2 bg-gray-10 hover:bg-gray-40 transition-all cursor-pointer text-xs text-foreground-secondary"
+                >
+                  {t.name}
+                </div>
+              ))}
+            </div>
+          )}
         </div>
       </ContextMenuTrigger>
 
       <ContextMenuContent className="min-w-[170px]">
+        <ContextMenuItem onSelect={handleSelect}>Select</ContextMenuItem>
+        <ContextMenuSeparator />
         <ContextMenuItem
           onSelect={() => {
             try {
@@ -374,9 +430,11 @@ export const GridItem = ({
         </ContextMenuItem>
         <ContextMenuItem onSelect={() => setIsTagEditorOpen(true)}>Edit tags</ContextMenuItem>
         <ContextMenuItem onSelect={handleRefreshMetadata}>Refresh metadata</ContextMenuItem>
-        <ContextMenuItem disabled>View in side panel</ContextMenuItem>
-        <ContextMenuItem disabled>Select item</ContextMenuItem>
+        <ContextMenuItem onSelect={() => setIsPreviewOpen(true)}>
+          View in side panel
+        </ContextMenuItem>
         <ContextMenuItem disabled>Edit</ContextMenuItem>
+        <ContextMenuSeparator />
         <ContextMenuItem
           onSelect={() => {
             setDeleteScope("current");
@@ -405,7 +463,7 @@ export const GridItem = ({
         description={
           deleteScope === "all"
             ? `This will delete "${item.title}" from every tab group. This action cannot be undone.`
-            : `This will remove "${item.title}" from this tab group. You can’t undo this action.`
+            : `This will remove "${item.title}" from this tab group. You can't undo this action.`
         }
         confirmLabel={deleteScope === "all" ? "Delete from all groups" : "Delete tab"}
         variant="danger"
@@ -431,6 +489,12 @@ export const GridItem = ({
         open={isTagEditorOpen}
         onOpenChange={setIsTagEditorOpen}
         onTagsUpdate={setTags}
+      />
+      <WebsitePreview
+        url={item.url}
+        title={item.title}
+        open={isPreviewOpen}
+        onOpenChange={setIsPreviewOpen}
       />
     </ContextMenu>
   );

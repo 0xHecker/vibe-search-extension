@@ -131,6 +131,7 @@ export class ItemsController {
       folderId: payload.folderId,
       isFavorite: false,
       parentId: null,
+      chunkOrder: now,
       vector_index: -1,
       isEmbedded: false,
       isMetaFetched: false,
@@ -221,6 +222,44 @@ export class ItemsController {
       payload: { urls, revalidate: true },
       target: "background",
     });
+  }
+
+  async reorder(payload: {
+    folders: { folderId: string; orderedIds: string[] }[];
+  }): Promise<{ updated: number }> {
+    const db = await getDb();
+    let updated = 0;
+
+    for (const entry of payload.folders || []) {
+      const { folderId, orderedIds } = entry;
+      if (!folderId) continue;
+      const docs = await db.items
+        .find({ selector: { folderId: { $eq: folderId }, deletedAt: { $eq: 0 } } })
+        .exec();
+      const allIds = docs.map((d) => d.primary);
+      const remainder = allIds.filter((id) => !orderedIds.includes(id));
+      const finalOrder = [...orderedIds, ...remainder];
+
+      for (let i = 0; i < finalOrder.length; i++) {
+        const id = finalOrder[i];
+        const doc = await db.items.findOne(id).exec();
+        if (!doc) continue;
+        const current = doc.toMutableJSON() as ItemDocType;
+        const needsPatch = current.folderId !== folderId || current.chunkOrder !== i;
+        if (needsPatch) {
+          await doc.patch({ folderId, chunkOrder: i, updatedAt: Date.now() });
+          updated++;
+        }
+      }
+    }
+
+    if (updated > 0) {
+      try {
+        chrome.runtime.sendMessage({ type: "DB_CHANGE", scope: "items" });
+      } catch {}
+    }
+
+    return { updated };
   }
 
   async delete(payload: {

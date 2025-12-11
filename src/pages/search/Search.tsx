@@ -27,13 +27,12 @@ const Search = () => {
         target: "offscreen",
       });
       if (foldersResponse?.success) {
-        setFolders(
-          (foldersResponse.payload as FolderDocType[]).slice().sort((a, b) => {
-            // Pinned first, within each group order by createdAt desc
-            if (!!a.isPinned !== !!b.isPinned) return a.isPinned ? -1 : 1;
-            return b.createdAt - a.createdAt;
-          })
-        );
+        const sorted = (foldersResponse.payload as FolderDocType[]).slice().sort((a, b) => {
+          // Pinned first, within each group order by createdAt desc
+          if (!!a.isPinned !== !!b.isPinned) return a.isPinned ? -1 : 1;
+          return b.createdAt - a.createdAt;
+        });
+        setFolders(sorted);
       }
 
       const itemsResponse = await chrome.runtime.sendMessage({

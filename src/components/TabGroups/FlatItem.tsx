@@ -1,19 +1,26 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { CopyIcon } from "@icons/copy";
 import { Checkmark } from "@icons/checkmark";
 import { OpenArrowIcon } from "@icons/open-arrow";
 import { DeleteIcon } from "@icons/delete";
 import { ItemDocType } from "@src/schemas/item_schema";
 import { WebIcon } from "@icons/web";
+import { EyeOpen } from "@components/icons/eye-open";
 import { ConfirmDialog } from "@components/ui/confirm-dialog";
 import {
   ContextMenu,
   ContextMenuTrigger,
   ContextMenuContent,
   ContextMenuItem,
+  ContextMenuSeparator,
 } from "@components/ui/context-menu";
 import { TagEditorDialog } from "@components/TabGroups/TagEditorDialog";
 import { cn } from "@src/lib/utils";
+import { useSelection } from "./SelectionContext";
+import { Checkbox } from "@components/ui/checkbox";
+import { WebsitePreview } from "./WebsitePreview";
+import { useSortable } from "@dnd-kit/sortable";
+import { CSS } from "@dnd-kit/utilities";
 
 export const FlatItem = ({
   item,
@@ -25,9 +32,42 @@ export const FlatItem = ({
   const [isCopied, setIsCopied] = useState(false);
   const [isDeleteDialogOpen, setIsDeleteDialogOpen] = useState(false);
   const [isTagEditorOpen, setIsTagEditorOpen] = useState(false);
+  const [isPreviewOpen, setIsPreviewOpen] = useState(false);
   const [isRefreshing, setIsRefreshing] = useState(false);
+  const [tags, setTags] = useState<{ id: string; name: string }[]>([]);
 
+  const { isSelectionMode, isSelected, toggleItem, selectItem, selectedIds } = useSelection();
+  const itemIsSelected = isSelected(item.id);
   const isLoading = !item.isMetaFetched || isRefreshing;
+  const { attributes, listeners, setNodeRef, transform, transition, isDragging, isOver } =
+    useSortable({
+      id: item.id,
+      data: {
+        type: "item",
+        item,
+        folderId: item.folderId,
+        selectedIds: isSelectionMode ? Array.from(selectedIds) : [item.id],
+      },
+    });
+  const style = {
+    transform: CSS.Transform.toString(transform),
+    transition,
+  };
+
+  // Fetch tags on mount
+  useEffect(() => {
+    (async () => {
+      try {
+        const res = await chrome.runtime.sendMessage({
+          service: "tags",
+          type: "getTagsForItem",
+          target: "offscreen",
+          payload: { itemId: item.id },
+        });
+        if (res?.success) setTags(res.payload as any);
+      } catch {}
+    })();
+  }, [item.id]);
 
   const handleCopy = async () => {
     try {
@@ -71,7 +111,6 @@ export const FlatItem = ({
         type: "FETCH_METADATA",
         payload: { urls: [item.url], revalidate: true },
       });
-      // The item will update via DB subscription, but add a timeout fallback
       setTimeout(() => setIsRefreshing(false), 10000);
     } catch (error) {
       console.error("Failed to refresh metadata", error);
@@ -79,19 +118,67 @@ export const FlatItem = ({
     }
   };
 
+  const handleSelect = () => {
+    selectItem(item.id);
+  };
+
+  const handleToggleSelect = () => {
+    toggleItem(item.id);
+  };
+
   return (
     <>
       <ContextMenu>
         <ContextMenuTrigger asChild>
           <div
-            className={cn("flex flex-row gap-4 items-center group", isLoading && "opacity-70")}
+            ref={setNodeRef}
+            style={style}
+            className={cn(
+              "flex flex-row gap-4 items-center group rounded-lg",
+              isLoading && "opacity-70",
+              isDragging && "ring-2 ring-accent/50 shadow-xl shadow-black/15 bg-background-neutral",
+              isOver && !isDragging && "ring-1 ring-accent/40 bg-background-neutral/90 shadow-md",
+              itemIsSelected && "bg-accent-faded/50"
+            )}
             data-observe="item"
             data-url={item.url}
+            {...attributes}
+            {...listeners}
           >
-            <div className="flex flex-row gap-2 cursor-pointer" onClick={handleOpen}>
-              <div className={cn("w-5 h-5 rounded-sm", isLoading && "animate-pulse")}>
+            {/* Checkbox - only visible in selection mode */}
+            {isSelectionMode && (
+              <div
+                className="flex-shrink-0"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  handleToggleSelect();
+                }}
+              >
+                <Checkbox
+                  checked={itemIsSelected}
+                  className={cn(
+                    "h-4 w-4 cursor-pointer",
+                    itemIsSelected &&
+                      "border-accent-secondary bg-accent-secondary text-background-neutral"
+                  )}
+                />
+              </div>
+            )}
+
+            <div
+              className="flex flex-row gap-2 cursor-pointer flex-1 min-w-0"
+              onClick={isSelectionMode ? handleToggleSelect : handleOpen}
+            >
+              <div className={cn("w-5 h-5 rounded-sm flex-shrink-0", isLoading && "animate-pulse")}>
                 {item.iconUrl ? (
-                  <img src={item.iconUrl} alt={item.title} className="w-5 h-5 rounded-sm" />
+                  <img
+                    src={item.iconUrl}
+                    alt={item.title}
+                    className="w-5 h-5 rounded-sm"
+                    onError={(e) => {
+                      e.currentTarget.style.display = "none";
+                    }}
+                  />
                 ) : (
                   <WebIcon className="w-5 h-5 rounded-sm text-foreground-icon" />
                 )}
@@ -104,52 +191,86 @@ export const FlatItem = ({
               >
                 {item.title}
               </span>
+              {tags.length > 0 && (
+                <div className="flex flex-row gap-1 flex-shrink-0">
+                  {tags.slice(0, 3).map((t) => (
+                    <span
+                      key={t.id}
+                      className="px-1.5 py-0.5 rounded text-[10px] bg-gray-10 text-foreground-tertiary"
+                    >
+                      {t.name}
+                    </span>
+                  ))}
+                  {tags.length > 3 && (
+                    <span className="text-[10px] text-foreground-tertiary">+{tags.length - 3}</span>
+                  )}
+                </div>
+              )}
               {isLoading && (
-                <span className="text-xs text-foreground-tertiary italic">loading...</span>
+                <span className="text-xs text-foreground-tertiary italic flex-shrink-0">
+                  loading...
+                </span>
               )}
             </div>
 
-            <div className="flex flex-row gap-1 invisible group-hover:visible transition-opacity duration-300 opacity-0 group-hover:opacity-100 text-foreground-tertiary">
-              <button
-                type="button"
-                onClick={handleCopy}
-                className="cursor-pointer hover:text-foreground-secondary"
-                aria-label="Copy tab URL"
-              >
-                {isCopied ? (
-                  <Checkmark
-                    size={20}
-                    className="text-foreground-secondary animate-in fade-in-0 zoom-in-95"
-                  />
-                ) : (
-                  <CopyIcon size={20} />
-                )}
-              </button>
-              <button
-                type="button"
-                className="cursor-pointer hover:text-foreground-secondary transition-colors duration-300"
-                aria-label="Open tab"
-                onClick={handleOpen}
-              >
-                <OpenArrowIcon size={20} />
-              </button>
-              <button
-                type="button"
-                className="cursor-pointer hover:text-foreground-danger transition-colors duration-300"
-                aria-label="Delete tab"
-                onClick={() => setIsDeleteDialogOpen(true)}
-              >
-                <DeleteIcon size={20} />
-              </button>
-            </div>
+            {/* Action buttons - hidden in selection mode */}
+            {!isSelectionMode && (
+              <div className="flex flex-row gap-1 invisible group-hover:visible transition-opacity duration-300 opacity-0 group-hover:opacity-100 text-foreground-tertiary">
+                <button
+                  type="button"
+                  onClick={handleCopy}
+                  className="cursor-pointer hover:text-foreground-secondary"
+                  aria-label="Copy tab URL"
+                >
+                  {isCopied ? (
+                    <Checkmark
+                      size={20}
+                      className="text-foreground-secondary animate-in fade-in-0 zoom-in-95"
+                    />
+                  ) : (
+                    <CopyIcon size={20} />
+                  )}
+                </button>
+                <button
+                  type="button"
+                  className="cursor-pointer hover:text-foreground-secondary transition-colors duration-300"
+                  aria-label="Preview"
+                  onClick={() => setIsPreviewOpen(true)}
+                >
+                  <EyeOpen size={20} />
+                </button>
+                <button
+                  type="button"
+                  className="cursor-pointer hover:text-foreground-secondary transition-colors duration-300"
+                  aria-label="Open tab"
+                  onClick={handleOpen}
+                >
+                  <OpenArrowIcon size={20} />
+                </button>
+                <button
+                  type="button"
+                  className="cursor-pointer hover:text-foreground-danger transition-colors duration-300"
+                  aria-label="Delete tab"
+                  onClick={() => setIsDeleteDialogOpen(true)}
+                >
+                  <DeleteIcon size={20} />
+                </button>
+              </div>
+            )}
           </div>
         </ContextMenuTrigger>
 
         <ContextMenuContent className="min-w-[170px]">
+          <ContextMenuItem onSelect={handleSelect}>Select</ContextMenuItem>
+          <ContextMenuSeparator />
           <ContextMenuItem onSelect={handleCopy}>Copy URL</ContextMenuItem>
           <ContextMenuItem onSelect={handleOpen}>Open in New Tab</ContextMenuItem>
           <ContextMenuItem onSelect={() => setIsTagEditorOpen(true)}>Edit tags</ContextMenuItem>
           <ContextMenuItem onSelect={handleRefreshMetadata}>Refresh metadata</ContextMenuItem>
+          <ContextMenuItem onSelect={() => setIsPreviewOpen(true)}>
+            View in side panel
+          </ContextMenuItem>
+          <ContextMenuSeparator />
           <ContextMenuItem disabled>Edit</ContextMenuItem>
           <ContextMenuItem onSelect={() => setIsDeleteDialogOpen(true)} variant="destructive">
             Delete from Current Tab Group
@@ -157,13 +278,25 @@ export const FlatItem = ({
         </ContextMenuContent>
       </ContextMenu>
 
-      <TagEditorDialog itemId={item.id} open={isTagEditorOpen} onOpenChange={setIsTagEditorOpen} />
+      <TagEditorDialog
+        itemId={item.id}
+        open={isTagEditorOpen}
+        onOpenChange={setIsTagEditorOpen}
+        onTagsUpdate={setTags}
+      />
+
+      <WebsitePreview
+        url={item.url}
+        title={item.title}
+        open={isPreviewOpen}
+        onOpenChange={setIsPreviewOpen}
+      />
 
       <ConfirmDialog
         open={isDeleteDialogOpen}
         onOpenChange={setIsDeleteDialogOpen}
         title="Delete this tab?"
-        description={`This will remove "${item.title}" from this tab group. You can’t undo this action.`}
+        description={`This will remove "${item.title}" from this tab group. You can't undo this action.`}
         confirmLabel="Delete tab"
         onConfirm={handleDelete}
         variant="danger"

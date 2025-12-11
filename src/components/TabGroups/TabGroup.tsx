@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect } from "react";
+import { useState, useRef, useEffect, useMemo } from "react";
 import { CopyIcon } from "@icons/copy";
 import { Checkmark } from "@icons/checkmark";
 import { OpenArrowIcon } from "@icons/open-arrow";
@@ -33,13 +33,25 @@ import { ConfirmDialog } from "@components/ui/confirm-dialog";
 import { OpenInCurrent } from "@icons/open-in-current";
 import { OpenInTabgroup } from "@icons/open-in-tabgroup";
 import { OpenInWindow } from "@icons/open-in-window";
+import { SelectionProvider, useSelection } from "./SelectionContext";
+import { BulkActionsBar } from "./BulkActionsBar";
+import { useDroppable } from "@dnd-kit/core";
+import {
+  SortableContext,
+  rectSortingStrategy,
+  useSortable,
+  verticalListSortingStrategy,
+} from "@dnd-kit/sortable";
+import { CSS } from "@dnd-kit/utilities";
 
 interface TabGroupProps {
   folder: FolderDocType;
   items: ItemDocType[];
+  allFolders: FolderDocType[];
+  viewMode: "list" | "grid";
 }
 
-export const TabGroup = ({ folder, items }: TabGroupProps) => {
+const TabGroupContent = ({ folder, items, allFolders, viewMode }: TabGroupProps) => {
   const [isCollapsed, setIsCollapsed] = useState(folder.isCollapsed ?? false);
   const [isEditingTitle, setIsEditingTitle] = useState(false);
   const [title, setTitle] = useState(folder.name);
@@ -52,6 +64,37 @@ export const TabGroup = ({ folder, items }: TabGroupProps) => {
   const [isOpenMenu, setIsOpenMenu] = useState(false);
   const [isDeleteDialogOpen, setIsDeleteDialogOpen] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
+
+  const { isSelectionMode } = useSelection();
+  const {
+    attributes,
+    listeners,
+    setActivatorNodeRef,
+    setNodeRef,
+    transform,
+    transition,
+    isDragging,
+  } = useSortable({
+    id: folder.id,
+    data: { type: "folder", folder },
+  });
+  const { setNodeRef: setDropRef, isOver } = useDroppable({
+    id: `folder-drop-${folder.id}`,
+    data: { type: "folder-drop", folderId: folder.id },
+  });
+
+  const combinedRef = (node: HTMLElement | null) => {
+    setNodeRef(node);
+    setDropRef(node);
+  };
+
+  const sortableStyle = useMemo(
+    () => ({
+      transform: CSS.Transform.toString(transform),
+      transition,
+    }),
+    [transform, transition]
+  );
 
   useEffect(() => {
     if (isEditingTitle) {
@@ -255,245 +298,301 @@ export const TabGroup = ({ folder, items }: TabGroupProps) => {
   };
 
   return (
-    <div className="group/tabgroup flex relative flex-col">
+    <>
       <div
+        ref={combinedRef}
+        style={sortableStyle}
         className={cn(
-          "absolute right-4 transition-all duration-300 flex flex-row gap-1",
-          isCollapsed ? "top-2" : "top-5.5",
-          isPinned || isLocked ? "opacity-100" : "opacity-0 group-hover/tabgroup:opacity-100"
+          "group/tabgroup flex relative flex-col rounded-xl transition-shadow duration-200",
+          isDragging ? "shadow-2xl shadow-black/20 ring-2 ring-accent/50 scale-[1.01]" : "",
+          isOver ? "outline-2 outline-accent/70 outline-offset-4" : ""
         )}
       >
+        {/* Pin/Lock controls */}
         <div
-          onClick={toggleLocked}
           className={cn(
-            "cursor-pointer transition-all duration-300",
-            isLocked
-              ? "text-foreground-icon"
-              : "text-foreground-tertiary/60 hover:text-foreground-tertiary",
-            isUpdatingLocked && "opacity-60 pointer-events-none"
+            "absolute right-4 transition-all duration-300 flex flex-row gap-1",
+            isCollapsed ? "top-2" : "top-5.5",
+            isPinned || isLocked ? "opacity-100" : "opacity-0 group-hover/tabgroup:opacity-100"
           )}
         >
-          <LockShadowIcon size={28} className="transition-all duration-300" />
-        </div>
-        <div
-          onClick={togglePinned}
-          className={cn(
-            "cursor-pointer transition-all duration-300",
-            isPinned
-              ? "text-foreground-icon"
-              : "text-foreground-tertiary/60 hover:text-foreground-tertiary",
-            isUpdatingPinned && "opacity-60 pointer-events-none"
-          )}
-        >
-          <PinShadowIcon size={28} className="transition-all duration-300" />
-        </div>
-      </div>
-
-      <div
-        className={cn(
-          "flex flex-row items-center px-4 py-2 transition-colors duration-300 border border-transparent rounded-semi",
-          isCollapsed ? "bg-background-page-secondary border-border-neutral-faded shadow-sm" : ""
-        )}
-      >
-        <Button
-          size="icon"
-          variant="outline"
-          className={cn("h-6 w-6 rounded-semi")}
-          onClick={handleToggleCollapse}
-        >
-          <ChevronRight
-            size={16}
-            className={cn(
-              "transition-all duration-300 text-foreground-tertiary hover:text-foreground-icon",
-              !isCollapsed && "rotate-90"
-            )}
-          />
-        </Button>
-
-        {isEditingTitle ? (
-          <Input
-            ref={inputRef}
-            value={title}
-            onChange={(e) => setTitle(e.target.value)}
-            onBlur={() => {
-              setIsEditingTitle(false);
-              commitTitle();
-            }}
-            onKeyDown={(e) => {
-              if (e.key === "Enter") {
-                setIsEditingTitle(false);
-                commitTitle();
-              }
-            }}
-            className="text-foreground-neutral font-semibold text-xl w-fit max-w-[50%] ml-4 h-auto px-2 py-0 transition-transform shadow-none focus-visible:border-2 focus-visible:border-border-neutral bg-transparent"
-          />
-        ) : (
-          <span
-            className="text-foreground-neutral font-semibold text-xl max-w-[50%] truncate ml-4 cursor-text"
-            onClick={() => setIsEditingTitle(true)}
-          >
-            {title.length > 40 ? `${title.slice(0, 40)}…` : title}
-          </span>
-        )}
-
-        <div className="text-foreground-tertiary">
-          <DotIcon size={20} />
-        </div>
-
-        <span className="text-foreground-secondary text-xs">{items.length} tabs</span>
-
-        <div className="text-foreground-tertiary">
-          <DotIcon size={20} />
-        </div>
-
-        <span className="text-foreground-secondary text-xs">
-          {new Intl.DateTimeFormat(undefined, {
-            day: "numeric",
-            month: "short",
-            year: "numeric",
-          }).format(new Date(folder.createdAt))}{" "}
-          at{" "}
-          {new Intl.DateTimeFormat(undefined, {
-            hour: "numeric",
-            minute: "numeric",
-          }).format(new Date(folder.createdAt))}
-        </span>
-
-        {/** Will add created at and last updated at in future */}
-        <div className="flex flex-row gap-2 text-foreground-tertiary ml-4">
           <div
-            onClick={handleCopyFolderUrls}
-            className="cursor-pointer hover:text-foreground-secondary transition-all duration-300"
-          >
-            {copiedFolderId === folder.id ? (
-              <Checkmark
-                size={24}
-                className="text-foreground-secondary animate-in fade-in-0 zoom-in-95"
-              />
-            ) : (
-              <CopyIcon />
-            )}
-          </div>
-          <DropdownMenu open={isOpenMenu} onOpenChange={setIsOpenMenu}>
-            <DropdownMenuTrigger asChild>
-              <div
-                className="cursor-pointer hover:text-foreground-secondary transition-colors duration-300"
-                onContextMenu={(e) => {
-                  e.preventDefault();
-                  setIsOpenMenu(true);
-                }}
-              >
-                <OpenArrowIcon />
-              </div>
-            </DropdownMenuTrigger>
-            <DropdownMenuContent sideOffset={8} className="min-w-[200px]">
-              <DropdownMenuItem
-                className="flex items-center gap-2"
-                onClick={handleOpenInCurrentWindow}
-              >
-                <OpenInCurrent />
-                <span>Open in current window</span>
-              </DropdownMenuItem>
-              <DropdownMenuItem
-                className="flex items-center gap-2"
-                onClick={handleOpenInNewTabGroup}
-              >
-                <OpenInTabgroup size={20} />
-                <span>Open in new tab group</span>
-              </DropdownMenuItem>
-              <DropdownMenuItem className="flex items-center gap-2" onClick={handleOpenInNewWindow}>
-                <OpenInWindow size={20} />
-                <span>Open in new window</span>
-              </DropdownMenuItem>
-              <DropdownMenuItem
-                className="flex items-center gap-2"
-                onClick={handleRefreshAllMetadata}
-              >
-                <span>Refresh all metadata</span>
-              </DropdownMenuItem>
-            </DropdownMenuContent>
-          </DropdownMenu>
-          <button
-            type="button"
+            onClick={toggleLocked}
             className={cn(
-              "cursor-pointer transition-colors duration-300",
+              "cursor-pointer transition-all duration-300",
               isLocked
-                ? "text-foreground-tertiary/70 cursor-not-allowed"
-                : "text-foreground-tertiary hover:text-foreground-danger"
+                ? "text-foreground-icon"
+                : "text-foreground-tertiary/60 hover:text-foreground-tertiary",
+              isUpdatingLocked && "opacity-60 pointer-events-none"
             )}
-            aria-label={isLocked ? "Unlock to delete" : "Delete tab group"}
-            disabled={isLocked}
-            onClick={() => {
-              if (isLocked) return;
-              setIsDeleteDialogOpen(true);
-            }}
           >
-            <DeleteIcon />
-          </button>
-        </div>
-      </div>
-      <div
-        className={cn(
-          "transition-[max-height,opacity] ease-in-out duration-300 overflow-hidden",
-          isCollapsed ? "max-h-0 opacity-0" : "opacity-100"
-        )}
-      >
-        <div className="flex flex-col gap-2 bg-background-page-secondary w-full h-fit mx-auto rounded-semi shadow-sm shadow-foreground-muted/60 pt-2 px-4 pb-4">
-          <div className="flex flex-row gap-2">
-            <ExpandingButton
-              icon={<SearchThickIcon size={16} />}
-              placeholder="Search in this tab group"
-            />
-            <AddTabButton folderId={folder.id} />
+            <LockShadowIcon size={28} className="transition-all duration-300" />
           </div>
+          <div
+            onClick={togglePinned}
+            className={cn(
+              "cursor-pointer transition-all duration-300",
+              isPinned
+                ? "text-foreground-icon"
+                : "text-foreground-tertiary/60 hover:text-foreground-tertiary",
+              isUpdatingPinned && "opacity-60 pointer-events-none"
+            )}
+          >
+            <PinShadowIcon size={28} className="transition-all duration-300" />
+          </div>
+        </div>
 
-          <div className="flex flex-col gap-2">
-            {items.map((item) => (
-              <FlatItem
-                key={item.id}
-                item={item}
-                onCopy={(itemToCopy) => {
-                  setCopiedItemId(itemToCopy.id);
-                  setTimeout(() => setCopiedItemId(null), 5000);
-                }}
-              />
-            ))}
-            <Masonry
-              items={items}
-              config={{
-                columns: [2, 3, 4],
-                gap: [16, 16, 16],
-                media: [640, 768, 1024],
-              }}
-              render={(item) => (
-                <GridItem
-                  key={item.id}
-                  item={item}
-                  onCopy={(itemToCopy) => {
-                    setCopiedItemId(itemToCopy.id);
-                    setTimeout(() => setCopiedItemId(null), 5000);
-                  }}
-                />
+        {/* Header */}
+        <div
+          className={cn(
+            "flex flex-row items-center px-4 py-2 transition-colors duration-300 border border-transparent rounded-semi",
+            isCollapsed ? "bg-background-page-secondary border-border-neutral-faded shadow-sm" : ""
+          )}
+        >
+          <div
+            ref={setActivatorNodeRef}
+            {...listeners}
+            {...attributes}
+            className={cn(
+              "mr-2 flex h-8 w-5 items-center justify-center text-foreground-tertiary",
+              "hover:text-foreground-secondary cursor-grab active:cursor-grabbing rounded-sm",
+              "transition-colors duration-150"
+            )}
+            aria-label="Drag tab group"
+          >
+            <DotIcon size={18} />
+          </div>
+          <Button
+            size="icon"
+            variant="outline"
+            className={cn("h-6 w-6 rounded-semi")}
+            onClick={handleToggleCollapse}
+          >
+            <ChevronRight
+              size={16}
+              className={cn(
+                "transition-all duration-300 text-foreground-tertiary hover:text-foreground-icon",
+                !isCollapsed && "rotate-90"
               )}
             />
+          </Button>
+
+          {isEditingTitle ? (
+            <Input
+              ref={inputRef}
+              value={title}
+              onChange={(e) => setTitle(e.target.value)}
+              onBlur={() => {
+                setIsEditingTitle(false);
+                commitTitle();
+              }}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") {
+                  setIsEditingTitle(false);
+                  commitTitle();
+                }
+              }}
+              className="text-foreground-neutral font-semibold text-xl w-fit max-w-[50%] ml-4 h-auto px-2 py-0 transition-transform shadow-none focus-visible:border-2 focus-visible:border-border-neutral bg-transparent"
+            />
+          ) : (
+            <span
+              className="text-foreground-neutral font-semibold text-xl max-w-[50%] truncate ml-4 cursor-text"
+              onClick={() => setIsEditingTitle(true)}
+            >
+              {title.length > 40 ? `${title.slice(0, 40)}…` : title}
+            </span>
+          )}
+
+          <div className="text-foreground-tertiary">
+            <DotIcon size={20} />
+          </div>
+
+          <span className="text-foreground-secondary text-xs">{items.length} tabs</span>
+
+          <div className="text-foreground-tertiary">
+            <DotIcon size={20} />
+          </div>
+
+          <span className="text-foreground-secondary text-xs">
+            {new Intl.DateTimeFormat(undefined, {
+              day: "numeric",
+              month: "short",
+              year: "numeric",
+            }).format(new Date(folder.createdAt))}{" "}
+            at{" "}
+            {new Intl.DateTimeFormat(undefined, {
+              hour: "numeric",
+              minute: "numeric",
+            }).format(new Date(folder.createdAt))}
+          </span>
+
+          <div className="flex flex-row gap-2 text-foreground-tertiary ml-4">
+            <div
+              onClick={handleCopyFolderUrls}
+              className="cursor-pointer hover:text-foreground-secondary transition-all duration-300"
+            >
+              {copiedFolderId === folder.id ? (
+                <Checkmark
+                  size={24}
+                  className="text-foreground-secondary animate-in fade-in-0 zoom-in-95"
+                />
+              ) : (
+                <CopyIcon />
+              )}
+            </div>
+            <DropdownMenu open={isOpenMenu} onOpenChange={setIsOpenMenu}>
+              <DropdownMenuTrigger asChild>
+                <div
+                  className="cursor-pointer hover:text-foreground-secondary transition-colors duration-300"
+                  onContextMenu={(e) => {
+                    e.preventDefault();
+                    setIsOpenMenu(true);
+                  }}
+                >
+                  <OpenArrowIcon />
+                </div>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent sideOffset={8} className="min-w-[200px]">
+                <DropdownMenuItem
+                  className="flex items-center gap-2"
+                  onClick={handleOpenInCurrentWindow}
+                >
+                  <OpenInCurrent />
+                  <span>Open in current window</span>
+                </DropdownMenuItem>
+                <DropdownMenuItem
+                  className="flex items-center gap-2"
+                  onClick={handleOpenInNewTabGroup}
+                >
+                  <OpenInTabgroup size={20} />
+                  <span>Open in new tab group</span>
+                </DropdownMenuItem>
+                <DropdownMenuItem
+                  className="flex items-center gap-2"
+                  onClick={handleOpenInNewWindow}
+                >
+                  <OpenInWindow size={20} />
+                  <span>Open in new window</span>
+                </DropdownMenuItem>
+                <DropdownMenuItem
+                  className="flex items-center gap-2"
+                  onClick={handleRefreshAllMetadata}
+                >
+                  <span>Refresh all metadata</span>
+                </DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenu>
+            <button
+              type="button"
+              className={cn(
+                "cursor-pointer transition-colors duration-300",
+                isLocked
+                  ? "text-foreground-tertiary/70 cursor-not-allowed"
+                  : "text-foreground-tertiary hover:text-foreground-danger"
+              )}
+              aria-label={isLocked ? "Unlock to delete" : "Delete tab group"}
+              disabled={isLocked}
+              onClick={() => {
+                if (isLocked) return;
+                setIsDeleteDialogOpen(true);
+              }}
+            >
+              <DeleteIcon />
+            </button>
           </div>
         </div>
+
+        {/* Content */}
+        <div
+          className={cn(
+            "transition-[max-height,opacity] ease-in-out duration-300 overflow-hidden",
+            isCollapsed ? "max-h-0 opacity-0" : "opacity-100"
+          )}
+        >
+          <div className="flex flex-col gap-2 bg-background-page-secondary w-full h-fit mx-auto rounded-semi shadow-sm shadow-foreground-muted/60 pt-2 px-4 pb-4">
+            {/* Toolbar */}
+            <div className="flex flex-row gap-2">
+              <ExpandingButton
+                icon={<SearchThickIcon size={16} />}
+                placeholder="Search in this tab group"
+              />
+              <AddTabButton folderId={folder.id} />
+            </div>
+
+            {/* Items */}
+            <SortableContext
+              items={items.map((item) => item.id)}
+              strategy={viewMode === "list" ? verticalListSortingStrategy : rectSortingStrategy}
+            >
+              <div className="flex flex-col gap-2">
+                {viewMode === "list" ? (
+                  items.map((item) => (
+                    <FlatItem
+                      key={item.id}
+                      item={item}
+                      onCopy={(itemToCopy) => {
+                        setCopiedItemId(itemToCopy.id);
+                        setTimeout(() => setCopiedItemId(null), 5000);
+                      }}
+                    />
+                  ))
+                ) : (
+                  <Masonry
+                    items={items}
+                    config={{
+                      columns: [2, 3, 4],
+                      gap: [16, 16, 16],
+                      media: [640, 768, 1024],
+                    }}
+                    render={(item) => (
+                      <GridItem
+                        key={item.id}
+                        item={item}
+                        onCopy={(itemToCopy) => {
+                          setCopiedItemId(itemToCopy.id);
+                          setTimeout(() => setCopiedItemId(null), 5000);
+                        }}
+                      />
+                    )}
+                  />
+                )}
+              </div>
+              {items.length === 0 && (
+                <div className="mt-2 rounded-lg border border-dashed border-border-neutral/70 bg-background-neutral p-4 text-center text-sm text-foreground-secondary">
+                  Drag tabs here to start this group.
+                </div>
+              )}
+            </SortableContext>
+          </div>
+        </div>
+
+        <ConfirmDialog
+          open={isDeleteDialogOpen}
+          onOpenChange={setIsDeleteDialogOpen}
+          title={isLocked ? "Tab group is locked" : "Delete this tab group?"}
+          description={
+            isLocked
+              ? "Unlock this group before deleting it."
+              : `All ${items.length} tabs saved in "${title}" will be permanently removed. This action cannot be undone.`
+          }
+          confirmLabel={isLocked ? "Close" : "Delete tab group"}
+          cancelLabel={isLocked ? undefined : "Cancel"}
+          variant={isLocked ? "warning" : "danger"}
+          isConfirmDisabled={isLocked}
+          onConfirm={handleDeleteGroup}
+        />
       </div>
-      <ConfirmDialog
-        open={isDeleteDialogOpen}
-        onOpenChange={setIsDeleteDialogOpen}
-        title={isLocked ? "Tab group is locked" : "Delete this tab group?"}
-        description={
-          isLocked
-            ? "Unlock this group before deleting it."
-            : `All ${items.length} tabs saved in "${title}" will be permanently removed. This action cannot be undone.`
-        }
-        confirmLabel={isLocked ? "Close" : "Delete tab group"}
-        cancelLabel={isLocked ? undefined : "Cancel"}
-        variant={isLocked ? "warning" : "danger"}
-        isConfirmDisabled={isLocked}
-        onConfirm={handleDeleteGroup}
-      />
-    </div>
+
+      {/* Bulk actions bar */}
+      <BulkActionsBar items={items} folders={allFolders} currentFolderId={folder.id} />
+    </>
+  );
+};
+
+export const TabGroup = ({ folder, items, allFolders, viewMode }: TabGroupProps) => {
+  return (
+    <SelectionProvider>
+      <TabGroupContent folder={folder} items={items} allFolders={allFolders} viewMode={viewMode} />
+    </SelectionProvider>
   );
 };

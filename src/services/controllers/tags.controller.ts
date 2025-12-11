@@ -20,31 +20,32 @@ export class TagsController {
 
   async searchTags(payload: { query: string; limit?: number }): Promise<TagDocType[]> {
     const db = await getDb();
-    const q = (payload.query ?? "").trim();
-    const limit = Math.max(1, Math.min(payload.limit ?? 20, 100));
+    const q = (payload.query ?? "").trim().toLowerCase();
+    const limit = Math.max(1, Math.min(payload.limit ?? 50, 100));
 
-    if (!q) {
-      const all = await db.tags.find({ selector: {} }).limit(limit).exec();
-      return all.map((t) => t.toMutableJSON());
+    // Get all tags sorted by updatedAt (most recently used first - LRU style)
+    const allTags = await db.tags.find({ selector: {} }).exec();
+    let results = allTags
+      .map((t) => t.toMutableJSON())
+      .sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+
+    // Filter by query if provided
+    if (q) {
+      results = results.filter((t) => t.name.toLowerCase().includes(q));
     }
 
-    const upper = q + "\uffff";
-    const results = await db.tags
-      .find({ selector: { name: { $gte: q, $lte: upper } } })
-      .limit(limit)
-      .exec();
-    return results.map((t) => t.toMutableJSON());
+    return results.slice(0, limit);
   }
 
   async addTagToItem(payload: {
     itemId: string;
     tagName: string;
-    userId?: string | null;
+    userId?: string;
   }): Promise<{ tags: TagDocType[] }> {
     const db = await getDb();
     const name = this.normalizeName(payload.tagName);
     if (!name) return { tags: [] };
-    const userId = payload.userId ?? null;
+    const userId = payload.userId || "user1"; // Use default user ID instead of null
 
     // find or create tag by name + userId
     let tag = await db.tags
@@ -72,6 +73,11 @@ export class TagsController {
     if (!existingJoin) {
       await db.item_tags.insert({ id: joinId, itemId: payload.itemId, tagId, userId } as any);
     }
+
+    // Update the tag's updatedAt to track recent usage (LRU)
+    try {
+      await tag.patch({ updatedAt: Date.now() });
+    } catch {}
 
     try {
       chrome.runtime.sendMessage({ type: "DB_CHANGE", scope: "items" });

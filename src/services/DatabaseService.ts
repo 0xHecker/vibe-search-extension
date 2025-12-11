@@ -71,6 +71,27 @@ const createDatabase = async () => {
           }
           return oldDoc;
         },
+        2: async (oldDoc: any) => {
+          // Introduced sortOrder; keep existing order stable using createdAt as fallback
+          if (oldDoc.sortOrder === undefined) {
+            return { ...oldDoc, sortOrder: oldDoc.createdAt ?? Date.now() };
+          }
+          return oldDoc;
+        },
+        3: async (oldDoc: any) => {
+          // Ensure sortOrder is an integer for indexed field requirements
+          const nextOrderRaw =
+            oldDoc.sortOrder !== undefined ? oldDoc.sortOrder : oldDoc.createdAt ?? Date.now();
+          const nextOrder = Number.isFinite(nextOrderRaw) ? Math.max(0, Math.floor(nextOrderRaw)) : 0;
+          return { ...oldDoc, sortOrder: nextOrder };
+        },
+        4: async (oldDoc: any) => {
+          // Make sortOrder required with a safe default
+          const nextOrderRaw =
+            oldDoc.sortOrder !== undefined ? oldDoc.sortOrder : oldDoc.createdAt ?? Date.now();
+          const nextOrder = Number.isFinite(nextOrderRaw) ? Math.max(0, Math.floor(nextOrderRaw)) : 0;
+          return { ...oldDoc, sortOrder: nextOrder };
+        },
       },
     },
     tags: {

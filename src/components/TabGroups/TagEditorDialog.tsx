@@ -1,17 +1,8 @@
-import { useEffect, useState, useRef, useCallback } from "react";
-import { X, Plus, Tag, Sparkles, Check, ChevronsUpDown } from "lucide-react";
+import { useEffect, useState, useCallback } from "react";
+import { X, Plus, Tag, Sparkles, ChevronsUpDown, Search } from "lucide-react";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@components/ui/dialog";
 import { Button } from "@components/ui/button";
 import { Popover, PopoverContent, PopoverTrigger } from "@components/ui/popover";
-import {
-  Command,
-  CommandEmpty,
-  CommandGroup,
-  CommandInput,
-  CommandItem,
-  CommandList,
-  CommandSeparator,
-} from "@components/ui/command";
 import { cn } from "@src/lib/utils";
 
 interface TagType {
@@ -37,6 +28,7 @@ export const TagEditorDialog = ({
   const [comboboxOpen, setComboboxOpen] = useState(false);
   const [searchValue, setSearchValue] = useState("");
   const [allTags, setAllTags] = useState<TagType[]>([]);
+  const [highlightedIndex, setHighlightedIndex] = useState(-1);
 
   // Use itemId if provided, otherwise use first itemId from array for loading
   const primaryItemId = itemId || itemIds?.[0];
@@ -82,16 +74,25 @@ export const TagEditorDialog = ({
     } else {
       setSearchValue("");
       setComboboxOpen(false);
+      setHighlightedIndex(-1);
     }
   }, [open, load, loadAllTags]);
 
-  // Filter suggestions - exclude already added tags
-  const availableTags = allTags.filter((t) => !tags.some((existing) => existing.id === t.id));
+  // Filter suggestions - exclude already added tags and filter by search
+  const filteredTags = allTags
+    .filter((t) => !tags.some((existing) => existing.id === t.id))
+    .filter(
+      (t) => !searchValue.trim() || t.name.toLowerCase().includes(searchValue.trim().toLowerCase())
+    )
+    .slice(0, 10);
 
   // Check if current search value matches an existing tag
   const canCreateNew =
     searchValue.trim().length > 0 &&
     !allTags.some((t) => t.name.toLowerCase() === searchValue.trim().toLowerCase());
+
+  // Total selectable items (for keyboard navigation)
+  const totalItems = filteredTags.length + (canCreateNew ? 1 : 0);
 
   const addTag = async (name: string) => {
     const tagName = name.trim();
@@ -123,6 +124,7 @@ export const TagEditorDialog = ({
       // Reload all tags to include newly created ones
       await loadAllTags();
       setSearchValue("");
+      setHighlightedIndex(-1);
       setComboboxOpen(false);
     } finally {
       setIsLoading(false);
@@ -154,6 +156,25 @@ export const TagEditorDialog = ({
       }
     } finally {
       setIsLoading(false);
+    }
+  };
+
+  const handleKeyDown = (e: React.KeyboardEvent) => {
+    if (e.key === "ArrowDown") {
+      e.preventDefault();
+      setHighlightedIndex((prev) => (prev < totalItems - 1 ? prev + 1 : prev));
+    } else if (e.key === "ArrowUp") {
+      e.preventDefault();
+      setHighlightedIndex((prev) => (prev > 0 ? prev - 1 : -1));
+    } else if (e.key === "Enter" && highlightedIndex >= 0) {
+      e.preventDefault();
+      if (highlightedIndex < filteredTags.length) {
+        addTag(filteredTags[highlightedIndex].name);
+      } else if (canCreateNew) {
+        addTag(searchValue.trim());
+      }
+    } else if (e.key === "Escape") {
+      setComboboxOpen(false);
     }
   };
 
@@ -206,66 +227,96 @@ export const TagEditorDialog = ({
               </Button>
             </PopoverTrigger>
             <PopoverContent className="w-[--radix-popover-trigger-width] p-0" align="start">
-              <Command shouldFilter={false}>
-                <CommandInput
-                  placeholder="Search or create tag..."
-                  value={searchValue}
-                  onValueChange={setSearchValue}
-                />
-                <CommandList>
-                  <CommandEmpty>
-                    {searchValue.trim() ? (
-                      <div className="py-2 text-foreground-tertiary">No tags found</div>
-                    ) : (
-                      <div className="py-2 text-foreground-tertiary">
-                        Start typing to search tags
-                      </div>
+              <div className="flex flex-col">
+                {/* Search input */}
+                <div className="flex items-center gap-2 px-3 h-11 border-b border-border-neutral-faded">
+                  <Search size={16} className="text-foreground-tertiary shrink-0" />
+                  <input
+                    type="text"
+                    value={searchValue}
+                    onChange={(e) => {
+                      setSearchValue(e.target.value);
+                      setHighlightedIndex(-1);
+                    }}
+                    onKeyDown={handleKeyDown}
+                    placeholder="Search or create tag..."
+                    className={cn(
+                      "flex-1 h-full bg-transparent text-sm",
+                      "text-foreground-neutral caret-violet-500",
+                      "placeholder:text-foreground-tertiary",
+                      "outline-none border-none"
                     )}
-                  </CommandEmpty>
+                    autoFocus
+                  />
+                </div>
 
-                  {/* Available tags */}
-                  {availableTags.length > 0 && (
-                    <CommandGroup heading="Available Tags">
-                      {availableTags
-                        .filter(
-                          (t) =>
-                            !searchValue.trim() ||
-                            t.name.toLowerCase().includes(searchValue.trim().toLowerCase())
-                        )
-                        .slice(0, 10)
-                        .map((tag) => (
-                          <CommandItem
-                            key={tag.id}
-                            value={tag.name}
-                            onSelect={() => addTag(tag.name)}
+                {/* Results */}
+                <div className="max-h-[200px] overflow-y-auto">
+                  {filteredTags.length === 0 && !canCreateNew ? (
+                    <div className="py-6 text-center text-sm text-foreground-tertiary">
+                      {searchValue.trim() ? "No tags found" : "No tags available"}
+                    </div>
+                  ) : (
+                    <div className="p-1">
+                      {/* Available tags section */}
+                      {filteredTags.length > 0 && (
+                        <div>
+                          <div className="px-2 py-1.5 text-xs font-medium text-foreground-tertiary uppercase tracking-wider">
+                            Available Tags
+                          </div>
+                          {filteredTags.map((tag, index) => (
+                            <button
+                              key={tag.id}
+                              type="button"
+                              onClick={() => addTag(tag.name)}
+                              onMouseEnter={() => setHighlightedIndex(index)}
+                              className={cn(
+                                "w-full flex items-center gap-2 px-2 py-2 rounded-md text-sm",
+                                "text-foreground-secondary cursor-pointer",
+                                "transition-colors duration-100",
+                                highlightedIndex === index
+                                  ? "bg-violet-500/10 text-violet-700"
+                                  : "hover:bg-background-page-secondary"
+                              )}
+                            >
+                              <Tag size={14} className="text-foreground-tertiary shrink-0" />
+                              <span className="flex-1 truncate text-left">{tag.name}</span>
+                            </button>
+                          ))}
+                        </div>
+                      )}
+
+                      {/* Create new option */}
+                      {canCreateNew && (
+                        <>
+                          {filteredTags.length > 0 && (
+                            <div className="h-px bg-border-neutral-faded my-1 -mx-1" />
+                          )}
+                          <button
+                            type="button"
+                            onClick={() => addTag(searchValue.trim())}
+                            onMouseEnter={() => setHighlightedIndex(filteredTags.length)}
+                            className={cn(
+                              "w-full flex items-center gap-2 px-2 py-2 rounded-md text-sm",
+                              "text-violet-600 cursor-pointer",
+                              "transition-colors duration-100",
+                              highlightedIndex === filteredTags.length
+                                ? "bg-violet-500/10"
+                                : "hover:bg-violet-500/5"
+                            )}
                           >
-                            <Tag size={14} className="text-foreground-tertiary" />
-                            <span className="flex-1 truncate">{tag.name}</span>
-                            <Check size={14} className="opacity-0" />
-                          </CommandItem>
-                        ))}
-                    </CommandGroup>
+                            <Plus size={14} className="shrink-0" />
+                            <span className="flex-1 truncate text-left">
+                              Create "{searchValue.trim()}"
+                            </span>
+                            <Sparkles size={12} className="opacity-60 shrink-0" />
+                          </button>
+                        </>
+                      )}
+                    </div>
                   )}
-
-                  {/* Create new tag option */}
-                  {canCreateNew && (
-                    <>
-                      {availableTags.length > 0 && <CommandSeparator />}
-                      <CommandGroup>
-                        <CommandItem
-                          value={`create-${searchValue.trim()}`}
-                          onSelect={() => addTag(searchValue.trim())}
-                          className="text-violet-600"
-                        >
-                          <Plus size={14} />
-                          <span>Create "{searchValue.trim()}"</span>
-                          <Sparkles size={12} className="ml-auto opacity-60" />
-                        </CommandItem>
-                      </CommandGroup>
-                    </>
-                  )}
-                </CommandList>
-              </Command>
+                </div>
+              </div>
             </PopoverContent>
           </Popover>
 

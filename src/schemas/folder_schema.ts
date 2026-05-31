@@ -3,6 +3,7 @@ import { RxJsonSchema } from "rxdb";
 export type FolderDocType = {
   id: string;
   name: string;
+  spaceId: string;
   parentId: string | null;
   type: "folder" | "tab_group";
   sortOrder: number;
@@ -14,19 +15,20 @@ export type FolderDocType = {
   serverVersion: number;
   createdAt: number;
   updatedAt: number;
-  userId: string | null;
+  userId: string;
 };
 
 export const folderSchema: RxJsonSchema<FolderDocType> = {
   title: "folder schema",
-  version: 4,
+  version: 6,
   description: "Describes a folder for organizing items or a group of tabs",
   primaryKey: "id",
   type: "object",
   properties: {
     id: { type: "string", maxLength: 100 },
-    userId: { type: "string", default: null, maxLength: 1000 },
+    userId: { type: "string", default: "", maxLength: 1000 },
     name: { type: "string" },
+    spaceId: { type: "string", default: "space_public_default", maxLength: 1000 },
     parentId: {
       type: ["string", "null"],
       ref: "folders",
@@ -71,6 +73,7 @@ export const folderSchema: RxJsonSchema<FolderDocType> = {
   required: [
     "id",
     "name",
+    "spaceId",
     "type",
     "createdAt",
     "updatedAt",
@@ -81,5 +84,5 @@ export const folderSchema: RxJsonSchema<FolderDocType> = {
     "isCollapsed",
     "sortOrder",
   ],
-  indexes: ["isDirty", "userId", "type", "isPinned", "isCollapsed", "sortOrder"],
+  indexes: ["isDirty", "userId", "spaceId", "type", "isPinned", "isCollapsed", "sortOrder"],
 };

@@ -2,7 +2,7 @@ import { TabGroup } from "@components/TabGroups/TabGroup";
 import { FolderDocType } from "@src/schemas/folder_schema";
 import { ItemDocType } from "@src/schemas/item_schema";
 import { TooltipProvider } from "../ui/tooltip";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { memo, useEffect, useMemo, useRef, useState } from "react";
 import { ViewToggle } from "./ViewToggle";
 import {
   DndContext,
@@ -15,15 +15,36 @@ import {
   type DragStartEvent,
 } from "@dnd-kit/core";
 import { SortableContext, arrayMove, verticalListSortingStrategy } from "@dnd-kit/sortable";
+import type { QueryRankDebugScore } from "@src/search-core/contracts";
+
+export type SpaceMoveOption = {
+  id: string;
+  name: string;
+  isPrivate: boolean;
+  access?: {
+    isUnlocked?: boolean;
+  };
+};
 
 interface TabGroupsProps {
   folders: FolderDocType[];
   items: ItemDocType[];
+  spaces: SpaceMoveOption[];
+  preserveInputOrder?: boolean;
+  debugScoresByItemId?: Record<string, QueryRankDebugScore>;
+  showDebugScores?: boolean;
 }
 
 const VIEW_STORAGE_KEY = "vibe-search-view-mode";
 
-export const TabGroups = ({ folders, items }: TabGroupsProps) => {
+const TabGroupsComponent = ({
+  folders,
+  items,
+  spaces,
+  preserveInputOrder = false,
+  debugScoresByItemId,
+  showDebugScores = false,
+}: TabGroupsProps) => {
   const containerRef = useRef<HTMLDivElement>(null);
   const [sentForFetch, setSentForFetch] = useState(new Set<string>());
   const [itemsState, setItemsState] = useState<ItemDocType[]>(items);
@@ -79,8 +100,11 @@ export const TabGroups = ({ folders, items }: TabGroupsProps) => {
 
   const orderedFolders = useMemo(() => sortFolders(foldersState), [foldersState]);
 
-  const orderedItemsForFolder = (folderId: string) => {
-    const folderItems = itemsState.filter((i) => i.folderId === folderId);
+  const orderedItemsForFolder = (folderId: string, sourceItems: ItemDocType[] = itemsState) => {
+    const folderItems = sourceItems.filter((i) => i.folderId === folderId);
+    if (preserveInputOrder) {
+      return folderItems;
+    }
     return [...folderItems].sort((a, b) => {
       const ao = a.chunkOrder ?? Number.MAX_SAFE_INTEGER;
       const bo = b.chunkOrder ?? Number.MAX_SAFE_INTEGER;
@@ -148,13 +172,18 @@ export const TabGroups = ({ folders, items }: TabGroupsProps) => {
 
   const handleFolderReorder = async (activeId: string, overId: string) => {
     let nextIds: string[] = [];
+    let spaceId: string | undefined;
     setFoldersState((prev) => {
+      const uniqueSpaceIds = new Set(prev.map((folder) => folder.spaceId));
+      if (uniqueSpaceIds.size > 1) return prev;
       const ids = prev.map((f) => f.id);
       const oldIndex = ids.indexOf(activeId);
       const newIndex = ids.indexOf(overId);
       if (oldIndex === -1 || newIndex === -1) return prev;
       nextIds = arrayMove(ids, oldIndex, newIndex);
       const lookup = new Map(prev.map((f) => [f.id, f]));
+      const first = prev[0];
+      spaceId = first?.spaceId;
       return nextIds.map((id) => lookup.get(id)!).filter(Boolean);
     });
     if (nextIds.length > 0) {
@@ -163,7 +192,7 @@ export const TabGroups = ({ folders, items }: TabGroupsProps) => {
           service: "folders",
           type: "reorder",
           target: "offscreen",
-          payload: { orderedIds: nextIds },
+          payload: { orderedIds: nextIds, spaceId },
         });
       } catch (e) {
         console.error("Failed to persist folder order", e);
@@ -190,7 +219,7 @@ export const TabGroups = ({ folders, items }: TabGroupsProps) => {
   const reorderWithinFolder = async (folderId: string, activeId: string, overId: string) => {
     let nextIds: string[] = [];
     setItemsState((prev) => {
-      const list = orderedItemsForFolder(folderId);
+      const list = orderedItemsForFolder(folderId, prev);
       const ids = list.map((i) => i.id);
       const oldIndex = ids.indexOf(activeId);
       const newIndex = ids.indexOf(overId);
@@ -217,8 +246,8 @@ export const TabGroups = ({ folders, items }: TabGroupsProps) => {
     let sourceIds: string[] = [];
     let targetIds: string[] = [];
     setItemsState((prev) => {
-      const sourceList = orderedItemsForFolder(sourceFolderId).map((i) => i.id);
-      const targetList = orderedItemsForFolder(targetFolderId).map((i) => i.id);
+      const sourceList = orderedItemsForFolder(sourceFolderId, prev).map((i) => i.id);
+      const targetList = orderedItemsForFolder(targetFolderId, prev).map((i) => i.id);
       sourceIds = sourceList.filter((id) => !ids.includes(id));
       targetIds = targetList.filter((id) => !ids.includes(id));
       const insertionIndex =
@@ -345,7 +374,10 @@ export const TabGroups = ({ folders, items }: TabGroupsProps) => {
                     folder={folder}
                     items={folderItems}
                     allFolders={orderedFolders}
+                    spaces={spaces}
                     viewMode={viewMode}
+                    debugScoresByItemId={debugScoresByItemId}
+                    showDebugScores={showDebugScores}
                   />
                 );
               })}
@@ -380,3 +412,5 @@ export const TabGroups = ({ folders, items }: TabGroupsProps) => {
     </TooltipProvider>
   );
 };
+
+export const TabGroups = memo(TabGroupsComponent);

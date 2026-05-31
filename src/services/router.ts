@@ -6,13 +6,45 @@ export interface Service {
 
 export class OffscreenRouter {
   private services: Map<string, Service> = new Map();
+  private serviceAllowList: Map<string, Set<string>> = new Map();
 
-  registerService(name: string, service: Service) {
+  registerService(name: string, service: Service, options?: { methods?: string[] }) {
     if (this.services.has(name)) {
       throw new Error(`Service "${name}" is already registered.`);
     }
     this.services.set(name, service);
+    if (options?.methods && options.methods.length > 0) {
+      this.serviceAllowList.set(name, new Set(options.methods));
+    }
     console.log(`Service registered: ${name}`);
+  }
+
+  private isTrustedForwarder(sender: chrome.runtime.MessageSender): boolean {
+    if (!sender || sender.id !== chrome.runtime.id) {
+      return false;
+    }
+    // UI pages (search/popup/options/etc.) should never directly forward privileged calls.
+    if (sender.tab) {
+      return false;
+    }
+
+    const senderUrl = typeof sender.url === "string" ? sender.url : "";
+    if (!senderUrl) {
+      // Service worker senders commonly do not expose a URL.
+      return true;
+    }
+
+    try {
+      const parsed = new URL(senderUrl);
+      const path = parsed.pathname || "";
+      if (path.includes("/src/pages/")) return false;
+      if (path.endsWith(".html") && !path.endsWith("/_generated_background_page.html")) {
+        return false;
+      }
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   listen() {
@@ -28,6 +60,16 @@ export class OffscreenRouter {
         return;
       }
 
+      if (!this.isTrustedForwarder(sender)) {
+        sendResponse({ success: false, error: "UNAUTHORIZED_FORWARDER" });
+        return true;
+      }
+
+      // Allow non-service messages to be handled by dedicated listeners.
+      if (!service || typeof service !== "string") {
+        return;
+      }
+
       (async () => {
         const targetService = this.services.get(service);
         if (!targetService) {
@@ -40,6 +82,14 @@ export class OffscreenRouter {
         const method = targetService[type];
         if (typeof method !== "function") {
           const error = `Method "${type}" not found in service "${service}".`;
+          console.error(error);
+          sendResponse({ success: false, error });
+          return;
+        }
+
+        const allowList = this.serviceAllowList.get(service);
+        if (allowList && !allowList.has(type)) {
+          const error = `Method "${type}" is not exposed for service "${service}".`;
           console.error(error);
           sendResponse({ success: false, error });
           return;

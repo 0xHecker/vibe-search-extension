@@ -8,6 +8,10 @@ import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuSub,
+  DropdownMenuSubTrigger,
+  DropdownMenuSubContent,
   DropdownMenuTrigger,
 } from "@components/ui/dropdown-menu";
 import { SearchThickIcon } from "@icons/search-thick";
@@ -43,15 +47,34 @@ import {
   verticalListSortingStrategy,
 } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
+import type { SpaceMoveOption } from "./TabGroups";
+import type { QueryRankDebugScore } from "@src/search-core/contracts";
+import {
+  resolveToastErrorMessage,
+  showErrorToast,
+  showSuccessToast,
+  withToast,
+} from "@src/utils/toast-feedback";
 
 interface TabGroupProps {
   folder: FolderDocType;
   items: ItemDocType[];
   allFolders: FolderDocType[];
+  spaces: SpaceMoveOption[];
   viewMode: "list" | "grid";
+  debugScoresByItemId?: Record<string, QueryRankDebugScore>;
+  showDebugScores?: boolean;
 }
 
-const TabGroupContent = ({ folder, items, allFolders, viewMode }: TabGroupProps) => {
+const TabGroupContent = ({
+  folder,
+  items,
+  allFolders,
+  spaces,
+  viewMode,
+  debugScoresByItemId,
+  showDebugScores = false,
+}: TabGroupProps) => {
   const [isCollapsed, setIsCollapsed] = useState(folder.isCollapsed ?? false);
   const [isEditingTitle, setIsEditingTitle] = useState(false);
   const [title, setTitle] = useState(folder.name);
@@ -64,6 +87,10 @@ const TabGroupContent = ({ folder, items, allFolders, viewMode }: TabGroupProps)
   const [isOpenMenu, setIsOpenMenu] = useState(false);
   const [isDeleteDialogOpen, setIsDeleteDialogOpen] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
+  const moveSpaceOptions = useMemo(
+    () => spaces.filter((space) => space.id !== folder.spaceId),
+    [folder.spaceId, spaces]
+  );
 
   const { isSelectionMode } = useSelection();
   const {
@@ -105,12 +132,18 @@ const TabGroupContent = ({ folder, items, allFolders, viewMode }: TabGroupProps)
 
   const handleCopyFolderUrls = async () => {
     const urls = items.map((item) => item.url).join("\n");
+    if (!urls.trim()) {
+      showErrorToast("No URLs available to copy.", { tempo: "quick" });
+      return;
+    }
     try {
       await navigator.clipboard.writeText(urls);
       setCopiedFolderId(folder.id);
       setTimeout(() => setCopiedFolderId(null), 5000);
+      showSuccessToast("Tab group URLs copied.", { tempo: "quick" });
     } catch (err) {
       console.error("Failed to copy URLs:", err);
+      showErrorToast(resolveToastErrorMessage(err, "Failed to copy tab group URLs."));
     }
   };
 
@@ -118,11 +151,19 @@ const TabGroupContent = ({ folder, items, allFolders, viewMode }: TabGroupProps)
     const urls = items.map((item) => item.url);
     if (urls.length === 0) return;
     try {
-      await chrome.runtime.sendMessage({
-        target: "background",
-        type: "FETCH_METADATA",
-        payload: { urls, revalidate: true },
+      await withToast({
+        loading: "Refreshing metadata for tab group...",
+        success: "Metadata refresh queued for tab group.",
+        error: (err) => resolveToastErrorMessage(err, "Failed to refresh metadata."),
+        action: async () => {
+          await chrome.runtime.sendMessage({
+            target: "background",
+            type: "FETCH_METADATA",
+            payload: { urls, revalidate: true },
+          });
+        },
       });
+      setIsOpenMenu(false);
     } catch (error) {
       console.error("Failed to refresh metadata for folder", error);
     }
@@ -251,27 +292,47 @@ const TabGroupContent = ({ folder, items, allFolders, viewMode }: TabGroupProps)
   };
 
   const handleDeleteGroup = async () => {
-    const response = await chrome.runtime.sendMessage({
-      service: "folders",
-      type: "delete",
-      target: "offscreen",
-      payload: { id: folder.id, alsoDeleteItems: true },
-    });
+    await withToast({
+      loading: "Deleting tab group...",
+      success: "Tab group deleted.",
+      error: (err) => resolveToastErrorMessage(err, "Failed to delete tab group."),
+      action: async () => {
+        const response = await chrome.runtime.sendMessage({
+          service: "folders",
+          type: "delete",
+          target: "offscreen",
+          payload: { id: folder.id, alsoDeleteItems: true },
+        });
 
-    if (response?.success === false || response?.payload?.success === false) {
-      throw new Error(
-        response?.error ||
-          response?.payload?.error ||
-          "Failed to delete tab group. Please try again."
-      );
-    }
+        if (response?.success === false || response?.payload?.success === false) {
+          throw new Error(
+            response?.error ||
+              response?.payload?.error ||
+              "Failed to delete tab group. Please try again."
+          );
+        }
+      },
+    });
   };
 
   const handleOpenInNewWindow = async () => {
     const urls = items.map((i) => i.url);
+    if (urls.length === 0) {
+      showErrorToast("No tabs available to open.", { tempo: "quick" });
+      return;
+    }
     try {
-      await openUrlsInNewWindow(urls);
-      await maybeDeleteFolderAfterOpen();
+      await withToast({
+        loading: "Opening tab group in new window...",
+        success: "Tab group opened in new window.",
+        error: (err) => resolveToastErrorMessage(err, "Failed to open tab group."),
+        action: async () => {
+          await openUrlsInNewWindow(urls);
+          await maybeDeleteFolderAfterOpen();
+        },
+      });
+    } catch (error) {
+      console.error("Failed to open tab group in new window", error);
     } finally {
       setIsOpenMenu(false);
     }
@@ -279,9 +340,22 @@ const TabGroupContent = ({ folder, items, allFolders, viewMode }: TabGroupProps)
 
   const handleOpenInCurrentWindow = async () => {
     const urls = items.map((i) => i.url);
+    if (urls.length === 0) {
+      showErrorToast("No tabs available to open.", { tempo: "quick" });
+      return;
+    }
     try {
-      await openUrlsInCurrentWindow(urls);
-      await maybeDeleteFolderAfterOpen();
+      await withToast({
+        loading: "Opening tab group in current window...",
+        success: "Tab group opened in current window.",
+        error: (err) => resolveToastErrorMessage(err, "Failed to open tab group."),
+        action: async () => {
+          await openUrlsInCurrentWindow(urls);
+          await maybeDeleteFolderAfterOpen();
+        },
+      });
+    } catch (error) {
+      console.error("Failed to open tab group in current window", error);
     } finally {
       setIsOpenMenu(false);
     }
@@ -289,9 +363,82 @@ const TabGroupContent = ({ folder, items, allFolders, viewMode }: TabGroupProps)
 
   const handleOpenInNewTabGroup = async () => {
     const urls = items.map((i) => i.url);
+    if (urls.length === 0) {
+      showErrorToast("No tabs available to open.", { tempo: "quick" });
+      return;
+    }
     try {
-      await openUrlsInNewTabGroup(urls, title || folder.name);
-      await maybeDeleteFolderAfterOpen();
+      await withToast({
+        loading: "Opening tab group in a new tab group...",
+        success: "Tab group opened in a new tab group.",
+        error: (err) => resolveToastErrorMessage(err, "Failed to open tab group."),
+        action: async () => {
+          await openUrlsInNewTabGroup(urls, title || folder.name);
+          await maybeDeleteFolderAfterOpen();
+        },
+      });
+    } catch (error) {
+      console.error("Failed to open tab group in new tab group", error);
+    } finally {
+      setIsOpenMenu(false);
+    }
+  };
+
+  const handleMoveFolderToSpace = async (targetSpaceId: string) => {
+    try {
+      await withToast({
+        loading: "Moving tab group to selected space...",
+        success: "Tab group moved to selected space.",
+        error: (err) => resolveToastErrorMessage(err, "Failed to move tab group."),
+        action: async () => {
+          const response = await chrome.runtime.sendMessage({
+            service: "folders",
+            type: "moveToSpace",
+            target: "offscreen",
+            payload: {
+              folderId: folder.id,
+              targetSpaceId,
+            },
+          });
+          if (response?.success === false || response?.payload?.success === false) {
+            throw new Error(
+              response?.error || response?.payload?.error || "Failed to move folder to selected space."
+            );
+          }
+        },
+      });
+    } catch (error) {
+      console.error("Failed to move folder to selected space", error);
+    } finally {
+      setIsOpenMenu(false);
+    }
+  };
+
+  const handleCopyFolderToSpace = async (targetSpaceId: string) => {
+    try {
+      await withToast({
+        loading: "Copying tab group to selected space...",
+        success: "Tab group copied to selected space.",
+        error: (err) => resolveToastErrorMessage(err, "Failed to copy tab group."),
+        action: async () => {
+          const response = await chrome.runtime.sendMessage({
+            service: "folders",
+            type: "copyToSpace",
+            target: "offscreen",
+            payload: {
+              folderId: folder.id,
+              targetSpaceId,
+            },
+          });
+          if (response?.success === false || response?.payload?.success === false) {
+            throw new Error(
+              response?.error || response?.payload?.error || "Failed to copy folder to selected space."
+            );
+          }
+        },
+      });
+    } catch (error) {
+      console.error("Failed to copy folder to selected space", error);
     } finally {
       setIsOpenMenu(false);
     }
@@ -480,6 +627,51 @@ const TabGroupContent = ({ folder, items, allFolders, viewMode }: TabGroupProps)
                 >
                   <span>Refresh all metadata</span>
                 </DropdownMenuItem>
+                {moveSpaceOptions.length > 0 && <DropdownMenuSeparator />}
+                {moveSpaceOptions.length > 0 && (
+                  <DropdownMenuSub>
+                    <DropdownMenuSubTrigger>Move to space</DropdownMenuSubTrigger>
+                    <DropdownMenuSubContent className="min-w-[220px]">
+                      {moveSpaceOptions.map((space) => {
+                        const isLocked = space.isPrivate && !space.access?.isUnlocked;
+                        return (
+                          <DropdownMenuItem
+                            key={`move-${space.id}`}
+                            disabled={isLocked}
+                            onClick={() => {
+                              void handleMoveFolderToSpace(space.id);
+                            }}
+                          >
+                            {space.name}
+                            {isLocked ? " (Locked)" : ""}
+                          </DropdownMenuItem>
+                        );
+                      })}
+                    </DropdownMenuSubContent>
+                  </DropdownMenuSub>
+                )}
+                {moveSpaceOptions.length > 0 && (
+                  <DropdownMenuSub>
+                    <DropdownMenuSubTrigger>Copy to space</DropdownMenuSubTrigger>
+                    <DropdownMenuSubContent className="min-w-[220px]">
+                      {moveSpaceOptions.map((space) => {
+                        const isLocked = space.isPrivate && !space.access?.isUnlocked;
+                        return (
+                          <DropdownMenuItem
+                            key={`copy-${space.id}`}
+                            disabled={isLocked}
+                            onClick={() => {
+                              void handleCopyFolderToSpace(space.id);
+                            }}
+                          >
+                            {space.name}
+                            {isLocked ? " (Locked)" : ""}
+                          </DropdownMenuItem>
+                        );
+                      })}
+                    </DropdownMenuSubContent>
+                  </DropdownMenuSub>
+                )}
               </DropdownMenuContent>
             </DropdownMenu>
             <button
@@ -530,6 +722,9 @@ const TabGroupContent = ({ folder, items, allFolders, viewMode }: TabGroupProps)
                     <FlatItem
                       key={item.id}
                       item={item}
+                      spaces={spaces}
+                      debugScore={showDebugScores ? debugScoresByItemId?.[item.id] : undefined}
+                      showDebugScore={showDebugScores}
                       onCopy={(itemToCopy) => {
                         setCopiedItemId(itemToCopy.id);
                         setTimeout(() => setCopiedItemId(null), 5000);
@@ -548,6 +743,9 @@ const TabGroupContent = ({ folder, items, allFolders, viewMode }: TabGroupProps)
                       <GridItem
                         key={item.id}
                         item={item}
+                        spaces={spaces}
+                        debugScore={showDebugScores ? debugScoresByItemId?.[item.id] : undefined}
+                        showDebugScore={showDebugScores}
                         onCopy={(itemToCopy) => {
                           setCopiedItemId(itemToCopy.id);
                           setTimeout(() => setCopiedItemId(null), 5000);
@@ -584,15 +782,36 @@ const TabGroupContent = ({ folder, items, allFolders, viewMode }: TabGroupProps)
       </div>
 
       {/* Bulk actions bar */}
-      <BulkActionsBar items={items} folders={allFolders} currentFolderId={folder.id} />
+      <BulkActionsBar
+        items={items}
+        folders={allFolders}
+        spaces={spaces}
+        currentFolderId={folder.id}
+      />
     </>
   );
 };
 
-export const TabGroup = ({ folder, items, allFolders, viewMode }: TabGroupProps) => {
+export const TabGroup = ({
+  folder,
+  items,
+  allFolders,
+  spaces,
+  viewMode,
+  debugScoresByItemId,
+  showDebugScores = false,
+}: TabGroupProps) => {
   return (
     <SelectionProvider>
-      <TabGroupContent folder={folder} items={items} allFolders={allFolders} viewMode={viewMode} />
+      <TabGroupContent
+        folder={folder}
+        items={items}
+        allFolders={allFolders}
+        spaces={spaces}
+        viewMode={viewMode}
+        debugScoresByItemId={debugScoresByItemId}
+        showDebugScores={showDebugScores}
+      />
     </SelectionProvider>
   );
 };

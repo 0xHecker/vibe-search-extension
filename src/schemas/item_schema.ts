@@ -19,17 +19,28 @@ export type ItemDocType = {
     | "github"
     | "article";
   folderId: string;
+  spaceId: string;
   isFavorite: boolean;
   authorUsername?: string;
   likes?: number;
   upvotes?: number;
   media?: {
-    type: "image" | "video";
+    type: "image" | "video" | "audio";
     originalUrl: string;
     storageType: "hotlink" | "opfs" | "s3";
     opfsPath?: string;
     s3Url?: string;
     expiresAt?: number;
+    altText?: string;
+    titleText?: string;
+    ariaLabel?: string;
+    pageUrl?: string;
+    pageTitle?: string;
+    siteName?: string;
+    faviconUrl?: string;
+    width?: number;
+    height?: number;
+    capturedAt?: number;
   }[];
   iconUrl?: string;
   displayImageUrl?: string;
@@ -47,7 +58,7 @@ export type ItemDocType = {
 
 export const itemSchema: RxJsonSchema<ItemDocType> = {
   title: "item schema",
-  version: 0,
+  version: 3,
   description: "Describes a single saved item (bookmark, note, social media post)",
   primaryKey: "id",
   type: "object",
@@ -75,6 +86,7 @@ export const itemSchema: RxJsonSchema<ItemDocType> = {
       maxLength: 20,
     },
     folderId: { type: "string", ref: "folders", maxLength: 1000 },
+    spaceId: { type: "string", default: "space_public_default", maxLength: 1000 },
     isFavorite: { type: "boolean", default: false },
     // Social media specific fields
     authorUsername: { type: "string" },
@@ -85,7 +97,7 @@ export const itemSchema: RxJsonSchema<ItemDocType> = {
       items: {
         type: "object",
         properties: {
-          type: { type: "string", enum: ["image", "video"] },
+          type: { type: "string", enum: ["image", "video", "audio"] },
           originalUrl: { type: "string" },
           storageType: {
             type: "string",
@@ -94,6 +106,16 @@ export const itemSchema: RxJsonSchema<ItemDocType> = {
           opfsPath: { type: "string" },
           s3Url: { type: "string" },
           expiresAt: { type: "number" },
+          altText: { type: "string" },
+          titleText: { type: "string" },
+          ariaLabel: { type: "string" },
+          pageUrl: { type: "string" },
+          pageTitle: { type: "string" },
+          siteName: { type: "string" },
+          faviconUrl: { type: "string" },
+          width: { type: "number" },
+          height: { type: "number" },
+          capturedAt: { type: "number" },
         },
       },
     },
@@ -144,6 +166,7 @@ export const itemSchema: RxJsonSchema<ItemDocType> = {
     "isMetaFetched",
     "isDirty",
     "folderId",
+    "spaceId",
     "vector_index",
     "userId",
     "deletedAt",
@@ -153,6 +176,7 @@ export const itemSchema: RxJsonSchema<ItemDocType> = {
     "updatedAt",
     "source",
     "folderId",
+    "spaceId",
     "isFavorite",
     "isEmbedded",
     "isMetaFetched",

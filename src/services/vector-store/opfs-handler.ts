@@ -3,13 +3,13 @@ export class OpfsHandler {
   private fileHandle: FileSystemFileHandle | null = null;
   private fileName: string | null = null;
 
-  async open(fileName: string, truncate = false): Promise<void> {
+  async open(fileName: string, truncate = false, create = true): Promise<void> {
     if (!self.navigator || !("storage" in self.navigator)) {
       throw new Error("OPFS is not available in this context.");
     }
     this.fileName = fileName;
     const root = await self.navigator.storage.getDirectory();
-    this.fileHandle = await root.getFileHandle(fileName, { create: true });
+    this.fileHandle = await root.getFileHandle(fileName, { create });
 
     if (truncate) {
       await this.truncate();
@@ -31,6 +31,11 @@ export class OpfsHandler {
     const file = await this.fileHandle.getFile();
     const slice = file.slice(offset, offset + buffer.byteLength);
     const readBuffer = await slice.arrayBuffer();
+    if (readBuffer.byteLength !== buffer.byteLength) {
+      throw new Error(
+        `Read out of bounds for ${this.fileName ?? "unknown file"}: requested ${buffer.byteLength} bytes at offset ${offset}, got ${readBuffer.byteLength}.`
+      );
+    }
     new Uint8Array(buffer).set(new Uint8Array(readBuffer));
   }
 

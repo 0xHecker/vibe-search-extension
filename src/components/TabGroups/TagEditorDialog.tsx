@@ -4,6 +4,7 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@components/ui
 import { Button } from "@components/ui/button";
 import { Popover, PopoverContent, PopoverTrigger } from "@components/ui/popover";
 import { cn } from "@src/lib/utils";
+import { resolveToastErrorMessage, withToast } from "@src/utils/toast-feedback";
 
 interface TagType {
   id: string;
@@ -99,33 +100,47 @@ export const TagEditorDialog = ({
     if (!tagName) return;
     setIsLoading(true);
     try {
-      // If bulk mode, add to all items
-      const targetIds = isBulkMode ? itemIds : [primaryItemId];
-      for (const id of targetIds || []) {
-        await chrome.runtime.sendMessage({
-          service: "tags",
-          type: "addTagToItem",
-          target: "offscreen",
-          payload: { itemId: id, tagName },
-        });
-      }
-      // Reload tags from primary item
-      const res = await chrome.runtime.sendMessage({
-        service: "tags",
-        type: "getTagsForItem",
-        target: "offscreen",
-        payload: { itemId: primaryItemId },
+      await withToast({
+        loading: isBulkMode ? "Adding tag to selected tabs..." : "Adding tag...",
+        success: isBulkMode
+          ? `Tag added to ${itemIds?.length ?? 0} tabs.`
+          : `Tag "${tagName}" added.`,
+        error: (err) => resolveToastErrorMessage(err, "Failed to add tag."),
+        action: async () => {
+          // If bulk mode, add to all items
+          const targetIds = isBulkMode ? itemIds : [primaryItemId];
+          for (const id of targetIds || []) {
+            const addResponse = await chrome.runtime.sendMessage({
+              service: "tags",
+              type: "addTagToItem",
+              target: "offscreen",
+              payload: { itemId: id, tagName },
+            });
+            if (addResponse?.success === false || addResponse?.payload?.success === false) {
+              throw new Error(addResponse?.error || addResponse?.payload?.error || "Failed to add tag.");
+            }
+          }
+          // Reload tags from primary item
+          const res = await chrome.runtime.sendMessage({
+            service: "tags",
+            type: "getTagsForItem",
+            target: "offscreen",
+            payload: { itemId: primaryItemId },
+          });
+          if (res?.success) {
+            const next = res.payload as TagType[];
+            setTags(next);
+            onTagsUpdate?.(next);
+          }
+          // Reload all tags to include newly created ones
+          await loadAllTags();
+          setSearchValue("");
+          setHighlightedIndex(-1);
+          setComboboxOpen(false);
+        },
       });
-      if (res?.success) {
-        const next = res.payload as TagType[];
-        setTags(next);
-        onTagsUpdate?.(next);
-      }
-      // Reload all tags to include newly created ones
-      await loadAllTags();
-      setSearchValue("");
-      setHighlightedIndex(-1);
-      setComboboxOpen(false);
+    } catch (error) {
+      console.error("Failed to add tag", error);
     } finally {
       setIsLoading(false);
     }
@@ -134,26 +149,40 @@ export const TagEditorDialog = ({
   const removeTag = async (tagId: string) => {
     setIsLoading(true);
     try {
-      const targetIds = isBulkMode ? itemIds : [primaryItemId];
-      for (const id of targetIds || []) {
-        await chrome.runtime.sendMessage({
-          service: "tags",
-          type: "removeTagFromItem",
-          target: "offscreen",
-          payload: { itemId: id, tagId },
-        });
-      }
-      const res = await chrome.runtime.sendMessage({
-        service: "tags",
-        type: "getTagsForItem",
-        target: "offscreen",
-        payload: { itemId: primaryItemId },
+      await withToast({
+        loading: isBulkMode ? "Removing tag from selected tabs..." : "Removing tag...",
+        success: isBulkMode ? `Tag removed from ${itemIds?.length ?? 0} tabs.` : "Tag removed.",
+        error: (err) => resolveToastErrorMessage(err, "Failed to remove tag."),
+        action: async () => {
+          const targetIds = isBulkMode ? itemIds : [primaryItemId];
+          for (const id of targetIds || []) {
+            const removeResponse = await chrome.runtime.sendMessage({
+              service: "tags",
+              type: "removeTagFromItem",
+              target: "offscreen",
+              payload: { itemId: id, tagId },
+            });
+            if (removeResponse?.success === false || removeResponse?.payload?.success === false) {
+              throw new Error(
+                removeResponse?.error || removeResponse?.payload?.error || "Failed to remove tag."
+              );
+            }
+          }
+          const res = await chrome.runtime.sendMessage({
+            service: "tags",
+            type: "getTagsForItem",
+            target: "offscreen",
+            payload: { itemId: primaryItemId },
+          });
+          if (res?.success) {
+            const next = res.payload as TagType[];
+            setTags(next);
+            onTagsUpdate?.(next);
+          }
+        },
       });
-      if (res?.success) {
-        const next = res.payload as TagType[];
-        setTags(next);
-        onTagsUpdate?.(next);
-      }
+    } catch (error) {
+      console.error("Failed to remove tag", error);
     } finally {
       setIsLoading(false);
     }

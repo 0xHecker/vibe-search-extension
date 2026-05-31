@@ -1,6 +1,14 @@
 import { getDb } from "@src/services/DatabaseService";
 import { v4 as uuidv4 } from "uuid";
 import type { TagDocType } from "@src/schemas/tag_schema";
+import { PRIVATE_SPACE_ID, PUBLIC_SPACE_ID } from "@src/common/spaces";
+import { spaceSessionService } from "@src/services/space-session.service";
+
+type SearchScope = "current" | "global" | "private" | "public";
+type AccessContext = {
+  activeSpaceId?: string;
+  searchScope?: SearchScope;
+};
 
 export class TagsController {
   [key: string]: any;
@@ -9,8 +17,116 @@ export class TagsController {
     return name.trim().slice(0, 100);
   }
 
+  private assertSpaceUnlocked(spaceId: string): void {
+    if (spaceId === PRIVATE_SPACE_ID && !spaceSessionService.isUnlocked(PRIVATE_SPACE_ID)) {
+      throw new Error("PRIVATE_SPACE_LOCKED");
+    }
+  }
+
+  private async resolveAllowedSpaceIds(
+    db: any,
+    accessContext?: AccessContext
+  ): Promise<string[]> {
+    const activeSpaceId = accessContext?.activeSpaceId || PUBLIC_SPACE_ID;
+    const requestedScope = accessContext?.searchScope || "global";
+    const privateUnlocked = spaceSessionService.isUnlocked(PRIVATE_SPACE_ID);
+
+    const spaceDocs = await db.spaces.find({ selector: { isArchived: { $eq: false } } }).exec();
+    const spaces = spaceDocs.map((doc: any) => doc.toMutableJSON() as any);
+    const allSpaceIds = spaces.map((space: any) => space.id as string);
+    const nonPrivateSpaceIds = spaces
+      .filter((space: any) => !space.isPrivate)
+      .map((space: any) => space.id as string);
+    const hasActiveSpace = spaces.some((space: any) => space.id === activeSpaceId);
+    const safeActiveSpaceId = hasActiveSpace ? activeSpaceId : PUBLIC_SPACE_ID;
+    const fallbackPublic = nonPrivateSpaceIds.length > 0 ? nonPrivateSpaceIds : [PUBLIC_SPACE_ID];
+    const fallbackAll = allSpaceIds.length > 0 ? allSpaceIds : fallbackPublic;
+
+    if (requestedScope === "global") {
+      return privateUnlocked ? fallbackAll : fallbackPublic;
+    }
+    if (requestedScope === "public") {
+      return fallbackPublic;
+    }
+    if (requestedScope === "private") {
+      return privateUnlocked ? [PRIVATE_SPACE_ID] : [];
+    }
+    if (safeActiveSpaceId === PRIVATE_SPACE_ID) {
+      return privateUnlocked ? [PRIVATE_SPACE_ID] : [];
+    }
+    return [safeActiveSpaceId];
+  }
+
+  private async getAccessibleItem(db: any, itemId: string): Promise<any | null> {
+    const itemDoc = await db.items.findOne(itemId).exec();
+    if (!itemDoc) return null;
+    const item = itemDoc.toMutableJSON() as any;
+    const spaceId = (item.spaceId as string | undefined) || PUBLIC_SPACE_ID;
+    this.assertSpaceUnlocked(spaceId);
+    return itemDoc;
+  }
+
+  private async findVisibleItemIds(
+    db: any,
+    itemIds: string[],
+    allowedSpaceIds: string[]
+  ): Promise<Set<string>> {
+    const visible = new Set<string>();
+    if (itemIds.length === 0 || allowedSpaceIds.length === 0) return visible;
+
+    const uniqueIds = Array.from(new Set(itemIds.filter(Boolean)));
+    const chunkSize = 600;
+    for (let i = 0; i < uniqueIds.length; i += chunkSize) {
+      const chunk = uniqueIds.slice(i, i + chunkSize);
+      const docs = await db.items
+        .find({
+          selector: {
+            id: { $in: chunk },
+            deletedAt: { $eq: 0 },
+            spaceId: { $in: allowedSpaceIds },
+          },
+        })
+        .exec();
+      for (const doc of docs) {
+        const id = doc.get("id") as string;
+        if (id) visible.add(id);
+      }
+    }
+    return visible;
+  }
+
+  private async collectVisibleTagIds(
+    db: any,
+    candidateTagIds: string[],
+    allowedSpaceIds: string[]
+  ): Promise<Set<string>> {
+    const visibleTagIds = new Set<string>();
+    if (candidateTagIds.length === 0 || allowedSpaceIds.length === 0) return visibleTagIds;
+
+    const joins = await db.item_tags.find({ selector: { tagId: { $in: candidateTagIds } } }).exec();
+    if (joins.length === 0) return visibleTagIds;
+
+    const joinPairs = joins.map((join: any) => ({
+      itemId: join.get("itemId") as string,
+      tagId: join.get("tagId") as string,
+    }));
+    const itemIds = joinPairs.map((pair: { itemId: string; tagId: string }) => pair.itemId).filter(Boolean);
+    const visibleItemIds = await this.findVisibleItemIds(db, itemIds, allowedSpaceIds);
+    if (visibleItemIds.size === 0) return visibleTagIds;
+
+    for (const pair of joinPairs) {
+      if (visibleItemIds.has(pair.itemId)) {
+        visibleTagIds.add(pair.tagId);
+      }
+    }
+
+    return visibleTagIds;
+  }
+
   async getTagsForItem(payload: { itemId: string }): Promise<TagDocType[]> {
     const db = await getDb();
+    const itemDoc = await this.getAccessibleItem(db, payload.itemId);
+    if (!itemDoc) return [];
     const joins = await db.item_tags.find({ selector: { itemId: { $eq: payload.itemId } } }).exec();
     if (joins.length === 0) return [];
     const tagIds = joins.map((j) => j.get("tagId") as string);
@@ -18,23 +134,66 @@ export class TagsController {
     return tags.map((t) => t.toMutableJSON());
   }
 
-  async searchTags(payload: { query: string; limit?: number }): Promise<TagDocType[]> {
+  async searchTags(payload: {
+    query: string;
+    limit?: number;
+    accessContext?: AccessContext;
+  }): Promise<TagDocType[]> {
     const db = await getDb();
     const q = (payload.query ?? "").trim().toLowerCase();
     const limit = Math.max(1, Math.min(payload.limit ?? 50, 100));
+    const allowedSpaceIds = await this.resolveAllowedSpaceIds(db, payload.accessContext);
+    if (allowedSpaceIds.length === 0) return [];
 
-    // Get all tags sorted by updatedAt (most recently used first - LRU style)
-    const allTags = await db.tags.find({ selector: {} }).exec();
-    let results = allTags
-      .map((t) => t.toMutableJSON())
-      .sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+    const allTags = (await db.tags.find({ selector: {} }).exec()).map((tag) =>
+      tag.toMutableJSON() as TagDocType
+    );
+    if (allTags.length === 0) return [];
 
-    // Filter by query if provided
+    const sortByRecency = (a: TagDocType, b: TagDocType) => (b.updatedAt || 0) - (a.updatedAt || 0);
+    const startsWithScore = (tag: TagDocType) => {
+      const lower = (tag.name || "").toLowerCase();
+      if (!q) return 0;
+      return lower.startsWith(q) ? 1 : 0;
+    };
+
+    let candidates = allTags;
     if (q) {
-      results = results.filter((t) => t.name.toLowerCase().includes(q));
+      candidates = candidates.filter((tag) => (tag.name || "").toLowerCase().includes(q));
+      candidates.sort((a, b) => {
+        const byPrefix = startsWithScore(b) - startsWithScore(a);
+        if (byPrefix !== 0) return byPrefix;
+        return sortByRecency(a, b);
+      });
+      candidates = candidates.slice(0, Math.max(limit * 8, 200));
+      if (candidates.length === 0) return [];
+      const visibleTagIds = await this.collectVisibleTagIds(
+        db,
+        candidates.map((tag) => tag.id),
+        allowedSpaceIds
+      );
+      return candidates.filter((tag) => visibleTagIds.has(tag.id)).slice(0, limit);
     }
 
-    return results.slice(0, limit);
+    candidates = [...candidates].sort(sortByRecency);
+    const results: TagDocType[] = [];
+    const batchSize = 120;
+    for (let i = 0; i < candidates.length && results.length < limit; i += batchSize) {
+      const batch = candidates.slice(i, i + batchSize);
+      const visibleTagIds = await this.collectVisibleTagIds(
+        db,
+        batch.map((tag) => tag.id),
+        allowedSpaceIds
+      );
+      for (const tag of batch) {
+        if (visibleTagIds.has(tag.id)) {
+          results.push(tag);
+          if (results.length >= limit) break;
+        }
+      }
+    }
+
+    return results;
   }
 
   async addTagToItem(payload: {
@@ -43,6 +202,10 @@ export class TagsController {
     userId?: string;
   }): Promise<{ tags: TagDocType[] }> {
     const db = await getDb();
+    const itemDoc = await this.getAccessibleItem(db, payload.itemId);
+    if (!itemDoc) {
+      throw new Error("ITEM_NOT_FOUND");
+    }
     const name = this.normalizeName(payload.tagName);
     if (!name) return { tags: [] };
     const userId = payload.userId || "user1"; // Use default user ID instead of null
@@ -92,6 +255,10 @@ export class TagsController {
     tagId: string;
   }): Promise<{ tags: TagDocType[] }> {
     const db = await getDb();
+    const itemDoc = await this.getAccessibleItem(db, payload.itemId);
+    if (!itemDoc) {
+      throw new Error("ITEM_NOT_FOUND");
+    }
     const joinId = `${payload.itemId}|${payload.tagId}`;
     const joinDoc = await db.item_tags.findOne(joinId).exec();
     if (joinDoc) {

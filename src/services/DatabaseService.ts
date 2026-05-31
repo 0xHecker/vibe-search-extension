@@ -16,15 +16,18 @@ addRxPlugin(RxDBQueryBuilderPlugin);
 // Import schemas
 import { itemSchema, ItemDocType } from "@src/schemas/item_schema";
 import { folderSchema, FolderDocType } from "@src/schemas/folder_schema";
+import { spaceSchema, SpaceDocType } from "@src/schemas/space_schema";
 import { tagSchema, TagDocType } from "@src/schemas/tag_schema";
 import { itemTagSchema, ItemTagDocType } from "@src/schemas/item_tag_schema";
 import { searchHistorySchema, SearchHistoryDocType } from "@src/schemas/search_history_schema";
 import { flashcardSchema, FlashcardDocType } from "@src/schemas/flashcard_schema";
 import { deletedItemSchema, DeletedItemDocType } from "@src/schemas/deleted_item_schema";
+import { PUBLIC_SPACE_ID } from "@src/common/spaces";
 
 // Define collection types
 export type ItemCollection = RxCollection<ItemDocType>;
 export type FolderCollection = RxCollection<FolderDocType>;
+export type SpaceCollection = RxCollection<SpaceDocType>;
 export type TagCollection = RxCollection<TagDocType>;
 export type ItemTagCollection = RxCollection<ItemTagDocType>;
 export type SearchHistoryCollection = RxCollection<SearchHistoryDocType>;
@@ -35,6 +38,7 @@ export type DeletedItemCollection = RxCollection<DeletedItemDocType>;
 export type MyDatabaseCollections = {
   items: ItemCollection;
   folders: FolderCollection;
+  spaces: SpaceCollection;
   tags: TagCollection;
   item_tags: ItemTagCollection;
   search_history: SearchHistoryCollection;
@@ -61,6 +65,20 @@ const createDatabase = async () => {
   await db.addCollections({
     items: {
       schema: itemSchema,
+      migrationStrategies: {
+        1: async (oldDoc: any) => {
+          if (!oldDoc.spaceId || typeof oldDoc.spaceId !== "string") {
+            return { ...oldDoc, spaceId: PUBLIC_SPACE_ID };
+          }
+          return oldDoc;
+        },
+        2: async (oldDoc: any) => {
+          return oldDoc;
+        },
+        3: async (oldDoc: any) => {
+          return oldDoc;
+        },
+      },
     },
     folders: {
       schema: folderSchema,
@@ -91,6 +109,29 @@ const createDatabase = async () => {
             oldDoc.sortOrder !== undefined ? oldDoc.sortOrder : oldDoc.createdAt ?? Date.now();
           const nextOrder = Number.isFinite(nextOrderRaw) ? Math.max(0, Math.floor(nextOrderRaw)) : 0;
           return { ...oldDoc, sortOrder: nextOrder };
+        },
+        5: async (oldDoc: any) => {
+          const nextSpaceId =
+            typeof oldDoc.spaceId === "string" && oldDoc.spaceId.trim().length > 0
+              ? oldDoc.spaceId
+              : PUBLIC_SPACE_ID;
+          return { ...oldDoc, spaceId: nextSpaceId };
+        },
+        6: async (oldDoc: any) => {
+          return {
+            ...oldDoc,
+            userId: typeof oldDoc.userId === "string" ? oldDoc.userId : "",
+          };
+        },
+      },
+    },
+    spaces: {
+      schema: spaceSchema,
+      migrationStrategies: {
+        1: async (oldDoc: any) => {
+          return {
+            ...oldDoc,
+          };
         },
       },
     },

@@ -13,6 +13,9 @@ import {
   ContextMenuContent,
   ContextMenuItem,
   ContextMenuSeparator,
+  ContextMenuSub,
+  ContextMenuSubTrigger,
+  ContextMenuSubContent,
 } from "@components/ui/context-menu";
 import { TagEditorDialog } from "@components/TabGroups/TagEditorDialog";
 import { cn } from "@src/lib/utils";
@@ -21,12 +24,26 @@ import { Checkbox } from "@components/ui/checkbox";
 import { WebsitePreview } from "./WebsitePreview";
 import { useSortable } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
+import type { SpaceMoveOption } from "./TabGroups";
+import type { QueryRankDebugScore } from "@src/search-core/contracts";
+import {
+  resolveToastErrorMessage,
+  showErrorToast,
+  showSuccessToast,
+  withToast,
+} from "@src/utils/toast-feedback";
 
 export const FlatItem = ({
   item,
+  spaces,
+  debugScore,
+  showDebugScore = false,
   onCopy,
 }: {
   item: ItemDocType;
+  spaces: SpaceMoveOption[];
+  debugScore?: QueryRankDebugScore;
+  showDebugScore?: boolean;
   onCopy: (item: ItemDocType) => void;
 }) => {
   const [isCopied, setIsCopied] = useState(false);
@@ -39,6 +56,10 @@ export const FlatItem = ({
   const { isSelectionMode, isSelected, toggleItem, selectItem, selectedIds } = useSelection();
   const itemIsSelected = isSelected(item.id);
   const isLoading = !item.isMetaFetched || isRefreshing;
+  const primaryMediaType = item.media?.[0]?.type;
+  const hasImagePreview = !!item.displayImageUrl;
+  const mediaCount = (item.media || []).length > 0 ? (item.media || []).length : hasImagePreview ? 1 : 0;
+  const extraMediaCount = Math.max(0, mediaCount - 1);
   const { attributes, listeners, setNodeRef, transform, transition, isDragging, isOver } =
     useSortable({
       id: item.id,
@@ -75,25 +96,64 @@ export const FlatItem = ({
       setIsCopied(true);
       onCopy(item);
       setTimeout(() => setIsCopied(false), 5000);
+      showSuccessToast("URL copied.", { tempo: "quick" });
     } catch (err) {
       console.error("Failed to copy URL:", err);
+      showErrorToast(resolveToastErrorMessage(err, "Failed to copy URL."));
     }
   };
 
   const handleDelete = async () => {
-    const response = await chrome.runtime.sendMessage({
-      service: "items",
-      type: "delete",
-      target: "offscreen",
-      payload: { id: item.id },
-    });
+    await withToast({
+      loading: "Deleting tab...",
+      success: "Tab deleted.",
+      error: (err) => resolveToastErrorMessage(err, "Failed to delete tab."),
+      action: async () => {
+        const response = await chrome.runtime.sendMessage({
+          service: "items",
+          type: "delete",
+          target: "offscreen",
+          payload: { id: item.id },
+        });
 
-    if (response?.success === false || response?.payload?.success === false) {
-      throw new Error(
-        response?.error || response?.payload?.error || "Failed to delete tab. Please try again."
-      );
+        if (response?.success === false || response?.payload?.success === false) {
+          throw new Error(
+            response?.error || response?.payload?.error || "Failed to delete tab. Please try again."
+          );
+        }
+      },
+    });
+  };
+
+  const handleMoveToSpace = async (targetSpaceId: string) => {
+    try {
+      await withToast({
+        loading: "Moving tab to selected space...",
+        success: "Tab moved to selected space.",
+        error: (err) => resolveToastErrorMessage(err, "Failed to move tab to selected space."),
+        action: async () => {
+          const response = await chrome.runtime.sendMessage({
+            service: "items",
+            type: "moveToSpace",
+            target: "offscreen",
+            payload: {
+              targetSpaceId,
+              itemIds: [item.id],
+            },
+          });
+          if (response?.success === false || response?.payload?.success === false) {
+            throw new Error(
+              response?.error || response?.payload?.error || "Failed to move tab to selected space."
+            );
+          }
+        },
+      });
+    } catch (error) {
+      console.error("Failed to move tab to selected space", error);
     }
   };
+
+  const moveSpaceOptions = spaces.filter((space) => space.id !== item.spaceId);
 
   const handleOpen = () => {
     try {
@@ -106,10 +166,17 @@ export const FlatItem = ({
   const handleRefreshMetadata = async () => {
     setIsRefreshing(true);
     try {
-      await chrome.runtime.sendMessage({
-        target: "background",
-        type: "FETCH_METADATA",
-        payload: { urls: [item.url], revalidate: true },
+      await withToast({
+        loading: "Refreshing metadata...",
+        success: "Metadata refresh queued.",
+        error: (err) => resolveToastErrorMessage(err, "Failed to refresh metadata."),
+        action: async () => {
+          await chrome.runtime.sendMessage({
+            target: "background",
+            type: "FETCH_METADATA",
+            payload: { urls: [item.url], revalidate: true },
+          });
+        },
       });
       setTimeout(() => setIsRefreshing(false), 10000);
     } catch (error) {
@@ -169,8 +236,32 @@ export const FlatItem = ({
               className="flex flex-row gap-2 cursor-pointer flex-1 min-w-0"
               onClick={isSelectionMode ? handleToggleSelect : handleOpen}
             >
-              <div className={cn("w-5 h-5 rounded-sm flex-shrink-0", isLoading && "animate-pulse")}>
-                {item.iconUrl ? (
+              <div
+                className={cn(
+                  hasImagePreview ? "w-8 h-8 rounded-md" : "w-5 h-5 rounded-sm",
+                  "flex-shrink-0 overflow-hidden",
+                  isLoading && "animate-pulse"
+                )}
+              >
+                {hasImagePreview ? (
+                  <div className="relative w-full h-full">
+                    <img
+                      src={item.displayImageUrl}
+                      alt={item.title}
+                      loading="lazy"
+                      decoding="async"
+                      className="w-full h-full object-cover rounded-md border border-border-neutral-faded"
+                      onError={(e) => {
+                        e.currentTarget.style.display = "none";
+                      }}
+                    />
+                    {extraMediaCount > 0 && (
+                      <span className="absolute -right-1 -bottom-1 rounded-full bg-background-neutral/95 border border-border-neutral-faded px-1 text-[9px] font-medium text-foreground-secondary">
+                        +{extraMediaCount}
+                      </span>
+                    )}
+                  </div>
+                ) : item.iconUrl ? (
                   <img
                     src={item.iconUrl}
                     alt={item.title}
@@ -191,6 +282,28 @@ export const FlatItem = ({
               >
                 {item.title}
               </span>
+              {showDebugScore && debugScore && (
+                <div className="flex items-center gap-1 flex-shrink-0 font-mono text-[10px]">
+                  <span className="rounded border border-border-neutral-faded px-1 text-foreground-tertiary">
+                    #{debugScore.rank}
+                  </span>
+                  <span className="rounded border border-border-neutral-faded px-1 text-foreground-tertiary">
+                    L {debugScore.lexicalScore.toFixed(3)}
+                  </span>
+                  <span className="rounded border border-border-neutral-faded px-1 text-foreground-tertiary">
+                    V {debugScore.vectorScore.toFixed(3)}
+                  </span>
+                  <span className="rounded border border-border-neutral-faded px-1 text-foreground-secondary">
+                    F {debugScore.fusedScore.toFixed(3)}
+                  </span>
+                </div>
+              )}
+              {!hasImagePreview && primaryMediaType && (
+                <span className="px-1.5 py-0.5 rounded text-[10px] uppercase tracking-[0.08em] bg-gray-10 text-foreground-tertiary flex-shrink-0">
+                  {primaryMediaType}
+                  {extraMediaCount > 0 ? ` +${extraMediaCount}` : ""}
+                </span>
+              )}
               {tags.length > 0 && (
                 <div className="flex flex-row gap-1 flex-shrink-0">
                   {tags.slice(0, 3).map((t) => (
@@ -270,6 +383,29 @@ export const FlatItem = ({
           <ContextMenuItem onSelect={() => setIsPreviewOpen(true)}>
             View in side panel
           </ContextMenuItem>
+          {moveSpaceOptions.length > 0 && <ContextMenuSeparator />}
+          {moveSpaceOptions.length > 0 && (
+            <ContextMenuSub>
+              <ContextMenuSubTrigger>Move to space</ContextMenuSubTrigger>
+              <ContextMenuSubContent>
+                {moveSpaceOptions.map((space) => {
+                  const isLocked = space.isPrivate && !space.access?.isUnlocked;
+                  return (
+                    <ContextMenuItem
+                      key={space.id}
+                      disabled={isLocked}
+                      onSelect={() => {
+                        void handleMoveToSpace(space.id);
+                      }}
+                    >
+                      {space.name}
+                      {isLocked ? " (Locked)" : ""}
+                    </ContextMenuItem>
+                  );
+                })}
+              </ContextMenuSubContent>
+            </ContextMenuSub>
+          )}
           <ContextMenuSeparator />
           <ContextMenuItem disabled>Edit</ContextMenuItem>
           <ContextMenuItem onSelect={() => setIsDeleteDialogOpen(true)} variant="destructive">

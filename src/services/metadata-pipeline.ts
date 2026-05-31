@@ -215,7 +215,7 @@ const fetchMetadataForUrls = async (urls: string[], revalidate = false): Promise
 // --- Manual, Reliable Request Pipeline ---
 
 type UrlStatus = "idle" | "queued" | "inflight" | "done" | "failed";
-type UrlEntry = { status: UrlStatus; attempts: number; revalidate: boolean };
+type UrlEntry = { status: UrlStatus; attempts: number; revalidate: boolean; updatedAt: number };
 const urlState = new Map<string, UrlEntry>();
 
 const MAX_ATTEMPTS = 3;
@@ -223,18 +223,112 @@ const RETRY_BACKOFF = [1000, 5000, 30000]; // ms
 const CONCURRENCY = 4;
 const BATCH_SIZE = 5;
 const TICK_INTERVAL = 400; // ms
+const URL_STATE_MAX_SIZE = 20000;
+const URL_STATE_DONE_TTL = 30 * 60 * 1000;
+const URL_STATE_FAILED_TTL = 2 * 60 * 60 * 1000;
+const URL_STATE_IDLE_TTL = 10 * 60 * 1000;
+const URL_STATE_CLEANUP_INTERVAL = 60 * 1000;
+
+let lastUrlStateCleanupAt = 0;
+
+type MetadataPipelineStats = {
+  scheduledUrls: number;
+  fetchedBatches: number;
+  successfulUrls: number;
+  failedUrls: number;
+  retriesScheduled: number;
+  evictedUrls: number;
+  cleanupRuns: number;
+  queueLength: number;
+  inflightCount: number;
+  urlStateSize: number;
+  lastUpdatedAt: number;
+};
+
+const pipelineStats: MetadataPipelineStats = {
+  scheduledUrls: 0,
+  fetchedBatches: 0,
+  successfulUrls: 0,
+  failedUrls: 0,
+  retriesScheduled: 0,
+  evictedUrls: 0,
+  cleanupRuns: 0,
+  queueLength: 0,
+  inflightCount: 0,
+  urlStateSize: 0,
+  lastUpdatedAt: Date.now(),
+};
+
+const touchPipelineStats = () => {
+  pipelineStats.queueLength = queue.length + batchBuffer.length;
+  pipelineStats.inflightCount = inflightCount;
+  pipelineStats.urlStateSize = urlState.size;
+  pipelineStats.lastUpdatedAt = Date.now();
+};
 
 const queue: Array<{ url: string; revalidate: boolean }> = [];
 let inflightCount = 0;
 let batchTimeout: NodeJS.Timeout | null = null;
 const batchBuffer: Array<{ url: string; revalidate: boolean }> = [];
 
+const touchEntry = (entry: UrlEntry) => {
+  entry.updatedAt = Date.now();
+};
+
+const cleanupUrlState = (force = false) => {
+  const now = Date.now();
+  if (!force && now - lastUrlStateCleanupAt < URL_STATE_CLEANUP_INTERVAL) {
+    return;
+  }
+  lastUrlStateCleanupAt = now;
+  pipelineStats.cleanupRuns += 1;
+
+  for (const [url, state] of urlState.entries()) {
+    const age = now - state.updatedAt;
+    if (state.status === "done" && age > URL_STATE_DONE_TTL) {
+      urlState.delete(url);
+      pipelineStats.evictedUrls += 1;
+      continue;
+    }
+    if (state.status === "failed" && age > URL_STATE_FAILED_TTL) {
+      urlState.delete(url);
+      pipelineStats.evictedUrls += 1;
+      continue;
+    }
+    if (state.status === "idle" && age > URL_STATE_IDLE_TTL) {
+      urlState.delete(url);
+      pipelineStats.evictedUrls += 1;
+    }
+  }
+
+  if (urlState.size <= URL_STATE_MAX_SIZE) {
+    return;
+  }
+
+  const evictable = Array.from(urlState.entries())
+    .filter(([, state]) => state.status !== "queued" && state.status !== "inflight")
+    .sort((a, b) => a[1].updatedAt - b[1].updatedAt);
+
+  for (const [url] of evictable) {
+    if (urlState.size <= URL_STATE_MAX_SIZE) {
+      break;
+    }
+    urlState.delete(url);
+    pipelineStats.evictedUrls += 1;
+  }
+  touchPipelineStats();
+};
+
 const processQueue = () => {
+  cleanupUrlState();
+  touchPipelineStats();
   while (inflightCount < CONCURRENCY && queue.length > 0) {
     inflightCount++;
+    touchPipelineStats();
     const batchToProcess = queue.splice(0, BATCH_SIZE);
     fetchAndProcessBatch(batchToProcess).finally(() => {
       inflightCount--;
+      touchPipelineStats();
       processQueue();
     });
   }
@@ -244,6 +338,7 @@ const fetchAndProcessBatch = async (batch: Array<{ url: string; revalidate: bool
   const urls = batch.map((b) => b.url);
   const safeUrls = normalizeIncomingUrls(urls);
   if (safeUrls.length === 0) return;
+  pipelineStats.fetchedBatches += 1;
 
   // Check if any URL in batch needs revalidation (force cache bypass)
   const shouldRevalidate = batch.some((b) => b.revalidate);
@@ -254,6 +349,7 @@ const fetchAndProcessBatch = async (batch: Array<{ url: string; revalidate: bool
     if (!state) continue;
     state.status = "inflight";
     state.attempts++;
+    touchEntry(state);
   }
 
   console.log(
@@ -290,8 +386,12 @@ const fetchAndProcessBatch = async (batch: Array<{ url: string; revalidate: bool
     // Mark successful URLs as done
     for (const url of fetchResult.successfulUrls) {
       const state = urlState.get(url);
-      if (state) state.status = "done";
+      if (state) {
+        state.status = "done";
+        touchEntry(state);
+      }
     }
+    pipelineStats.successfulUrls += fetchResult.successfulUrls.size;
 
     // Handle failed URLs - schedule for retry with backoff
     for (const url of fetchResult.failedUrls) {
@@ -300,12 +400,16 @@ const fetchAndProcessBatch = async (batch: Array<{ url: string; revalidate: bool
       if (state.attempts < MAX_ATTEMPTS) {
         const delay = RETRY_BACKOFF[state.attempts - 1];
         console.log(`[MetadataPipeline] Scheduling retry for ${url} in ${delay}ms`);
+        pipelineStats.retriesScheduled += 1;
         setTimeout(() => {
           state.status = "queued";
+          touchEntry(state);
           addUrlToPipeline(url, state.revalidate);
         }, delay);
       } else {
         state.status = "failed";
+        touchEntry(state);
+        pipelineStats.failedUrls += 1;
         console.warn(
           `[MetadataPipeline] Permanently failed for URL after ${MAX_ATTEMPTS} attempts:`,
           url
@@ -320,14 +424,21 @@ const fetchAndProcessBatch = async (batch: Array<{ url: string; revalidate: bool
       if (!state) continue;
       if (state.attempts < MAX_ATTEMPTS) {
         const delay = RETRY_BACKOFF[state.attempts - 1];
+        pipelineStats.retriesScheduled += 1;
         setTimeout(() => {
           state.status = "queued";
+          touchEntry(state);
           addUrlToPipeline(url, state.revalidate);
         }, delay);
       } else {
         state.status = "failed";
+        touchEntry(state);
+        pipelineStats.failedUrls += 1;
       }
     }
+  } finally {
+    cleanupUrlState();
+    touchPipelineStats();
   }
 };
 
@@ -339,12 +450,14 @@ const flushBatchBuffer = () => {
   if (batchBuffer.length > 0) {
     queue.push(...batchBuffer);
     batchBuffer.length = 0;
+    touchPipelineStats();
     processQueue();
   }
 };
 
 const addUrlToPipeline = (url: string, revalidate: boolean) => {
   batchBuffer.push({ url, revalidate });
+  touchPipelineStats();
   if (batchBuffer.length >= BATCH_SIZE) {
     flushBatchBuffer();
   } else if (!batchTimeout) {
@@ -358,6 +471,7 @@ const addUrlToPipeline = (url: string, revalidate: boolean) => {
  * @param forceRefresh - If true, bypasses cache and re-fetches even for already-fetched URLs
  */
 export const scheduleForProcessing = (urls: string[], forceRefresh = false) => {
+  cleanupUrlState();
   const normalized = normalizeIncomingUrls(urls);
   if (normalized.length === 0) return;
 
@@ -369,20 +483,40 @@ export const scheduleForProcessing = (urls: string[], forceRefresh = false) => {
     const state = urlState.get(url);
     if (!state) {
       // New URL - add to pipeline
-      urlState.set(url, { status: "queued", attempts: 0, revalidate: forceRefresh });
+      urlState.set(url, {
+        status: "queued",
+        attempts: 0,
+        revalidate: forceRefresh,
+        updatedAt: Date.now(),
+      });
       addUrlToPipeline(url, forceRefresh);
+      pipelineStats.scheduledUrls += 1;
     } else if (forceRefresh) {
       // Force refresh - reset state and requeue with cache bypass
       state.status = "queued";
       state.attempts = 0;
       state.revalidate = true;
+      touchEntry(state);
       addUrlToPipeline(url, true);
+      pipelineStats.scheduledUrls += 1;
     } else if (state.status === "failed") {
       // Retry failed URL
       state.status = "queued";
       state.attempts = 0;
+      touchEntry(state);
       addUrlToPipeline(url, false);
+      pipelineStats.scheduledUrls += 1;
     }
     // If state exists and is "done" or "queued" or "inflight", skip unless forceRefresh
   }
+  cleanupUrlState();
+  touchPipelineStats();
 };
+
+export const getMetadataPipelineStats = (): MetadataPipelineStats => ({
+  ...pipelineStats,
+  queueLength: queue.length + batchBuffer.length,
+  inflightCount,
+  urlStateSize: urlState.size,
+  lastUpdatedAt: Date.now(),
+});

@@ -21,18 +21,31 @@ import {
   ContextMenuContent,
   ContextMenuItem,
   ContextMenuSeparator,
+  ContextMenuSub,
+  ContextMenuSubTrigger,
+  ContextMenuSubContent,
 } from "@components/ui/context-menu";
 import { TagEditorDialog } from "@components/TabGroups/TagEditorDialog";
 import { useSelection } from "./SelectionContext";
 import { WebsitePreview } from "./WebsitePreview";
+import { ItemMediaPreview } from "./ItemMediaPreview";
 import { useSortable } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
+import type { SpaceMoveOption } from "./TabGroups";
+import type { QueryRankDebugScore } from "@src/search-core/contracts";
+import { resolveToastErrorMessage, withToast } from "@src/utils/toast-feedback";
 
 export const GridItem = ({
   item,
+  spaces,
+  debugScore,
+  showDebugScore = false,
   onCopy,
 }: {
   item: ItemDocType;
+  spaces: SpaceMoveOption[];
+  debugScore?: QueryRankDebugScore;
+  showDebugScore?: boolean;
   onCopy: (item: ItemDocType) => void;
 }) => {
   const textRef = useRef<HTMLParagraphElement>(null);
@@ -188,10 +201,17 @@ export const GridItem = ({
   const handleRefreshMetadata = async () => {
     setIsRefreshing(true);
     try {
-      await chrome.runtime.sendMessage({
-        target: "background",
-        type: "FETCH_METADATA",
-        payload: { urls: [item.url], revalidate: true },
+      await withToast({
+        loading: "Refreshing metadata...",
+        success: "Metadata refresh queued.",
+        error: (err) => resolveToastErrorMessage(err, "Failed to refresh metadata."),
+        action: async () => {
+          await chrome.runtime.sendMessage({
+            target: "background",
+            type: "FETCH_METADATA",
+            payload: { urls: [item.url], revalidate: true },
+          });
+        },
       });
       setTimeout(() => setIsRefreshing(false), 10000);
     } catch (error) {
@@ -199,6 +219,36 @@ export const GridItem = ({
       setIsRefreshing(false);
     }
   };
+
+  const handleMoveToSpace = async (targetSpaceId: string) => {
+    try {
+      await withToast({
+        loading: "Moving tab to selected space...",
+        success: "Tab moved to selected space.",
+        error: (err) => resolveToastErrorMessage(err, "Failed to move tab to selected space."),
+        action: async () => {
+          const response = await chrome.runtime.sendMessage({
+            service: "items",
+            type: "moveToSpace",
+            target: "offscreen",
+            payload: {
+              targetSpaceId,
+              itemIds: [item.id],
+            },
+          });
+          if (response?.success === false || response?.payload?.success === false) {
+            throw new Error(
+              response?.error || response?.payload?.error || "Failed to move tab to selected space."
+            );
+          }
+        },
+      });
+    } catch (error) {
+      console.error("Failed to move tab to selected space", error);
+    }
+  };
+
+  const moveSpaceOptions = spaces.filter((space) => space.id !== item.spaceId);
 
   return (
     <ContextMenu>
@@ -283,16 +333,7 @@ export const GridItem = ({
           </div>
 
           <div className="flex flex-col gap-1 p-3 rounded-semi overflow-hidden bg-background-neutral">
-            {item.displayImageUrl && (
-              <img
-                src={item.displayImageUrl}
-                alt={item.title}
-                className="w-full object-cover rounded-sm-semi"
-                onError={(e) => {
-                  e.currentTarget.style.display = "none";
-                }}
-              />
-            )}
+            <ItemMediaPreview item={item} />
             <div className="flex flex-col gap-2">
               <div className="flex flex-col gap-1">
                 <h3
@@ -301,6 +342,22 @@ export const GridItem = ({
                 >
                   {item.title}
                 </h3>
+                {showDebugScore && debugScore && (
+                  <div className="flex flex-wrap items-center gap-1 font-mono text-[10px]">
+                    <span className="rounded border border-border-neutral-faded px-1 text-foreground-tertiary">
+                      #{debugScore.rank}
+                    </span>
+                    <span className="rounded border border-border-neutral-faded px-1 text-foreground-tertiary">
+                      L {debugScore.lexicalScore.toFixed(3)}
+                    </span>
+                    <span className="rounded border border-border-neutral-faded px-1 text-foreground-tertiary">
+                      V {debugScore.vectorScore.toFixed(3)}
+                    </span>
+                    <span className="rounded border border-border-neutral-faded px-1 text-foreground-secondary">
+                      F {debugScore.fusedScore.toFixed(3)}
+                    </span>
+                  </div>
+                )}
                 <div className="relative">
                   <p
                     ref={textRef}
@@ -433,6 +490,29 @@ export const GridItem = ({
         <ContextMenuItem onSelect={() => setIsPreviewOpen(true)}>
           View in side panel
         </ContextMenuItem>
+        {moveSpaceOptions.length > 0 && <ContextMenuSeparator />}
+        {moveSpaceOptions.length > 0 && (
+          <ContextMenuSub>
+            <ContextMenuSubTrigger>Move to space</ContextMenuSubTrigger>
+            <ContextMenuSubContent>
+              {moveSpaceOptions.map((space) => {
+                const isLocked = space.isPrivate && !space.access?.isUnlocked;
+                return (
+                  <ContextMenuItem
+                    key={space.id}
+                    disabled={isLocked}
+                    onSelect={() => {
+                      void handleMoveToSpace(space.id);
+                    }}
+                  >
+                    {space.name}
+                    {isLocked ? " (Locked)" : ""}
+                  </ContextMenuItem>
+                );
+              })}
+            </ContextMenuSubContent>
+          </ContextMenuSub>
+        )}
         <ContextMenuItem disabled>Edit</ContextMenuItem>
         <ContextMenuSeparator />
         <ContextMenuItem
@@ -468,20 +548,28 @@ export const GridItem = ({
         confirmLabel={deleteScope === "all" ? "Delete from all groups" : "Delete tab"}
         variant="danger"
         onConfirm={async () => {
-          const response = await chrome.runtime.sendMessage({
-            service: "items",
-            type: "delete",
-            target: "offscreen",
-            payload: { id: item.id, scope: deleteScope },
-          });
+          await withToast({
+            loading: "Deleting tab...",
+            success:
+              deleteScope === "all" ? "Tab deleted from all groups." : "Tab deleted from group.",
+            error: (err) => resolveToastErrorMessage(err, "Failed to delete tab."),
+            action: async () => {
+              const response = await chrome.runtime.sendMessage({
+                service: "items",
+                type: "delete",
+                target: "offscreen",
+                payload: { id: item.id, scope: deleteScope },
+              });
 
-          if (response?.success === false || response?.payload?.success === false) {
-            throw new Error(
-              response?.error ||
-                response?.payload?.error ||
-                "Failed to delete tab. Please try again."
-            );
-          }
+              if (response?.success === false || response?.payload?.success === false) {
+                throw new Error(
+                  response?.error ||
+                    response?.payload?.error ||
+                    "Failed to delete tab. Please try again."
+                );
+              }
+            },
+          });
         }}
       />
       <TagEditorDialog

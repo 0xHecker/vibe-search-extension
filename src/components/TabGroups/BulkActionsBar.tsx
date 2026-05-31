@@ -34,19 +34,27 @@ import { useSelection } from "./SelectionContext";
 import { OpenInCurrent } from "@icons/open-in-current";
 import { OpenInTabgroup } from "@icons/open-in-tabgroup";
 import { OpenInWindow } from "@icons/open-in-window";
+import type { SpaceMoveOption } from "./TabGroups";
 import {
   openUrlsInCurrentWindow,
   openUrlsInNewTabGroup,
   openUrlsInNewWindow,
 } from "@src/utils/chromeTabs";
+import {
+  resolveToastErrorMessage,
+  showErrorToast,
+  showSuccessToast,
+  withToast,
+} from "@src/utils/toast-feedback";
 
 interface BulkActionsBarProps {
   items: ItemDocType[];
   folders: FolderDocType[];
+  spaces: SpaceMoveOption[];
   currentFolderId: string;
 }
 
-export const BulkActionsBar = ({ items, folders, currentFolderId }: BulkActionsBarProps) => {
+export const BulkActionsBar = ({ items, folders, spaces, currentFolderId }: BulkActionsBarProps) => {
   const {
     selectedIds,
     selectedCount,
@@ -68,128 +76,277 @@ export const BulkActionsBar = ({ items, folders, currentFolderId }: BulkActionsB
   const selectedItems = getSelectedItems(items);
   const allSelected = selectedCount === items.length;
   const someSelected = selectedCount > 0 && selectedCount < items.length;
+  const selectedItemIds = selectedItems.map((item) => item.id);
+  const selectedLabel = `${selectedCount} tab${selectedCount === 1 ? "" : "s"}`;
+
+  const assertResponseSuccess = (response: any, fallbackMessage: string) => {
+    if (response?.success === false || response?.payload?.success === false) {
+      throw new Error(response?.error || response?.payload?.error || fallbackMessage);
+    }
+  };
 
   const handleCopy = async () => {
     const urls = selectedItems.map((item) => item.url).join("\n");
+    if (!urls.trim()) {
+      showErrorToast("No URLs available to copy.", { tempo: "quick" });
+      return;
+    }
     try {
       await navigator.clipboard.writeText(urls);
       setIsCopied(true);
       setTimeout(() => setIsCopied(false), 2000);
+      showSuccessToast(`Copied ${selectedLabel}.`, { tempo: "quick" });
     } catch (err) {
       console.error("Failed to copy URLs:", err);
+      showErrorToast(resolveToastErrorMessage(err, "Failed to copy URLs."));
     }
   };
 
   const handleDelete = async () => {
-    for (const item of selectedItems) {
-      await chrome.runtime.sendMessage({
-        service: "items",
-        type: "delete",
-        target: "offscreen",
-        payload: { id: item.id },
-      });
-    }
+    await withToast({
+      loading: `Deleting ${selectedLabel}...`,
+      success: `Deleted ${selectedLabel}.`,
+      error: (err) => resolveToastErrorMessage(err, `Failed to delete ${selectedLabel}.`),
+      action: async () => {
+        for (const item of selectedItems) {
+          const response = await chrome.runtime.sendMessage({
+            service: "items",
+            type: "delete",
+            target: "offscreen",
+            payload: { id: item.id },
+          });
+          assertResponseSuccess(response, "Failed to delete selected tab.");
+        }
+      },
+    });
     exitSelectionMode();
   };
 
   const handleMoveToFolder = async (targetFolderId: string) => {
-    // For now, we'll implement move as delete + add to new folder
-    // A proper implementation would need a moveToFolder method in the controller
-    for (const item of selectedItems) {
-      // Delete from current location
-      await chrome.runtime.sendMessage({
-        service: "items",
-        type: "delete",
-        target: "offscreen",
-        payload: { id: item.id },
-      });
-      // Add to new folder
-      await chrome.runtime.sendMessage({
-        service: "items",
-        type: "addToFolder",
-        target: "offscreen",
-        payload: {
-          folderId: targetFolderId,
-          url: item.url,
-          title: item.title,
-          iconUrl: item.iconUrl,
-          textContent: item.textContent,
-          source: item.source,
+    if (selectedItemIds.length === 0) {
+      showErrorToast("Select at least one tab to move.", { tempo: "quick" });
+      return;
+    }
+    try {
+      await withToast({
+        loading: `Moving ${selectedLabel}...`,
+        success: `Moved ${selectedLabel}.`,
+        error: (err) => resolveToastErrorMessage(err, "Failed to move selected tabs."),
+        action: async () => {
+          const response = await chrome.runtime.sendMessage({
+            service: "items",
+            type: "moveToFolder",
+            target: "offscreen",
+            payload: {
+              targetFolderId,
+              itemIds: selectedItemIds,
+            },
+          });
+          assertResponseSuccess(response, "Failed to move selected tabs.");
         },
       });
+      exitSelectionMode();
+      setIsMoveMenuOpen(false);
+    } catch (error) {
+      console.error("Failed to move selected tabs to folder", error);
     }
-    exitSelectionMode();
-    setIsMoveMenuOpen(false);
+  };
+
+  const handleMoveToSpace = async (targetSpaceId: string) => {
+    if (selectedItemIds.length === 0) {
+      showErrorToast("Select at least one tab to move.", { tempo: "quick" });
+      return;
+    }
+    try {
+      await withToast({
+        loading: `Moving ${selectedLabel} to selected space...`,
+        success: `Moved ${selectedLabel} to selected space.`,
+        error: (err) => resolveToastErrorMessage(err, "Failed to move selected tabs to space."),
+        action: async () => {
+          const response = await chrome.runtime.sendMessage({
+            service: "items",
+            type: "moveToSpace",
+            target: "offscreen",
+            payload: {
+              targetSpaceId,
+              itemIds: selectedItemIds,
+            },
+          });
+          assertResponseSuccess(response, "Failed to move selected tabs to space.");
+        },
+      });
+      exitSelectionMode();
+      setIsMoveMenuOpen(false);
+    } catch (error) {
+      console.error("Failed to move selected tabs to space", error);
+    }
   };
 
   const handleCreateNewFolder = async () => {
     const folderName = `${selectedCount} tabs - ${new Date().toLocaleDateString()}`;
-    const response = await chrome.runtime.sendMessage({
-      service: "folders",
-      type: "create",
-      target: "offscreen",
-      payload: { name: folderName, userId: "user1" },
-    });
-    if (response?.success) {
-      const newFolder = response.payload as FolderDocType;
-      await handleMoveToFolder(newFolder.id);
+    const currentFolder = folders.find((folder) => folder.id === currentFolderId);
+    if (selectedItemIds.length === 0) {
+      showErrorToast("Select at least one tab to move.", { tempo: "quick" });
+      return;
+    }
+    try {
+      await withToast({
+        loading: "Creating folder and moving tabs...",
+        success: `Moved ${selectedLabel} to a new folder.`,
+        error: (err) =>
+          resolveToastErrorMessage(err, "Failed to create a folder and move selected tabs."),
+        action: async () => {
+          const createResponse = await chrome.runtime.sendMessage({
+            service: "folders",
+            type: "create",
+            target: "offscreen",
+            payload: { name: folderName, userId: "user1", spaceId: currentFolder?.spaceId },
+          });
+          assertResponseSuccess(createResponse, "Failed to create folder.");
+          const newFolder = createResponse.payload as FolderDocType;
+          const moveResponse = await chrome.runtime.sendMessage({
+            service: "items",
+            type: "moveToFolder",
+            target: "offscreen",
+            payload: {
+              targetFolderId: newFolder.id,
+              itemIds: selectedItemIds,
+            },
+          });
+          assertResponseSuccess(moveResponse, "Failed to move selected tabs.");
+        },
+      });
+      exitSelectionMode();
+      setIsMoveMenuOpen(false);
+    } catch (error) {
+      console.error("Failed to create folder from selection", error);
     }
   };
 
   const handleOpenInCurrentWindow = async () => {
     const urls = selectedItems.map((i) => i.url);
-    await openUrlsInCurrentWindow(urls);
-    setIsOpenMenuOpen(false);
+    if (urls.length === 0) {
+      showErrorToast("No tabs available to open.", { tempo: "quick" });
+      return;
+    }
+    try {
+      await withToast({
+        loading: `Opening ${selectedLabel} in current window...`,
+        success: `Opened ${selectedLabel} in current window.`,
+        error: (err) => resolveToastErrorMessage(err, "Failed to open tabs."),
+        action: async () => openUrlsInCurrentWindow(urls),
+      });
+      setIsOpenMenuOpen(false);
+    } catch (error) {
+      console.error("Failed to open tabs in current window", error);
+    }
   };
 
   const handleOpenInNewWindow = async () => {
     const urls = selectedItems.map((i) => i.url);
-    await openUrlsInNewWindow(urls);
-    setIsOpenMenuOpen(false);
+    if (urls.length === 0) {
+      showErrorToast("No tabs available to open.", { tempo: "quick" });
+      return;
+    }
+    try {
+      await withToast({
+        loading: `Opening ${selectedLabel} in new window...`,
+        success: `Opened ${selectedLabel} in new window.`,
+        error: (err) => resolveToastErrorMessage(err, "Failed to open tabs."),
+        action: async () => openUrlsInNewWindow(urls),
+      });
+      setIsOpenMenuOpen(false);
+    } catch (error) {
+      console.error("Failed to open tabs in new window", error);
+    }
   };
 
   const handleOpenInNewTabGroup = async () => {
     const urls = selectedItems.map((i) => i.url);
-    await openUrlsInNewTabGroup(urls, `${selectedCount} tabs`);
-    setIsOpenMenuOpen(false);
+    if (urls.length === 0) {
+      showErrorToast("No tabs available to open.", { tempo: "quick" });
+      return;
+    }
+    try {
+      await withToast({
+        loading: `Opening ${selectedLabel} in a new tab group...`,
+        success: `Opened ${selectedLabel} in a new tab group.`,
+        error: (err) => resolveToastErrorMessage(err, "Failed to open tabs."),
+        action: async () => openUrlsInNewTabGroup(urls, `${selectedCount} tabs`),
+      });
+      setIsOpenMenuOpen(false);
+    } catch (error) {
+      console.error("Failed to open tabs in new tab group", error);
+    }
   };
 
   const handleRefreshMetadata = async () => {
     const urls = selectedItems.map((item) => item.url);
-    await chrome.runtime.sendMessage({
-      target: "background",
-      type: "FETCH_METADATA",
-      payload: { urls, revalidate: true },
-    });
-    setIsMoreMenuOpen(false);
+    if (urls.length === 0) {
+      showErrorToast("No tabs available to refresh.", { tempo: "quick" });
+      return;
+    }
+    try {
+      await withToast({
+        loading: `Refreshing metadata for ${selectedLabel}...`,
+        success: `Metadata refresh queued for ${selectedLabel}.`,
+        error: (err) => resolveToastErrorMessage(err, "Failed to refresh metadata."),
+        action: async () => {
+          await chrome.runtime.sendMessage({
+            target: "background",
+            type: "FETCH_METADATA",
+            payload: { urls, revalidate: true },
+          });
+        },
+      });
+      setIsMoreMenuOpen(false);
+    } catch (error) {
+      console.error("Failed to refresh metadata for selection", error);
+    }
   };
 
   const handleDeleteTags = async () => {
-    // This would need a bulk delete tags endpoint
-    // For now, we'll remove all tags from selected items
-    for (const item of selectedItems) {
-      const res = await chrome.runtime.sendMessage({
-        service: "tags",
-        type: "getTagsForItem",
-        target: "offscreen",
-        payload: { itemId: item.id },
-      });
-      if (res?.success) {
-        const tags = res.payload as { id: string; name: string }[];
-        for (const tag of tags) {
-          await chrome.runtime.sendMessage({
-            service: "tags",
-            type: "removeTagFromItem",
-            target: "offscreen",
-            payload: { itemId: item.id, tagId: tag.id },
-          });
-        }
-      }
+    if (selectedItemIds.length === 0) {
+      showErrorToast("Select at least one tab first.", { tempo: "quick" });
+      return;
     }
-    setIsMoreMenuOpen(false);
+    try {
+      await withToast({
+        loading: `Removing tags from ${selectedLabel}...`,
+        success: `Removed tags from ${selectedLabel}.`,
+        error: (err) => resolveToastErrorMessage(err, "Failed to remove tags."),
+        action: async () => {
+          for (const item of selectedItems) {
+            const res = await chrome.runtime.sendMessage({
+              service: "tags",
+              type: "getTagsForItem",
+              target: "offscreen",
+              payload: { itemId: item.id },
+            });
+            assertResponseSuccess(res, "Failed to load tags for selected tab.");
+            const tags = (res.payload as { id: string; name: string }[]) || [];
+            for (const tag of tags) {
+              const removeResponse = await chrome.runtime.sendMessage({
+                service: "tags",
+                type: "removeTagFromItem",
+                target: "offscreen",
+                payload: { itemId: item.id, tagId: tag.id },
+              });
+              assertResponseSuccess(removeResponse, "Failed to remove a tag from selected tab.");
+            }
+          }
+        },
+      });
+      setIsMoreMenuOpen(false);
+    } catch (error) {
+      console.error("Failed to remove tags from selected tabs", error);
+    }
   };
 
   const otherFolders = folders.filter((f) => f.id !== currentFolderId);
+  const currentFolder = folders.find((folder) => folder.id === currentFolderId);
+  const currentSpaceId = currentFolder?.spaceId;
+  const movableSpaces = spaces.filter((space) => space.id !== currentSpaceId);
 
   return (
     <>
@@ -269,6 +426,40 @@ export const BulkActionsBar = ({ items, folders, currentFolderId }: BulkActionsB
                     </span>
                   </DropdownMenuItem>
                 ))}
+              </>
+            )}
+            {movableSpaces.length > 0 && (
+              <>
+                <DropdownMenuSeparator />
+                <DropdownMenuSub>
+                  <DropdownMenuSubTrigger className="gap-2">
+                    <FolderInput size={16} />
+                    <span>Move to space</span>
+                  </DropdownMenuSubTrigger>
+                  <DropdownMenuSubContent className="min-w-[220px]">
+                    {movableSpaces.map((space) => {
+                      const isLocked = space.isPrivate && !space.access?.isUnlocked;
+                      return (
+                        <DropdownMenuItem
+                          key={space.id}
+                          disabled={isLocked}
+                          onSelect={() => {
+                            void handleMoveToSpace(space.id);
+                          }}
+                          className="gap-2"
+                        >
+                          <FolderInput size={16} className="text-foreground-tertiary" />
+                          <span className="flex-1 truncate">{space.name}</span>
+                          {isLocked && (
+                            <span className="text-[10px] text-foreground-tertiary uppercase tracking-[0.08em]">
+                              Locked
+                            </span>
+                          )}
+                        </DropdownMenuItem>
+                      );
+                    })}
+                  </DropdownMenuSubContent>
+                </DropdownMenuSub>
               </>
             )}
           </DropdownMenuContent>

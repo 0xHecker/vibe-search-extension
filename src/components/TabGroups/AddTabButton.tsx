@@ -3,6 +3,7 @@ import { Button } from "@components/ui/button";
 import { PlusLargeIcon } from "@icons/plus-large";
 import { Input } from "@components/ui/input";
 import { cn } from "@src/lib/utils";
+import { resolveToastErrorMessage, withToast } from "@src/utils/toast-feedback";
 
 export const AddTabButton = ({ folderId }: { folderId: string }) => {
   const [isExpanded, setIsExpanded] = useState(false);
@@ -21,17 +22,27 @@ export const AddTabButton = ({ folderId }: { folderId: string }) => {
     if (!trimmed || isAdding) return;
     setIsAdding(true);
     try {
-      // Insert the item immediately - metadata will be fetched asynchronously
-      // by the addToFolder method which triggers FETCH_METADATA
-      await chrome.runtime.sendMessage({
-        service: "items",
-        type: "addToFolder",
-        target: "offscreen",
-        payload: {
-          folderId,
-          url: trimmed,
-          userId: "user1",
-          source: "web",
+      await withToast({
+        loading: "Adding tab...",
+        success: "Tab added.",
+        error: (err) => resolveToastErrorMessage(err, "Failed to add tab."),
+        action: async () => {
+          // Insert the item immediately - metadata will be fetched asynchronously
+          // by the addToFolder method which triggers FETCH_METADATA
+          const response = await chrome.runtime.sendMessage({
+            service: "items",
+            type: "addToFolder",
+            target: "offscreen",
+            payload: {
+              folderId,
+              url: trimmed,
+              userId: "user1",
+              source: "web",
+            },
+          });
+          if (response?.success === false || response?.payload?.success === false) {
+            throw new Error(response?.error || response?.payload?.error || "Failed to add tab.");
+          }
         },
       });
       setUrl("");

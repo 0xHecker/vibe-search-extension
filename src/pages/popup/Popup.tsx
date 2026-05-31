@@ -1,5 +1,8 @@
+import * as React from "react";
+import { v4 as uuidv4 } from "uuid";
 import { Button } from "@src/components/ui/button";
 import { Input } from "@src/components/ui/input";
+import { Checkbox } from "@src/components/ui/checkbox";
 import {
   Card,
   CardContent,
@@ -15,18 +18,378 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@src/components/ui/select";
-import { v4 as uuidv4 } from "uuid";
-import { ItemDocType } from "@src/schemas/item_schema";
-import { FolderDocType } from "@src/schemas/folder_schema";
-import * as React from "react";
+import type { ItemDocType } from "@src/schemas/item_schema";
+import type { FolderDocType } from "@src/schemas/folder_schema";
 
-const Popup = () => {
-  const [folderName, setFolderName] = React.useState("");
-  const [scope, setScope] = React.useState<
-    "current_window" | "except_current" | "left_of_current" | "right_of_current" | "all_windows"
-  >("current_window");
-  const [isSaving, setIsSaving] = React.useState(false);
+type TabSaveScope =
+  | "current_window"
+  | "except_current"
+  | "left_of_current"
+  | "right_of_current"
+  | "all_windows";
+
+type ImportSettings = {
+  reviewBeforeSave: boolean;
+};
+
+type ImportDraftSummary = {
+  id: string;
+  mode: "save" | "shot";
+  title: string;
+  host: string;
+  createdAt: number;
+};
+
+type ImportTargetItem = {
+  id: string;
+  title: string;
+  updatedAt: number;
+};
+
+type ImportTargetFolder = {
+  id: string;
+  name: string;
+  recentItems: ImportTargetItem[];
+};
+
+type ImportTargetSpace = {
+  id: string;
+  name: string;
+  isPrivate: boolean;
+  isUnlocked: boolean;
+  folders: ImportTargetFolder[];
+};
+
+type ImportDraft = {
+  id: string;
+  mode: "save" | "shot";
+  createdAt: number;
+  updatedAt: number;
+  primaryUrl: string;
+  title: string;
+  textContent: string;
+  source: ItemDocType["source"];
+  tags: string[];
+  iconUrl?: string;
+  displayImageUrl?: string;
+  media?: ItemDocType["media"];
+  shouldFetchMetadata?: boolean;
+  isMetaFetched?: boolean;
+  target: {
+    spaceId: string;
+    folderId?: string;
+    parentId?: string | null;
+    newFolderName?: string;
+  };
+};
+
+type ImportGetDraftPayload = {
+  draft: ImportDraft | null;
+  settings: ImportSettings;
+  targets: ImportTargetSpace[];
+};
+
+type RuntimeResponse<T> = {
+  success?: boolean;
+  payload?: T;
+  error?: string;
+};
+type ProcessStatusState = "processing" | "success" | "error";
+type ProcessStatusItem = {
+  id: string;
+  label: string;
+  state: ProcessStatusState;
+  detail: string;
+  retryAction?: string;
+  updatedAt: number;
+};
+
+const SOURCE_OPTIONS: ItemDocType["source"][] = [
+  "web",
+  "twitter",
+  "reddit",
+  "note",
+  "youtube",
+  "instagram",
+  "tiktok",
+  "substack",
+  "linkedin",
+  "github",
+  "article",
+];
+
+const trimText = (value: string, max = 80) =>
+  value.length <= max ? value : `${value.slice(0, Math.max(0, max - 1)).trim()}...`;
+
+const formatDraftTime = (value: number): string => {
+  const date = new Date(value);
+  return `${date.toLocaleDateString()} ${date.toLocaleTimeString([], {
+    hour: "2-digit",
+    minute: "2-digit",
+  })}`;
+};
+
+const parseTagsInput = (value: string): string[] => {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const part of value.split(/[\n,]/)) {
+    const trimmed = part.trim();
+    if (!trimmed) continue;
+    const key = trimmed.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(trimmed);
+  }
+  return out;
+};
+const formatProcessTime = (value: number): string => {
+  const date = new Date(value || Date.now());
+  return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+};
+const normalizeProcessState = (value: unknown): ProcessStatusState => {
+  if (value === "error") return "error";
+  if (value === "success") return "success";
+  return "processing";
+};
+const normalizeProcessStatusPayload = (payload: unknown): ProcessStatusItem | null => {
+  if (!payload || typeof payload !== "object") return null;
+  const row = payload as Partial<ProcessStatusItem>;
+  if (typeof row.id !== "string" || !row.id.trim()) return null;
+  return {
+    id: row.id,
+    label: typeof row.label === "string" && row.label.trim() ? row.label : "Background",
+    state: normalizeProcessState(row.state),
+    detail: typeof row.detail === "string" ? row.detail : "",
+    retryAction: typeof row.retryAction === "string" ? row.retryAction : undefined,
+    updatedAt: typeof row.updatedAt === "number" && Number.isFinite(row.updatedAt) ? row.updatedAt : Date.now(),
+  };
+};
+const upsertProcessStatusList = (list: ProcessStatusItem[], next: ProcessStatusItem, max = 8): ProcessStatusItem[] => {
+  const map = new Map<string, ProcessStatusItem>(list.map((entry) => [entry.id, entry]));
+  map.set(next.id, next);
+  return [...map.values()]
+    .sort((a, b) => b.updatedAt - a.updatedAt)
+    .slice(0, max);
+};
+
+const resolveDraftPreviewImages = (draft: ImportDraft | null): string[] => {
+  if (!draft) return [];
+  const candidates = [
+    draft.displayImageUrl || "",
+    ...(draft.media || [])
+      .filter((entry) => entry.type === "image")
+      .map((entry) => entry.s3Url || entry.originalUrl || ""),
+  ];
+  const unique = new Set<string>();
+  const output: string[] = [];
+  for (const src of candidates) {
+    const normalized = (src || "").trim();
+    if (!normalized) continue;
+    if (unique.has(normalized)) continue;
+    unique.add(normalized);
+    output.push(normalized);
+  }
+  return output;
+};
+
+const mapChecked = (value: boolean | "indeterminate"): boolean => value === true;
+
+const useBackground = () => {
+  const call = React.useCallback(async <T,>(type: string, payload?: unknown): Promise<T> => {
+    const response = (await chrome.runtime.sendMessage({
+      target: "background",
+      type,
+      payload,
+    })) as RuntimeResponse<T>;
+
+    if (!response?.success) {
+      throw new Error(response?.error || `${type} failed`);
+    }
+
+    return response.payload as T;
+  }, []);
+
+  return { call };
+};
+
+const useProcessStatusFeed = (call: <T>(type: string, payload?: unknown) => Promise<T>) => {
+  const [statuses, setStatuses] = React.useState<ProcessStatusItem[]>([]);
+
+  React.useEffect(() => {
+    let active = true;
+    void (async () => {
+      try {
+        const rows = await call<ProcessStatusItem[]>("IMPORT_GET_PROCESS_STATUSES", { max: 8 });
+        if (!active) return;
+        const normalized = Array.isArray(rows)
+          ? rows
+              .map((row) => normalizeProcessStatusPayload(row))
+              .filter((row): row is ProcessStatusItem => !!row)
+              .slice(0, 8)
+          : [];
+        setStatuses(normalized);
+      } catch {}
+    })();
+
+    const listener = (message: unknown) => {
+      if (!message || typeof message !== "object") return;
+      const row = message as { type?: string; payload?: unknown };
+      if (row.type !== "PROCESS_STATUS") return;
+      const normalized = normalizeProcessStatusPayload(row.payload);
+      if (!normalized) return;
+      setStatuses((current) => upsertProcessStatusList(current, normalized, 8));
+    };
+    chrome.runtime.onMessage.addListener(listener);
+    return () => {
+      active = false;
+      chrome.runtime.onMessage.removeListener(listener);
+    };
+  }, [call]);
+
+  return statuses;
+};
+
+const ProcessStatusPanel = ({ statuses }: { statuses: ProcessStatusItem[] }) => {
+  return (
+    <div className="rounded-lg border border-border-neutral-faded bg-background-page-secondary px-3 py-2 space-y-2">
+      <div className="text-xs font-medium text-foreground-neutral">Processing (dev)</div>
+      {statuses.length === 0 ? (
+        <div className="text-[11px] text-foreground-tertiary">No recent background activity.</div>
+      ) : (
+        <div className="max-h-44 overflow-auto space-y-1">
+          {statuses.map((status) => (
+            <div key={status.id} className="rounded-md border border-border-neutral-faded px-2 py-1.5">
+              <div className="flex items-center justify-between gap-2">
+                <span className="text-[11px] font-medium text-foreground-neutral truncate">{status.label}</span>
+                <span
+                  className={
+                    status.state === "error"
+                      ? "text-[10px] text-red-500"
+                      : status.state === "success"
+                        ? "text-[10px] text-green-500"
+                        : "text-[10px] text-amber-500"
+                  }
+                >
+                  {status.state}
+                </span>
+              </div>
+              <div className="text-[11px] text-foreground-secondary break-words">{status.detail || "..."}</div>
+              <div className="text-[10px] text-foreground-tertiary">{formatProcessTime(status.updatedAt)}</div>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+};
+
+const ImportEditor = ({ requestedDraftId }: { requestedDraftId: string | null }) => {
+  const { call } = useBackground();
+  const processStatuses = useProcessStatusFeed(call);
+
+  const [loading, setLoading] = React.useState(true);
+  const [saving, setSaving] = React.useState(false);
   const [status, setStatus] = React.useState<string | null>(null);
+  const [drafts, setDrafts] = React.useState<ImportDraftSummary[]>([]);
+  const [selectedDraftId, setSelectedDraftId] = React.useState<string>(requestedDraftId || "");
+
+  const [draft, setDraft] = React.useState<ImportDraft | null>(null);
+  const [targets, setTargets] = React.useState<ImportTargetSpace[]>([]);
+
+  const [title, setTitle] = React.useState("");
+  const [url, setUrl] = React.useState("");
+  const [textContent, setTextContent] = React.useState("");
+  const [source, setSource] = React.useState<ItemDocType["source"]>("web");
+  const [tagsInput, setTagsInput] = React.useState("");
+  const [spaceId, setSpaceId] = React.useState("");
+  const [folderId, setFolderId] = React.useState("__new__");
+  const [createFolderName, setCreateFolderName] = React.useState("");
+  const [parentId, setParentId] = React.useState("");
+
+  const selectedSpace = React.useMemo(
+    () => targets.find((space) => space.id === spaceId) || null,
+    [spaceId, targets]
+  );
+
+  const selectedFolder = React.useMemo(
+    () => selectedSpace?.folders.find((folder) => folder.id === folderId) || null,
+    [folderId, selectedSpace]
+  );
+  const previewImages = React.useMemo(() => resolveDraftPreviewImages(draft), [draft]);
+
+  const loadDrafts = React.useCallback(async () => {
+    const rows = await call<ImportDraftSummary[]>("IMPORT_LIST_DRAFTS");
+    setDrafts(rows || []);
+    return rows || [];
+  }, [call]);
+
+  const hydrateFromDraft = React.useCallback((nextDraft: ImportDraft | null, nextTargets: ImportTargetSpace[]) => {
+    setDraft(nextDraft);
+    setTargets(nextTargets);
+
+    if (!nextDraft) {
+      setTitle("");
+      setUrl("");
+      setTextContent("");
+      setSource("web");
+      setTagsInput("");
+      setSpaceId("");
+      setFolderId("__new__");
+      setCreateFolderName("");
+      setParentId("");
+      return;
+    }
+
+    setTitle(nextDraft.title || "");
+    setUrl(nextDraft.primaryUrl || "");
+    setTextContent(nextDraft.textContent || "");
+    setSource(nextDraft.source || "web");
+    setTagsInput((nextDraft.tags || []).join(", "));
+
+    const draftSpaceId = nextDraft.target.spaceId || nextTargets[0]?.id || "";
+    const draftFolderId = nextDraft.target.folderId || "__new__";
+    setSpaceId(draftSpaceId);
+    setFolderId(draftFolderId);
+    setCreateFolderName(nextDraft.target.newFolderName || "");
+    setParentId((nextDraft.target.parentId || "") as string);
+  }, []);
+
+  const loadDraft = React.useCallback(
+    async (targetDraftId?: string) => {
+      setLoading(true);
+      setStatus(null);
+      try {
+        const payload = await call<ImportGetDraftPayload>("IMPORT_GET_DRAFT", {
+          draftId: targetDraftId,
+        });
+        hydrateFromDraft(payload.draft, payload.targets || []);
+        if (payload.draft?.id) {
+          setSelectedDraftId(payload.draft.id);
+        }
+      } catch (error) {
+        setStatus(error instanceof Error ? error.message : "Failed to load import draft.");
+      } finally {
+        setLoading(false);
+      }
+    },
+    [call, hydrateFromDraft]
+  );
+
+  React.useEffect(() => {
+    void (async () => {
+      await loadDrafts();
+      await loadDraft(requestedDraftId || undefined);
+    })();
+  }, [loadDraft, loadDrafts, requestedDraftId]);
+
+  React.useEffect(() => {
+    if (!selectedSpace) return;
+    if (folderId === "__new__") return;
+    if (!selectedSpace.folders.some((folder) => folder.id === folderId)) {
+      setFolderId("__new__");
+      setParentId("");
+    }
+  }, [folderId, selectedSpace]);
 
   const openSearchPage = () => {
     chrome.tabs.create({
@@ -34,15 +397,347 @@ const Popup = () => {
     });
   };
 
-  const buildItemsFromTabs = (tabs: chrome.tabs.Tab[], folderId: string) => {
-    console.log(tabs);
-    const itemsToSave = tabs
+  const submitDraft = async () => {
+    if (!draft) return;
+    if (!title.trim()) {
+      setStatus("Title is required.");
+      return;
+    }
+    if (!url.trim()) {
+      setStatus("URL is required.");
+      return;
+    }
+    if (!spaceId) {
+      setStatus("Select a space.");
+      return;
+    }
+    if (folderId === "__new__" && !createFolderName.trim()) {
+      setStatus("Provide a folder name for the new folder.");
+      return;
+    }
+
+    setSaving(true);
+    setStatus(null);
+    try {
+      await call<ItemDocType>("IMPORT_SUBMIT_DRAFT", {
+        draftId: draft.id,
+        title,
+        url,
+        textContent,
+        source,
+        tags: parseTagsInput(tagsInput),
+        spaceId,
+        folderId,
+        parentId: folderId !== "__new__" ? parentId || null : null,
+        createFolderName: createFolderName.trim(),
+        iconUrl: draft.iconUrl,
+        displayImageUrl: draft.displayImageUrl,
+      });
+
+      const updatedList = await loadDrafts();
+      const nextId = updatedList[0]?.id || "";
+      if (!nextId) {
+        setDraft(null);
+        setStatus("Imported. No pending drafts.");
+      } else {
+        await loadDraft(nextId);
+        setStatus("Imported draft successfully.");
+      }
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : "Failed to import draft.");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const discardDraft = async () => {
+    if (!draft) return;
+    setSaving(true);
+    setStatus(null);
+    try {
+      await call("IMPORT_DELETE_DRAFT", { draftId: draft.id });
+      const updatedList = await loadDrafts();
+      const nextId = updatedList[0]?.id || "";
+      if (!nextId) {
+        setDraft(null);
+        setStatus("Draft deleted.");
+      } else {
+        await loadDraft(nextId);
+        setStatus("Draft deleted.");
+      }
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : "Failed to delete draft.");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <div className="p-3 w-[460px]">
+      <Card>
+        <CardHeader>
+          <CardTitle>Review Import Draft</CardTitle>
+          <CardDescription>
+            Edit metadata, tags, and destination before saving imported content.
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-3">
+          {loading ? (
+            <div className="text-xs text-foreground-secondary">Loading draft...</div>
+          ) : !draft ? (
+            <div className="space-y-2">
+              <div className="text-sm text-foreground-secondary">No pending import drafts.</div>
+              <Button variant="secondary" onClick={openSearchPage}>
+                Open Search
+              </Button>
+            </div>
+          ) : (
+            <>
+              {drafts.length > 1 && (
+                <div className="space-y-1">
+                  <label className="text-xs text-foreground-secondary">Draft queue</label>
+                  <Select
+                    value={selectedDraftId || draft.id}
+                    onValueChange={(value) => {
+                      setSelectedDraftId(value);
+                      void loadDraft(value);
+                    }}
+                  >
+                    <SelectTrigger className="w-full">
+                      <SelectValue placeholder="Select draft" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {drafts.map((row) => (
+                        <SelectItem key={row.id} value={row.id}>
+                          {trimText(`${row.mode === "shot" ? "Screenshot" : "Import"} · ${row.title} · ${row.host}`, 80)}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                  <p className="text-[11px] text-foreground-tertiary">Created {formatDraftTime(draft.createdAt)}</p>
+                </div>
+              )}
+
+              <div className="space-y-1">
+                <label className="text-xs text-foreground-secondary">Title</label>
+                <Input value={title} onChange={(event) => setTitle(event.target.value)} />
+              </div>
+
+              <div className="space-y-1">
+                <label className="text-xs text-foreground-secondary">URL</label>
+                <Input value={url} onChange={(event) => setUrl(event.target.value)} />
+                {draft.mode === "save" && (
+                  <p className="text-[11px] text-foreground-tertiary">
+                    Changing URL may clear attached media on save if it no longer matches the original draft.
+                  </p>
+                )}
+              </div>
+
+              <div className="space-y-1">
+                <label className="text-xs text-foreground-secondary">Source</label>
+                <Select value={source} onValueChange={(value) => setSource(value as ItemDocType["source"])}>
+                  <SelectTrigger className="w-full">
+                    <SelectValue placeholder="Select source" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {SOURCE_OPTIONS.map((option) => (
+                      <SelectItem key={option} value={option}>
+                        {option}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+
+              <div className="space-y-1">
+                <label className="text-xs text-foreground-secondary">Tags (comma/newline separated)</label>
+                <textarea
+                  value={tagsInput}
+                  onChange={(event) => setTagsInput(event.target.value)}
+                  className="w-full min-h-[56px] rounded-md border border-border-neutral-faded bg-background-neutral px-2 py-1 text-xs"
+                  placeholder="research, screenshots, twitter"
+                />
+              </div>
+
+              <div className="space-y-1">
+                <label className="text-xs text-foreground-secondary">Notes / Metadata</label>
+                <textarea
+                  value={textContent}
+                  onChange={(event) => setTextContent(event.target.value)}
+                  className="w-full min-h-[120px] rounded-md border border-border-neutral-faded bg-background-neutral px-2 py-1 text-xs"
+                />
+              </div>
+
+              <div className="grid grid-cols-2 gap-2">
+                <div className="space-y-1">
+                  <label className="text-xs text-foreground-secondary">Space</label>
+                  <Select
+                    value={spaceId}
+                    onValueChange={(value) => {
+                      setSpaceId(value);
+                      setFolderId("__new__");
+                      setParentId("");
+                    }}
+                  >
+                    <SelectTrigger className="w-full">
+                      <SelectValue placeholder="Select space" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {targets.map((space) => (
+                        <SelectItem key={space.id} value={space.id} disabled={!space.isUnlocked}>
+                          {space.name}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </div>
+
+                <div className="space-y-1">
+                  <label className="text-xs text-foreground-secondary">Folder</label>
+                  <Select
+                    value={folderId}
+                    onValueChange={(value) => {
+                      setFolderId(value);
+                      setParentId("");
+                    }}
+                  >
+                    <SelectTrigger className="w-full">
+                      <SelectValue placeholder="Select folder" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="__new__">Create new folder</SelectItem>
+                      {(selectedSpace?.folders || []).map((folder) => (
+                        <SelectItem key={folder.id} value={folder.id}>
+                          {folder.name}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </div>
+              </div>
+
+              {folderId === "__new__" && (
+                <div className="space-y-1">
+                  <label className="text-xs text-foreground-secondary">New folder name</label>
+                  <Input
+                    value={createFolderName}
+                    onChange={(event) => setCreateFolderName(event.target.value)}
+                    placeholder="Imports · example.com"
+                  />
+                </div>
+              )}
+
+              {folderId !== "__new__" && selectedFolder && (
+                <div className="space-y-1">
+                  <label className="text-xs text-foreground-secondary">Attach under item (optional)</label>
+                  <Select value={parentId || "__none__"} onValueChange={(value) => setParentId(value === "__none__" ? "" : value)}>
+                    <SelectTrigger className="w-full">
+                      <SelectValue placeholder="No parent" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="__none__">No parent</SelectItem>
+                      {selectedFolder.recentItems.map((item) => (
+                        <SelectItem key={item.id} value={item.id}>
+                          {item.title}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </div>
+              )}
+
+              {previewImages.length > 0 && (
+                <div className="space-y-1">
+                  <label className="text-xs text-foreground-secondary">
+                    Preview {previewImages.length > 1 ? `(${previewImages.length} images)` : ""}
+                  </label>
+                  <div className="grid grid-cols-3 gap-2">
+                    {previewImages.map((src, index) => (
+                      <img
+                        key={`${src}-${index}`}
+                        src={src}
+                        alt={`Import preview ${index + 1}`}
+                        className="h-20 w-full rounded-md border border-border-neutral-faded object-cover"
+                        loading="lazy"
+                        decoding="async"
+                      />
+                    ))}
+                  </div>
+                </div>
+              )}
+            </>
+          )}
+
+          {status && <div className="text-xs text-foreground-secondary">{status}</div>}
+          <ProcessStatusPanel statuses={processStatuses} />
+        </CardContent>
+
+        <CardFooter className="gap-2">
+          <Button variant="secondary" onClick={openSearchPage}>
+            Open Search
+          </Button>
+
+          {draft && (
+            <>
+              <Button variant="outline" onClick={() => void discardDraft()} disabled={saving}>
+                Discard
+              </Button>
+              <Button onClick={() => void submitDraft()} disabled={saving}>
+                {saving ? "Saving..." : "Save Import"}
+              </Button>
+            </>
+          )}
+        </CardFooter>
+      </Card>
+    </div>
+  );
+};
+
+const SaveTabsPopup = () => {
+  const { call } = useBackground();
+  const processStatuses = useProcessStatusFeed(call);
+
+  const [folderName, setFolderName] = React.useState("");
+  const [scope, setScope] = React.useState<TabSaveScope>("current_window");
+  const [isSaving, setIsSaving] = React.useState(false);
+  const [status, setStatus] = React.useState<string | null>(null);
+  const [importSettings, setImportSettings] = React.useState<ImportSettings>({
+    reviewBeforeSave: false,
+  });
+  const [draftCount, setDraftCount] = React.useState(0);
+
+  const openSearchPage = () => {
+    chrome.tabs.create({
+      url: chrome.runtime.getURL("src/pages/search/index.html"),
+    });
+  };
+
+  const refreshImportMeta = React.useCallback(async () => {
+    try {
+      const [settings, drafts] = await Promise.all([
+        call<ImportSettings>("IMPORT_GET_SETTINGS"),
+        call<ImportDraftSummary[]>("IMPORT_LIST_DRAFTS"),
+      ]);
+      setImportSettings(settings);
+      setDraftCount((drafts || []).length);
+    } catch (error) {
+      console.error("Failed to load import settings", error);
+    }
+  }, [call]);
+
+  React.useEffect(() => {
+    void refreshImportMeta();
+  }, [refreshImportMeta]);
+
+  const buildItemsFromTabs = (tabs: chrome.tabs.Tab[], folderId: string, spaceId: string) => {
+    const now = Date.now();
+    return tabs
       .filter(
         (tab) =>
           tab.url && !tab.url.startsWith("chrome://") && !tab.url.startsWith("chrome-extension://")
       )
       .map(
-        (tab) =>
+        (tab, index) =>
           ({
             id: uuidv4(),
             userId: "user1",
@@ -52,19 +747,19 @@ const Popup = () => {
             iconUrl: tab.favIconUrl || "",
             source: "web" as const,
             folderId,
+            spaceId,
             isFavorite: false,
             parentId: null,
             isEmbedded: false,
             isMetaFetched: false,
             isDirty: true,
             serverVersion: 0,
-            createdAt: Date.now(),
-            updatedAt: Date.now(),
+            createdAt: now + index,
+            updatedAt: now + index,
             vector_index: -1,
             deletedAt: 0,
           } as ItemDocType)
       );
-    return itemsToSave;
   };
 
   const pickTabsByScope = async (): Promise<chrome.tabs.Tab[]> => {
@@ -76,80 +771,113 @@ const Popup = () => {
     }
     if (scope === "left_of_current" || scope === "right_of_current") {
       const tabs = await chrome.tabs.query({ currentWindow: true });
-      const currentTab = tabs.find((t) => t.active);
+      const currentTab = tabs.find((tab) => tab.active);
       if (!currentTab) return [];
-      return tabs.filter((t) =>
-        scope === "left_of_current" ? t.index < currentTab.index : t.index > currentTab.index
+      return tabs.filter((tab) =>
+        scope === "left_of_current" ? tab.index < currentTab.index : tab.index > currentTab.index
       );
     }
-    // all_windows
     return chrome.tabs.query({});
   };
 
   const createFolder = async (name: string): Promise<FolderDocType> => {
-    const response = await chrome.runtime.sendMessage({
+    const response = (await chrome.runtime.sendMessage({
       service: "folders",
       type: "create",
       target: "offscreen",
       payload: { name, userId: "user1" },
-    });
+    })) as RuntimeResponse<FolderDocType>;
+
     if (!response?.success) {
       throw new Error(response?.error || "Failed to create folder");
     }
+
     return response.payload as FolderDocType;
   };
 
   const saveTabs = async () => {
     setIsSaving(true);
     setStatus(null);
-    setStatus(null);
     try {
       const tabs = await pickTabsByScope();
       const name = folderName.trim() || `${tabs.length} tabs`;
       const folder = await createFolder(name);
-      const items = buildItemsFromTabs(tabs, folder.id);
+      const items = buildItemsFromTabs(tabs, folder.id, folder.spaceId);
       if (items.length === 0) {
         setStatus("No tabs to save.");
         return;
       }
-      const response = await chrome.runtime.sendMessage({
+
+      const response = (await chrome.runtime.sendMessage({
         service: "items",
         type: "addMany",
         target: "offscreen",
         payload: { items },
-      });
+      })) as RuntimeResponse<{ inserted: number }>;
+
       if (!response?.success) {
         throw new Error(response?.error || "Failed to save items");
       }
-      setStatus(`Saved ${items.length} tabs to “${folder.name}”.`);
+
+      setStatus(`Saved ${items.length} tabs to "${folder.name}".`);
       setFolderName("");
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : "Something went wrong";
-      setStatus(msg);
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : "Something went wrong");
     } finally {
       setIsSaving(false);
     }
   };
 
+  const setReviewBeforeSave = async (next: boolean) => {
+    const previous = importSettings.reviewBeforeSave;
+    setImportSettings((current) => ({ ...current, reviewBeforeSave: next }));
+
+    try {
+      const saved = await call<ImportSettings>("IMPORT_SET_SETTINGS", {
+        reviewBeforeSave: next,
+      });
+      setImportSettings(saved);
+      setStatus(
+        saved.reviewBeforeSave
+          ? "Context import review is enabled."
+          : "Context import review is disabled."
+      );
+    } catch (error) {
+      setImportSettings((current) => ({ ...current, reviewBeforeSave: previous }));
+      setStatus(error instanceof Error ? error.message : "Failed to update import setting.");
+    }
+  };
+
+  const openImportEditor = async () => {
+    try {
+      await call("IMPORT_OPEN_EDITOR", {});
+      window.close();
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : "No pending drafts.");
+    }
+  };
+
   return (
-    <div className="p-3 w-72">
+    <div className="p-3 w-80">
       <Card>
         <CardHeader>
           <CardTitle>Save tabs</CardTitle>
           <CardDescription>Group tabs into a folder and save as items.</CardDescription>
         </CardHeader>
+
         <CardContent className="space-y-3">
           <div className="space-y-1">
             <label className="text-xs text-foreground-secondary">Folder name</label>
             <Input
               value={folderName}
-              onChange={(e) => setFolderName(e.target.value)}
+              onChange={(event) => setFolderName(event.target.value)}
               placeholder="e.g. Research – Local-first"
             />
           </div>
+
           <div className="space-y-1">
             <label className="text-xs text-foreground-secondary">Scope</label>
-            <Select value={scope} onValueChange={(v) => setScope(v as any)}>
+            <Select value={scope} onValueChange={(value) => setScope(value as TabSaveScope)}>
               <SelectTrigger className="w-full">
                 <SelectValue placeholder="Select scope" />
               </SelectTrigger>
@@ -162,19 +890,68 @@ const Popup = () => {
               </SelectContent>
             </Select>
           </div>
+
+          <div className="rounded-lg border border-border-neutral-faded bg-background-page-secondary px-3 py-2 space-y-2">
+            <div className="flex items-center justify-between gap-2">
+              <div>
+                <p className="text-xs font-medium text-foreground-neutral">Review imports before save</p>
+                <p className="text-[11px] text-foreground-tertiary">
+                  Opens an editor after right-click import so users can edit metadata/tags.
+                </p>
+              </div>
+              <Checkbox
+                checked={importSettings.reviewBeforeSave}
+                onCheckedChange={(checked) => {
+                  void setReviewBeforeSave(mapChecked(checked));
+                }}
+              />
+            </div>
+
+            <div className="flex items-center justify-between gap-2">
+              <span className="text-xs text-foreground-secondary">
+                Pending drafts: {draftCount}
+              </span>
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                onClick={() => {
+                  void openImportEditor();
+                }}
+                disabled={draftCount === 0}
+              >
+                Review queue
+              </Button>
+            </div>
+          </div>
+
           {status && <div className="text-xs text-foreground-secondary">{status}</div>}
+          <ProcessStatusPanel statuses={processStatuses} />
         </CardContent>
+
         <CardFooter className="gap-2">
           <Button variant="secondary" onClick={openSearchPage}>
             Open Search
           </Button>
-          <Button onClick={saveTabs} disabled={isSaving}>
-            {isSaving ? "Saving…" : "Save"}
+          <Button onClick={() => void saveTabs()} disabled={isSaving}>
+            {isSaving ? "Saving..." : "Save"}
           </Button>
         </CardFooter>
       </Card>
     </div>
   );
+};
+
+const Popup = () => {
+  const params = React.useMemo(() => new URLSearchParams(window.location.search), []);
+  const mode = params.get("mode");
+  const draftId = params.get("draftId");
+
+  if (mode === "import") {
+    return <ImportEditor requestedDraftId={draftId} />;
+  }
+
+  return <SaveTabsPopup />;
 };
 
 export default Popup;

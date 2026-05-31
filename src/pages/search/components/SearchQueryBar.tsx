@@ -240,6 +240,7 @@ export const SearchQueryBar = ({
   const forceAssistRef = useRef(forceAssist);
   const lastInputAtRef = useRef(Date.now());
   const pendingCursorRef = useRef<number | null>(null);
+  const textRef = useRef(text);
 
   const isMac = typeof navigator !== "undefined" && navigator.userAgent.includes("Mac");
 
@@ -260,6 +261,10 @@ export const SearchQueryBar = ({
   useEffect(() => {
     forceAssistRef.current = forceAssist;
   }, [forceAssist]);
+
+  useEffect(() => {
+    textRef.current = text;
+  }, [text]);
 
   // Apply a programmatic cursor position after a controlled text change.
   useEffect(() => {
@@ -321,9 +326,10 @@ export const SearchQueryBar = ({
       const hasSuggestions = payload.suggestions.length > 0;
       const inDirectiveContext = isDirectiveContextToken(payload.activeTokenText);
       const hasDatePicker = !!getDateContext(payload.activeTokenText);
+      const typing = textRef.current.length > 0;
       setOpenAssist(
         (hasSuggestions || hasDatePicker) &&
-          (forceAssistRef.current || inDirectiveContext || hasDatePicker)
+          (forceAssistRef.current || ((inDirectiveContext || hasDatePicker) && typing))
       );
     };
 

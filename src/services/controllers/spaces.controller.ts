@@ -127,31 +127,25 @@ export class SpacesController {
   }
 
   private async readLocalStorageValue(key: string): Promise<string | undefined> {
-    const result = await new Promise<Record<string, unknown>>((resolve) => {
-      chrome.storage.local.get(key, (values) => resolve(values || {}));
-    });
-    const value = result[key];
+    const db = await getDb();
+    const value = (await db.getLocal(key))?.get("value");
     return typeof value === "string" && value.length > 0 ? value : undefined;
   }
 
   private async writeLocalStorageValue(key: string, value: string): Promise<void> {
-    await new Promise<void>((resolve) => {
-      chrome.storage.local.set({ [key]: value }, () => resolve());
-    });
+    const db = await getDb();
+    await db.upsertLocal(key, { value });
   }
 
   private async readLocalStorageNumber(key: string): Promise<number | undefined> {
-    const result = await new Promise<Record<string, unknown>>((resolve) => {
-      chrome.storage.local.get(key, (values) => resolve(values || {}));
-    });
-    const value = result[key];
+    const db = await getDb();
+    const value = (await db.getLocal(key))?.get("value");
     return typeof value === "number" && Number.isFinite(value) ? value : undefined;
   }
 
   private async writeLocalStorageNumber(key: string, value: number): Promise<void> {
-    await new Promise<void>((resolve) => {
-      chrome.storage.local.set({ [key]: value }, () => resolve());
-    });
+    const db = await getDb();
+    await db.upsertLocal(key, { value });
   }
 
   private async getRecoveryPepper(): Promise<string> {

@@ -3,6 +3,7 @@ import { v4 as uuidv4 } from "uuid";
 import { Button } from "@src/components/ui/button";
 import { Input } from "@src/components/ui/input";
 import { Checkbox } from "@src/components/ui/checkbox";
+import { ArrowRight, Bookmark } from "lucide-react";
 import {
   Card,
   CardContent,
@@ -251,7 +252,7 @@ const useProcessStatusFeed = (call: <T>(type: string, payload?: unknown) => Prom
 
 const ProcessStatusPanel = ({ statuses }: { statuses: ProcessStatusItem[] }) => {
   return (
-    <div className="rounded-lg border border-border-neutral-faded bg-background-page-secondary px-3 py-2 space-y-2">
+    <div className="rounded-xl bg-background-neutral-faded px-3 py-2.5 space-y-2">
       <div className="text-xs font-medium text-foreground-neutral">Processing (dev)</div>
       {statuses.length === 0 ? (
         <div className="text-[11px] text-foreground-tertiary">No recent background activity.</div>
@@ -858,27 +859,53 @@ const SaveTabsPopup = () => {
   };
 
   return (
-    <div className="p-3 w-80">
-      <Card>
-        <CardHeader>
-          <CardTitle>Save tabs</CardTitle>
-          <CardDescription>Group tabs into a folder and save as items.</CardDescription>
-        </CardHeader>
+    <div className="w-[340px] bg-background-page p-3.5">
+      <div className="mb-3 flex items-center justify-between px-0.5">
+        <div className="flex items-center gap-2">
+          <div className="grid size-7 place-items-center rounded-lg bg-foreground-neutral text-background-neutral">
+            <Bookmark size={15} />
+          </div>
+          <span className="font-sans-bold text-sm tracking-[-0.01em] text-foreground-neutral">
+            Vibe Search
+          </span>
+        </div>
+        <button
+          type="button"
+          onClick={openSearchPage}
+          className="inline-flex items-center gap-1 rounded-lg px-2 py-1 text-xs font-medium text-foreground-secondary transition-colors hover:bg-background-neutral-faded hover:text-foreground-neutral active:scale-[0.97]"
+        >
+          Open app
+          <ArrowRight size={13} />
+        </button>
+      </div>
 
-        <CardContent className="space-y-3">
-          <div className="space-y-1">
-            <label className="text-xs text-foreground-secondary">Folder name</label>
+      <div className="rounded-2xl border border-border-neutral-faded bg-background-neutral p-4 shadow-[0_10px_40px_-14px_rgba(0,0,0,0.2)]">
+        <h1 className="font-sans-bold text-lg tracking-[-0.01em] text-foreground-neutral">
+          Save these tabs
+        </h1>
+        <p className="mt-0.5 text-sm leading-relaxed text-foreground-secondary">
+          Group them into a folder you can search later.
+        </p>
+
+        <div className="mt-4 space-y-3">
+          <div className="space-y-1.5">
+            <label className="text-[11px] font-semibold uppercase tracking-[0.06em] text-foreground-tertiary">
+              Folder name
+            </label>
             <Input
+              autoFocus
               value={folderName}
               onChange={(event) => setFolderName(event.target.value)}
               placeholder="e.g. Research – Local-first"
             />
           </div>
 
-          <div className="space-y-1">
-            <label className="text-xs text-foreground-secondary">Scope</label>
+          <div className="space-y-1.5">
+            <label className="text-[11px] font-semibold uppercase tracking-[0.06em] text-foreground-tertiary">
+              Which tabs
+            </label>
             <Select value={scope} onValueChange={(value) => setScope(value as TabSaveScope)}>
-              <SelectTrigger className="w-full">
+              <SelectTrigger className="h-10 w-full rounded-lg border-border-neutral-faded bg-background-neutral-faded/60">
                 <SelectValue placeholder="Select scope" />
               </SelectTrigger>
               <SelectContent>
@@ -890,54 +917,46 @@ const SaveTabsPopup = () => {
               </SelectContent>
             </Select>
           </div>
+        </div>
 
-          <div className="rounded-lg border border-border-neutral-faded bg-background-page-secondary px-3 py-2 space-y-2">
-            <div className="flex items-center justify-between gap-2">
-              <div>
-                <p className="text-xs font-medium text-foreground-neutral">Review imports before save</p>
-                <p className="text-[11px] text-foreground-tertiary">
-                  Opens an editor after right-click import so users can edit metadata/tags.
-                </p>
-              </div>
-              <Checkbox
-                checked={importSettings.reviewBeforeSave}
-                onCheckedChange={(checked) => {
-                  void setReviewBeforeSave(mapChecked(checked));
-                }}
-              />
-            </div>
+        <Button
+          className="mt-4 h-11 w-full rounded-lg text-sm active:scale-[0.98]"
+          onClick={() => void saveTabs()}
+          disabled={isSaving}
+        >
+          {isSaving ? "Saving…" : "Save tabs"}
+        </Button>
 
-            <div className="flex items-center justify-between gap-2">
-              <span className="text-xs text-foreground-secondary">
-                Pending drafts: {draftCount}
-              </span>
-              <Button
-                type="button"
-                variant="outline"
-                size="sm"
-                onClick={() => {
-                  void openImportEditor();
-                }}
-                disabled={draftCount === 0}
-              >
-                Review queue
-              </Button>
-            </div>
-          </div>
+        {status && <p className="mt-2 text-center text-xs text-foreground-secondary">{status}</p>}
+      </div>
 
-          {status && <div className="text-xs text-foreground-secondary">{status}</div>}
-          <ProcessStatusPanel statuses={processStatuses} />
-        </CardContent>
-
-        <CardFooter className="gap-2">
-          <Button variant="secondary" onClick={openSearchPage}>
-            Open Search
-          </Button>
-          <Button onClick={() => void saveTabs()} disabled={isSaving}>
-            {isSaving ? "Saving..." : "Save"}
-          </Button>
-        </CardFooter>
-      </Card>
+      <div className="mt-3 flex items-center justify-between gap-2 rounded-xl bg-background-neutral-faded px-3 py-2.5">
+        <div className="min-w-0">
+          <p className="text-xs font-medium text-foreground-neutral">Review before saving</p>
+          <p className="text-[11px] text-foreground-secondary">
+            {draftCount > 0
+              ? `${draftCount} draft${draftCount === 1 ? "" : "s"} waiting`
+              : "Edit metadata & tags on import"}
+          </p>
+        </div>
+        <div className="flex shrink-0 items-center gap-2">
+          {draftCount > 0 && (
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              className="h-8"
+              onClick={() => void openImportEditor()}
+            >
+              Review
+            </Button>
+          )}
+          <Checkbox
+            checked={importSettings.reviewBeforeSave}
+            onCheckedChange={(checked) => void setReviewBeforeSave(mapChecked(checked))}
+          />
+        </div>
+      </div>
     </div>
   );
 };

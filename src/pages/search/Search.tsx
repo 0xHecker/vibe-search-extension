@@ -1752,19 +1752,19 @@ const Search = () => {
           }
         }}
       >
-        <DialogContent className="max-w-md">
+        <DialogContent className="flex w-full max-w-md flex-col gap-5 rounded-3xl p-6 sm:max-w-md">
           <DialogHeader>
-            <div className="mb-1 flex size-11 items-center justify-center rounded-2xl bg-foreground-neutral text-background-neutral shadow-sm">
+            <div className="mb-1.5 flex size-12 items-center justify-center rounded-2xl bg-foreground-neutral text-background-neutral shadow-[0_6px_16px_-4px_rgba(0,0,0,0.3)]">
               <Lock size={20} />
             </div>
-            <DialogTitle>
+            <DialogTitle className="font-sans-bold text-xl tracking-[-0.01em] text-foreground-neutral">
               {unlockDialogMode === "setup"
                 ? "Lock your private space"
                 : unlockDialogMode === "recovery"
                   ? "Reset your password"
                   : "Private space"}
             </DialogTitle>
-            <DialogDescription>
+            <DialogDescription className="text-sm leading-relaxed text-foreground-secondary">
               {unlockDialogMode === "setup"
                 ? "Set a password to keep these folders and tabs hidden on this device."
                 : unlockDialogMode === "recovery"
@@ -1803,12 +1803,12 @@ const Search = () => {
               />
             )}
             {unlockDialogMode === "setup" && (
-              <div className="space-y-2 rounded-xl border border-border-neutral-faded bg-background-neutral-faded/70 p-3">
+              <div className="space-y-2.5 border-t border-border-neutral-faded pt-4">
                 <div>
                   <p className="text-[11px] font-semibold uppercase tracking-[0.08em] text-foreground-tertiary">
                     Recovery questions
                   </p>
-                  <p className="mt-0.5 text-[11px] text-foreground-secondary">
+                  <p className="mt-0.5 text-xs text-foreground-secondary">
                     The only way back in if you forget your password.
                   </p>
                 </div>

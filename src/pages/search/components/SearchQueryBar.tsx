@@ -4,6 +4,7 @@ import { Input } from "@src/components/ui/input";
 import { Popover, PopoverAnchor, PopoverContent } from "@src/components/ui/popover";
 import { cn } from "@src/lib/utils";
 import { DatePicker } from "./DatePicker";
+import { SearchFilterPills, buildQuickFilters, type QuickFilter } from "./SearchFilterPills";
 import {
   ArrowUpDown,
   AtSign,
@@ -45,6 +46,7 @@ type SearchQueryBarProps = {
   onSubmit: (value: string, analysis: QueryAnalysis, meta: SearchQuerySubmitMeta) => void;
   catalogs: QueryAssistCatalogs;
   placeholder?: string;
+  availableFilters?: string[];
 };
 
 const fallbackAnalysis: QueryAnalysis = {
@@ -222,6 +224,7 @@ export const SearchQueryBar = ({
   onSubmit,
   catalogs,
   placeholder = "Search anything\u2026",
+  availableFilters = [],
 }: SearchQueryBarProps) => {
   const initial = useMemo(() => splitQuery(committedValue, catalogs), []);
   const [tokens, setTokens] = useState<string[]>(initial.tokens);
@@ -231,6 +234,7 @@ export const SearchQueryBar = ({
   const [openAssist, setOpenAssist] = useState(false);
   const [forceAssist, setForceAssist] = useState(false);
   const [activeIndex, setActiveIndex] = useState(0);
+  const [focused, setFocused] = useState(false);
 
   const inputRef = useRef<HTMLInputElement | null>(null);
   const workerRef = useRef<Worker | null>(null);
@@ -253,6 +257,17 @@ export const SearchQueryBar = ({
     () => tokens.map((raw) => analyzeOnce(raw, catalogs).pills[0] ?? null),
     [tokens, catalogs]
   );
+
+  const quickFilters = useMemo(() => buildQuickFilters(availableFilters), [availableFilters]);
+
+  // Tokens already committed, as a "field:value" set, for highlighting active pills.
+  const activeFilterTokens = useMemo(() => {
+    const set = new Set<string>();
+    committedPills.forEach((pill) => {
+      if (pill && !pill.negated) set.add(`${pill.field}:${pill.value}`);
+    });
+    return set;
+  }, [committedPills]);
 
   useEffect(() => {
     latestCatalogsRef.current = catalogs;
@@ -484,6 +499,24 @@ export const SearchQueryBar = ({
     window.requestAnimationFrame(() => inputRef.current?.focus());
   };
 
+  // Toggle a quick-filter pill: remove its token if already applied, else append it.
+  const toggleQuickFilter = (filter: QuickFilter) => {
+    const sep = filter.token.indexOf(":");
+    const field = filter.token.slice(0, sep);
+    const value = filter.token.slice(sep + 1);
+    const existingIndex = tokens.findIndex((raw) => {
+      const pill = analyzeOnce(raw, latestCatalogsRef.current).pills[0];
+      return !!pill && !pill.negated && pill.field === field && pill.value === value;
+    });
+    const next =
+      existingIndex >= 0
+        ? tokens.filter((_, index) => index !== existingIndex)
+        : [...tokens, filter.token];
+    setTokens(next);
+    submitQuery(next, text);
+    window.requestAnimationFrame(() => inputRef.current?.focus());
+  };
+
   const handleKeyDown = (event: React.KeyboardEvent<HTMLInputElement>) => {
     const hasSuggestions = openAssist && flatSuggestions.length > 0;
     if (hasSuggestions && event.key === "ArrowDown") {
@@ -638,6 +671,8 @@ export const SearchQueryBar = ({
                     setCursor((event.currentTarget as HTMLInputElement).selectionStart ?? text.length)
                   }
                   onKeyDown={handleKeyDown}
+                  onFocus={() => setFocused(true)}
+                  onBlur={() => setFocused(false)}
                   className="h-12 min-w-[140px] flex-1 border-0 bg-transparent px-0 font-serif text-[2rem] italic shadow-none caret-accent selection:bg-accent/15 placeholder:text-foreground-secondary/90 focus-visible:ring-0 focus-visible:ring-offset-0"
                 />
               </div>
@@ -779,23 +814,12 @@ export const SearchQueryBar = ({
         </div>
       </Popover>
 
-      <div className="mx-auto mt-2.5 flex w-full max-w-5xl items-center gap-x-4 px-1 text-[11px] text-foreground-secondary">
-        <span className="inline-flex items-center gap-1.5">
-          <Kbd>
-            <CornerDownLeft size={11} />
-          </Kbd>
-          Search
-        </span>
-        <span className="inline-flex items-center gap-1.5">
-          <Kbd>Space</Kbd>
-          <Kbd>Space</Kbd>
-          Add filter
-        </span>
-        <span className="hidden items-center gap-1.5 sm:inline-flex">
-          <Kbd>/</Kbd>
-          Focus
-        </span>
-      </div>
+      <SearchFilterPills
+        filters={quickFilters}
+        activeTokens={activeFilterTokens}
+        visible={focused && !openAssist}
+        onToggle={toggleQuickFilter}
+      />
     </div>
   );
 };

@@ -1,4 +1,5 @@
 import { createRxDatabase, addRxPlugin, RxDatabase, RxCollection, RxStorage } from "rxdb";
+import { createRevision, now } from "rxdb/plugins/utils";
 import { getRxStorageDexie } from "rxdb/plugins/storage-dexie";
 import { RxDBDevModePlugin } from "rxdb/plugins/dev-mode";
 import { wrappedValidateZSchemaStorage } from "rxdb/plugins/validate-z-schema";
@@ -23,6 +24,100 @@ import { searchHistorySchema, SearchHistoryDocType } from "@src/schemas/search_h
 import { flashcardSchema, FlashcardDocType } from "@src/schemas/flashcard_schema";
 import { deletedItemSchema, DeletedItemDocType } from "@src/schemas/deleted_item_schema";
 import { PUBLIC_SPACE_ID } from "@src/common/spaces";
+
+const OCR_STATUSES = new Set(["pending", "processing", "done", "error", "skipped"]);
+
+function normalizeOcrStatus(value: unknown): ItemDocType["ocrStatus"] {
+  return typeof value === "string" && OCR_STATUSES.has(value) ? (value as ItemDocType["ocrStatus"]) : "pending";
+}
+
+function normalizeSafeInteger(value: unknown): number {
+  return Number.isFinite(value) ? Math.max(0, Math.floor(value as number)) : 0;
+}
+
+function normalizeOcrConfidence(value: unknown): number | null {
+  if (!Number.isFinite(value)) return null;
+  return Math.max(0, Math.min(1, value as number));
+}
+
+function repairStoredItemSchema(schema: any): boolean {
+  if (!schema || !Array.isArray(schema.indexes)) return false;
+
+  const beforeIndexCount = schema.indexes.length;
+  schema.indexes = schema.indexes.filter((index: unknown) => {
+    const fields = Array.isArray(index) ? index : [index];
+    return !fields.some(
+      (field) => field === "ocrStatus" || field === "ocrModelVersion" || field === "ocrUpdatedAt"
+    );
+  });
+
+  const indexedFields = schema.indexes.flat().filter((field: unknown) => typeof field === "string");
+  const required = new Set<string>(Array.isArray(schema.required) ? schema.required : []);
+  let changed = schema.indexes.length !== beforeIndexCount;
+
+  for (const field of indexedFields) {
+    if (!field.includes(".") && !required.has(field)) {
+      required.add(field);
+      changed = true;
+    }
+  }
+
+  if (!schema.properties) schema.properties = {};
+  if (schema.properties.ocrStatus && schema.properties.ocrStatus.default !== "pending") {
+    schema.properties.ocrStatus = { ...schema.properties.ocrStatus, default: "pending" };
+    changed = true;
+  }
+  if (schema.properties.ocrModelVersion && schema.properties.ocrModelVersion.default !== "") {
+    schema.properties.ocrModelVersion = { ...schema.properties.ocrModelVersion, default: "" };
+    changed = true;
+  }
+  if (schema.properties.ocrUpdatedAt && schema.properties.ocrUpdatedAt.default !== 0) {
+    schema.properties.ocrUpdatedAt = { ...schema.properties.ocrUpdatedAt, default: 0 };
+    changed = true;
+  }
+  if (schema.properties.ocrConfidence) {
+    const type = schema.properties.ocrConfidence.type;
+    const allowsNull = Array.isArray(type) ? type.includes("null") : type === "null";
+    if (!allowsNull || schema.properties.ocrConfidence.default !== null) {
+      schema.properties.ocrConfidence = {
+        ...schema.properties.ocrConfidence,
+        type: ["number", "null"],
+        default: null,
+      };
+      changed = true;
+    }
+  }
+
+  if (changed) {
+    schema.required = Array.from(required);
+  }
+  return changed;
+}
+
+async function repairStoredItemSchemaMetadata(db: MyDatabase): Promise<void> {
+  const internalStore = (db as any).internalStore;
+  if (!internalStore) return;
+
+  const ids = Array.from({ length: itemSchema.version + 1 }, (_, version) => `collection|items-${version}`);
+  const docs = await internalStore.findDocumentsById(ids, true);
+  const writeRows = docs
+    .map((doc: any) => {
+      if (!doc?.data?.schema) return null;
+      const nextDoc = structuredClone(doc);
+      if (!repairStoredItemSchema(nextDoc.data.schema)) return null;
+      nextDoc._meta = { ...nextDoc._meta, lwt: now() };
+      nextDoc._rev = createRevision(db.token, doc);
+      return { previous: doc, document: nextDoc };
+    })
+    .filter(Boolean);
+
+  if (writeRows.length === 0) return;
+
+  const result = await internalStore.bulkWrite(writeRows, "repair-item-schema-index-required-fields");
+  if (result.error.length > 0) {
+    console.warn("Failed to repair stored item schema metadata", result.error);
+  }
+}
 
 // Define collection types
 export type ItemCollection = RxCollection<ItemDocType>;
@@ -62,6 +157,8 @@ const createDatabase = async () => {
     localDocuments: true,
   });
 
+  await repairStoredItemSchemaMetadata(db);
+
   await db.addCollections({
     items: {
       schema: itemSchema,
@@ -77,6 +174,53 @@ const createDatabase = async () => {
         },
         3: async (oldDoc: any) => {
           return oldDoc;
+        },
+        4: async (oldDoc: any) => {
+          return {
+            ...oldDoc,
+            ocrStatus: typeof oldDoc.ocrStatus === "string" ? oldDoc.ocrStatus : "pending",
+          };
+        },
+        5: async (oldDoc: any) => {
+          const vectorIndex =
+            Number.isInteger(oldDoc.vector_index) && oldDoc.vector_index >= 0
+              ? oldDoc.vector_index
+              : -1;
+          return {
+            ...oldDoc,
+            vector_index: vectorIndex,
+            vector_indexes:
+              Array.isArray(oldDoc.vector_indexes) && oldDoc.vector_indexes.length > 0
+                ? oldDoc.vector_indexes.filter((index: unknown) => Number.isInteger(index) && (index as number) >= 0)
+                : vectorIndex >= 0
+                  ? [vectorIndex]
+                  : [],
+          };
+        },
+        6: async (oldDoc: any) => {
+          return {
+            ...oldDoc,
+            ocrStatus: normalizeOcrStatus(oldDoc.ocrStatus),
+            ocrModelVersion:
+              typeof oldDoc.ocrModelVersion === "string" ? oldDoc.ocrModelVersion : "",
+            ocrUpdatedAt: normalizeSafeInteger(oldDoc.ocrUpdatedAt),
+            ocrConfidence: normalizeOcrConfidence(oldDoc.ocrConfidence),
+            ocrLineCount: normalizeSafeInteger(oldDoc.ocrLineCount),
+          };
+        },
+        7: async (oldDoc: any) => {
+          return {
+            ...oldDoc,
+            ocrConfidence: normalizeOcrConfidence(oldDoc.ocrConfidence),
+            ocrLineCount: normalizeSafeInteger(oldDoc.ocrLineCount),
+          };
+        },
+        8: async (oldDoc: any) => {
+          return {
+            ...oldDoc,
+            ocrConfidence: normalizeOcrConfidence(oldDoc.ocrConfidence),
+            ocrLineCount: normalizeSafeInteger(oldDoc.ocrLineCount),
+          };
         },
       },
     },

@@ -6,6 +6,7 @@ import { cn } from "@src/lib/utils";
 export type SearchProcessRetryAction =
   | "RETRY_QUERY"
   | "TRIGGER_EMBEDDING"
+  | "TRIGGER_OCR"
   | "REBUILD_INDEX"
   | "REBUILD_VECTORS"
   | "LOCK_PRIVATE_SPACE"

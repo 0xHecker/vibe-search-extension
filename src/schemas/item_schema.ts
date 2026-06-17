@@ -5,6 +5,14 @@ export type ItemDocType = {
   userId: string | null;
   title: string;
   textContent: string;
+  ocrText?: string;
+  ocrStatus: "pending" | "processing" | "done" | "error" | "skipped";
+  ocrError?: string;
+  ocrModelVersion: string;
+  ocrSourceHash?: string;
+  ocrUpdatedAt: number;
+  ocrConfidence?: number | null;
+  ocrLineCount?: number;
   url: string;
   source:
     | "web"
@@ -47,6 +55,7 @@ export type ItemDocType = {
   parentId: string | null;
   chunkOrder?: number;
   vector_index?: number;
+  vector_indexes?: number[];
   isEmbedded: boolean;
   isMetaFetched: boolean;
   isDirty: boolean;
@@ -58,7 +67,7 @@ export type ItemDocType = {
 
 export const itemSchema: RxJsonSchema<ItemDocType> = {
   title: "item schema",
-  version: 3,
+  version: 8,
   description: "Describes a single saved item (bookmark, note, social media post)",
   primaryKey: "id",
   type: "object",
@@ -67,6 +76,30 @@ export const itemSchema: RxJsonSchema<ItemDocType> = {
     userId: { type: "string", default: null, maxLength: 1000 },
     title: { type: "string" },
     textContent: { type: "string" },
+    ocrText: { type: "string" },
+    ocrStatus: {
+      type: "string",
+      enum: ["pending", "processing", "done", "error", "skipped"],
+      default: "pending",
+      maxLength: 20,
+    },
+    ocrError: { type: "string" },
+    ocrModelVersion: { type: "string", default: "", maxLength: 100 },
+    ocrSourceHash: { type: "string", maxLength: 100 },
+    ocrUpdatedAt: {
+      type: "integer",
+      default: 0,
+      minimum: 0,
+      maximum: Number.MAX_SAFE_INTEGER - 1,
+      multipleOf: 1,
+    },
+    ocrConfidence: { type: ["number", "null"], default: null, minimum: 0, maximum: 1 },
+    ocrLineCount: {
+      type: "integer",
+      minimum: 0,
+      maximum: Number.MAX_SAFE_INTEGER - 1,
+      multipleOf: 1,
+    },
     url: { type: "string" },
     source: {
       type: "string",
@@ -128,6 +161,15 @@ export const itemSchema: RxJsonSchema<ItemDocType> = {
       minimum: -1,
       maximum: 10000000,
     },
+    vector_indexes: {
+      type: "array",
+      items: {
+        type: "number",
+        multipleOf: 1,
+        minimum: 0,
+        maximum: 10000000,
+      },
+    },
     // AI and Sync fields
     isEmbedded: { type: "boolean", default: false },
     isMetaFetched: { type: "boolean", default: false },
@@ -165,6 +207,9 @@ export const itemSchema: RxJsonSchema<ItemDocType> = {
     "isEmbedded",
     "isMetaFetched",
     "isDirty",
+    "ocrStatus",
+    "ocrModelVersion",
+    "ocrUpdatedAt",
     "folderId",
     "spaceId",
     "vector_index",

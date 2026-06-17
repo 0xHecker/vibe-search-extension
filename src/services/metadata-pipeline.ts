@@ -9,7 +9,10 @@ import {
 
 // --- URL Normalization & Helpers ---
 
-const META_PREFIX = "https://meta.vibesearch.app/?url=";
+const METADATA_WORKER_BASE_URL = "https://metadata-worker.watermelons.workers.dev";
+const LEGACY_METADATA_WORKER_BASE_URL = "https://meta.vibesearch.app";
+const META_PREFIX = `${METADATA_WORKER_BASE_URL}/?url=`;
+const LEGACY_META_PREFIX = "https://meta.vibesearch.app/?url=";
 
 function maybeDecode(raw: string): string {
   try {
@@ -26,8 +29,13 @@ function normalizeIncomingUrls(input: unknown): string[] {
     const trimmed = u.trim();
     if (!trimmed) return;
     if (trimmed.startsWith("chrome://") || trimmed.startsWith("chrome-extension://")) return;
-    if (trimmed.startsWith(META_PREFIX)) {
-      const after = trimmed.slice(META_PREFIX.length);
+    const metadataPrefix = trimmed.startsWith(META_PREFIX)
+      ? META_PREFIX
+      : trimmed.startsWith(LEGACY_META_PREFIX)
+        ? LEGACY_META_PREFIX
+        : null;
+    if (metadataPrefix) {
+      const after = trimmed.slice(metadataPrefix.length);
       const beforeAmp = after.split("&")[0];
       const rawParts = beforeAmp.split(",");
       for (const part of rawParts) add(maybeDecode(part));
@@ -74,6 +82,19 @@ type FetchResult = {
   failedUrls: Set<string>; // URLs that failed due to 4xx/5xx or network errors
 };
 
+const fetchMetadataEndpoint = async (query: string, revalidate: boolean): Promise<Response> => {
+  const suffix = `/?${query}${revalidate ? "&re=1" : ""}`;
+  const primaryUrl = `${METADATA_WORKER_BASE_URL}${suffix}`;
+  const legacyUrl = `${LEGACY_METADATA_WORKER_BASE_URL}${suffix}`;
+
+  try {
+    const primary = await fetch(primaryUrl, { method: "GET" as const });
+    if (primary.ok) return primary;
+  } catch {}
+
+  return fetch(legacyUrl, { method: "GET" as const });
+};
+
 const fetchMetadataForUrls = async (urls: string[], revalidate = false): Promise<FetchResult> => {
   const result: FetchResult = {
     metadata: {},
@@ -95,11 +116,7 @@ const fetchMetadataForUrls = async (urls: string[], revalidate = false): Promise
   for (const group of batches) {
     try {
       const query = group.map((u) => `url=${encodeURIComponent(u)}`).join("&");
-      let endpoint = `https://meta.vibesearch.app/?${query}`;
-      if (revalidate) {
-        endpoint += "&re=1";
-      }
-      const res = await fetch(endpoint, { method: "GET" as const });
+      const res = await fetchMetadataEndpoint(query, revalidate);
       if (!res.ok) {
         // API returned 4xx/5xx - mark all URLs in this batch as failed
         console.warn(`Metadata API returned ${res.status} for batch:`, group);

@@ -2,13 +2,17 @@ import type { ItemDocType } from "@src/schemas/item_schema";
 
 type EmbeddingTextSource = Pick<
   ItemDocType,
-  "title" | "textContent" | "url" | "source" | "authorUsername" | "media"
+  "title" | "textContent" | "ocrText" | "url" | "source" | "authorUsername" | "media"
 >;
 
-export const EMBEDDING_TEXT_VERSION = "v2-canonical";
+export const EMBEDDING_TEXT_VERSION = "v5-ocr-chunks";
 
 const MAX_CONTENT_CHARS = 2200;
+const MAX_OCR_CHARS = 12000;
 const MAX_QUERY_CHARS = 320;
+const EMBEDDING_MODEL_MAX_TOKENS = 1000;
+const EMBEDDING_CHUNK_TOKEN_BUDGET = Math.floor(EMBEDDING_MODEL_MAX_TOKENS * 0.25);
+const MIN_BODY_CHUNK_TOKEN_BUDGET = 512;
 const PATH_TOKEN_STOPWORDS = new Set([
   "amp",
   "api",
@@ -24,6 +28,7 @@ const PATH_TOKEN_STOPWORDS = new Set([
   "m",
 ]);
 const URL_LIKE_TOKEN_REGEX = /(https?:\/\/[^\s]+|www\.[^\s]+)/i;
+const TOKEN_LIKE_REGEX = /[\p{L}\p{N}]+|[^\s\p{L}\p{N}]/gu;
 
 const normalizeWhitespace = (input: string): string =>
   input
@@ -85,23 +90,67 @@ const normalizeUrlParts = (
   }
 };
 
-const composeMediaHints = (media: ItemDocType["media"] | undefined): string =>
-  Array.from(
-    new Set(
-      (media || [])
-        .map((entry) => entry?.type)
-        .filter((type): type is "image" | "video" | "audio" =>
-          type === "image" || type === "video" || type === "audio"
-        )
-    )
-  ).join(" ");
-
 const trimContent = (input: string, limit: number): string => {
   const normalized = normalizeWhitespace(input);
   if (normalized.length <= limit) {
     return normalized;
   }
   return normalizeWhitespace(normalized.slice(0, limit));
+};
+
+const splitTokenLike = (input: string): string[] => normalizeWhitespace(input).match(TOKEN_LIKE_REGEX) || [];
+
+const countTokenLike = (input: string): number => splitTokenLike(input).length;
+
+const chunkTextByTokenBudget = (input: string, budget: number): string[] => {
+  const normalized = normalizeWhitespace(input);
+  if (!normalized) return [];
+
+  const maxTokens = Math.max(1, Math.floor(budget));
+  const paragraphs = normalized.split(/\n{2,}/).map((part) => part.trim()).filter(Boolean);
+  const chunks: string[] = [];
+  let current: string[] = [];
+  let currentTokens = 0;
+
+  const flush = () => {
+    const text = normalizeWhitespace(current.join("\n\n"));
+    if (text) chunks.push(text);
+    current = [];
+    currentTokens = 0;
+  };
+
+  const pushPart = (part: string) => {
+    const tokens = countTokenLike(part);
+    if (tokens <= maxTokens) {
+      if (currentTokens > 0 && currentTokens + tokens > maxTokens) flush();
+      current.push(part);
+      currentTokens += tokens;
+      return;
+    }
+
+    flush();
+    const words = part.split(/\s+/).filter(Boolean);
+    let segment: string[] = [];
+    let segmentTokens = 0;
+    for (const word of words) {
+      const wordTokens = Math.max(1, countTokenLike(word));
+      if (segmentTokens > 0 && segmentTokens + wordTokens > maxTokens) {
+        chunks.push(normalizeWhitespace(segment.join(" ")));
+        segment = [];
+        segmentTokens = 0;
+      }
+      segment.push(word);
+      segmentTokens += wordTokens;
+    }
+    if (segment.length > 0) chunks.push(normalizeWhitespace(segment.join(" ")));
+  };
+
+  for (const paragraph of paragraphs.length > 0 ? paragraphs : [normalized]) {
+    pushPart(paragraph);
+  }
+  flush();
+
+  return chunks;
 };
 
 const stripUrlLikeToken = (input: string): string =>
@@ -121,6 +170,9 @@ const composeHostnameTokens = (hostname: string): string => {
   return Array.from(new Set(hostnameTokens)).join(" ");
 };
 
+// Mirrors composeEmbeddingText: plain text, no field labels, so query and
+// document vectors live in the same representation space (jina-v2 is not
+// trained for query/passage prefixes).
 export const composeQueryEmbeddingText = (query: string): string => {
   const normalized = trimContent(query || "", MAX_QUERY_CHARS);
   if (!normalized) return "";
@@ -128,35 +180,37 @@ export const composeQueryEmbeddingText = (query: string): string => {
   const urlToken = extractUrlLikeToken(normalized);
   const queryText = stripUrlLikeToken(normalized);
   const urlParts = urlToken ? normalizeUrlParts(urlToken) : { hostname: "", pathname: "", pathTokens: [] };
+  const hostnameTerms = composeHostnameTokens(urlParts.hostname);
 
-  return [
-    queryText ? `query: ${queryText}` : "",
-    urlParts.hostname ? `domain: ${urlParts.hostname}` : "",
-    urlParts.pathTokens.length > 0 ? `path_terms: ${urlParts.pathTokens.join(" ")}` : "",
-  ]
-    .filter(Boolean)
-    .join("\n");
+  return [queryText, hostnameTerms, urlParts.pathTokens.join(" ")].filter(Boolean).join("\n");
 };
 
+// Content-first, no field labels. `source`/media are hard filters elsewhere,
+// not semantic signal; including them as repeated tokens on every document
+// inflated baseline cosine similarity and collapsed result separation.
 export const composeEmbeddingText = (item: EmbeddingTextSource): string => {
+  return composeEmbeddingTexts(item)[0] || "";
+};
+
+export const composeEmbeddingTexts = (item: EmbeddingTextSource): string[] => {
   const title = trimContent(item.title || "", 220);
   const textContent = trimContent(item.textContent || "", MAX_CONTENT_CHARS);
+  const ocrText = trimContent(item.ocrText || "", MAX_OCR_CHARS);
   const author = safeLower((item.authorUsername || "").replace(/^@+/, ""));
-  const source = safeLower(item.source || "");
   const { hostname, pathTokens } = normalizeUrlParts(item.url || "");
   const hostnameTerms = composeHostnameTokens(hostname);
-  const mediaHints = composeMediaHints((item.media || []) as NonNullable<ItemDocType["media"]>);
+  const prefix = [title, hostnameTerms, pathTokens.join(" "), author].filter(Boolean).join("\n");
+  const body = [textContent, ocrText].filter(Boolean).join("\n\n");
+  const bodyBudget = Math.max(
+    MIN_BODY_CHUNK_TOKEN_BUDGET,
+    EMBEDDING_CHUNK_TOKEN_BUDGET - countTokenLike(prefix)
+  );
+  const bodyChunks = chunkTextByTokenBudget(body, bodyBudget);
 
-  return [
-    title ? `title: ${title}` : "",
-    textContent ? `content: ${textContent}` : "",
-    hostname ? `domain: ${hostname}` : "",
-    hostnameTerms ? `domain_terms: ${hostnameTerms}` : "",
-    pathTokens.length > 0 ? `path_terms: ${pathTokens.join(" ")}` : "",
-    source ? `source: ${source}` : "",
-    author ? `author: ${author}` : "",
-    mediaHints ? `media: ${mediaHints}` : "",
-  ]
-    .filter(Boolean)
-    .join("\n");
+  if (bodyChunks.length === 0) {
+    const fallback = [prefix, item.url || ""].filter(Boolean).join("\n");
+    return fallback ? [fallback] : [];
+  }
+
+  return bodyChunks.map((chunk) => [prefix, chunk].filter(Boolean).join("\n"));
 };

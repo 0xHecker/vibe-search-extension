@@ -191,10 +191,21 @@ class SyncService {
         const dirtyItems = activeItems.filter((item) => item.isDirty);
         const cleanItems = activeItems
           .filter((item) => !item.isDirty)
-          .filter((item) => item.vector_index !== undefined && item.vector_index > -1) as {
-          id: string;
-          vector_index: number;
-        }[];
+          .flatMap((item) => {
+            const primaryIndex =
+              Number.isInteger(item.vector_index) && typeof item.vector_index === "number" && item.vector_index >= 0
+                ? item.vector_index
+                : -1;
+            const indexes =
+              Array.isArray(item.vector_indexes) && item.vector_indexes.length > 0
+                ? item.vector_indexes
+                : primaryIndex >= 0
+                  ? [primaryIndex]
+                  : [];
+            return indexes
+              .filter((index): index is number => Number.isInteger(index) && index >= 0)
+              .map((vector_index) => ({ id: item.id, vector_index }));
+          });
 
         // Step 4: Re-embed dirty items and copy clean vectors
         const { newIndexMap } = await vectorStoreService.rebuildVectors(
@@ -216,9 +227,16 @@ class SyncService {
           detail: "Swapped compacted vector file into place.",
         });
 
-        const updates = newIndexMap.map((item: { id: string; vector_index: number }) => ({
-          id: item.id,
-          vector_index: item.vector_index,
+        const indexesByItemId = new Map<string, number[]>();
+        for (const item of newIndexMap) {
+          const indexes = indexesByItemId.get(item.id) || [];
+          indexes.push(item.vector_index);
+          indexesByItemId.set(item.id, indexes);
+        }
+        const updates = Array.from(indexesByItemId.entries()).map(([id, vectorIndexes]) => ({
+          id,
+          vector_index: vectorIndexes[0] ?? -1,
+          vector_indexes: vectorIndexes,
           isEmbedded: true,
           isDirty: false,
         }));

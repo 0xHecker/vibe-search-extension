@@ -361,11 +361,13 @@ export type RankableItem = {
   id: string;
   title: string;
   textContent: string;
+  ocrText: string;
   url: string;
   source: ItemDocType["source"];
   authorUsername?: string;
   mediaTypes: Array<"image" | "video">;
   vector_index?: number;
+  vector_indexes?: number[];
   createdAt: number;
   updatedAt: number;
 };

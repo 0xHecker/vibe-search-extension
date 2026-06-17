@@ -42,6 +42,38 @@ class DatabaseManager {
     return typeof userId === "string" ? userId : "";
   }
 
+  private itemHasOcrImage(item: ItemDocType): boolean {
+    if (typeof item.displayImageUrl === "string" && item.displayImageUrl.trim().length > 0) {
+      return true;
+    }
+    return (item.media || []).some(
+      (entry) =>
+        entry?.type === "image" &&
+        (typeof entry.s3Url === "string" ||
+          typeof entry.originalUrl === "string" ||
+          typeof entry.opfsPath === "string")
+    );
+  }
+
+  private normalizeOcrText(text: string | undefined): string {
+    return (text || "")
+      .replace(/\s+\n/g, "\n")
+      .replace(/\n\s+/g, "\n")
+      .replace(/[ \t]+/g, " ")
+      .replace(/\n{3,}/g, "\n\n")
+      .trim();
+  }
+
+  private normalizeOcrConfidence(value: unknown): number | null {
+    if (!Number.isFinite(value)) return null;
+    return Math.max(0, Math.min(1, value as number));
+  }
+
+  private normalizeOcrLineCount(value: unknown): number {
+    if (!Number.isFinite(value)) return 0;
+    return Math.max(0, Math.floor(value as number));
+  }
+
   private async resolveAllowedSpaceIds(
     db: any,
     accessContext?: AccessContext
@@ -221,6 +253,96 @@ class DatabaseManager {
     return dirtyItems.map((item) => item.toMutableJSON());
   }
 
+  async getItemsToOcr(payload: {
+    limit: number;
+    modelVersion: string;
+    retryErroredBefore: number;
+  }): Promise<ItemDocType[]> {
+    const db = await getDb();
+    const limit = Math.max(1, Math.min(100, Math.floor(payload.limit || 10)));
+    const docs = await db.items
+      .find({
+        selector: {
+          deletedAt: { $eq: 0 },
+        },
+        limit: limit * 12,
+      } as any)
+      .exec();
+
+    return docs
+      .map((item) => item.toMutableJSON() as ItemDocType)
+      .filter((item) => {
+        if (!item.ocrStatus) return true;
+        if (item.ocrStatus === "pending" || item.ocrStatus === "processing") return true;
+        if (item.ocrModelVersion !== payload.modelVersion) return true;
+        return item.ocrStatus === "error" && (item.ocrUpdatedAt || 0) < payload.retryErroredBefore;
+      })
+      .filter((item) => this.itemHasOcrImage(item))
+      .slice(0, limit);
+  }
+
+  async markItemOcrProcessing(payload: {
+    id: string;
+    modelVersion: string;
+    sourceHash: string;
+  }): Promise<void> {
+    const db = await getDb();
+    const doc = await db.items.findOne(payload.id).exec();
+    if (!doc) return;
+    await doc.patch({
+      ocrStatus: "processing",
+      ocrError: "",
+      ocrModelVersion: payload.modelVersion,
+      ocrSourceHash: payload.sourceHash,
+      ocrUpdatedAt: Date.now(),
+    });
+  }
+
+  async saveItemOcrResult(payload: {
+    id: string;
+    status: ItemDocType["ocrStatus"];
+    modelVersion: string;
+    sourceHash: string;
+    text?: string;
+    confidence?: number | null;
+    lineCount?: number;
+    error?: string;
+  }): Promise<void> {
+    const db = await getDb();
+    const doc = await db.items.findOne(payload.id).exec();
+    if (!doc) return;
+
+    const current = doc.toMutableJSON() as ItemDocType;
+    const now = Date.now();
+    const nextText = this.normalizeOcrText(payload.text);
+    const currentText = this.normalizeOcrText(current.ocrText);
+    const textChanged = payload.status === "done" && nextText !== currentText;
+    const confidence = this.normalizeOcrConfidence(payload.confidence);
+    const lineCount = this.normalizeOcrLineCount(payload.lineCount);
+
+    const patchData: Partial<ItemDocType> = {
+      ocrStatus: payload.status,
+      ocrError: payload.error ? payload.error.slice(0, 500) : "",
+      ocrModelVersion: payload.modelVersion,
+      ocrSourceHash: payload.sourceHash,
+      ocrUpdatedAt: now,
+      ocrConfidence: confidence,
+      ocrLineCount: lineCount,
+    };
+
+    if (payload.status === "done") {
+      patchData.ocrText = nextText;
+    }
+
+    if (textChanged) {
+      patchData.isDirty = true;
+      patchData.isEmbedded = false;
+      patchData.updatedAt = now;
+    }
+
+    await doc.patch(patchData);
+  }
+
   async markAllActiveItemsForReembedding(options?: { touchUpdatedAt?: boolean }): Promise<number> {
     const db = await getDb();
     const now = Date.now();
@@ -236,6 +358,7 @@ class DatabaseManager {
         ...current,
         userId: this.normalizeUserId(doc.get("userId") as string | null | undefined),
         vector_index: -1,
+        vector_indexes: [],
         isEmbedded: false,
         isDirty: true,
         updatedAt: touchUpdatedAt ? now : current.updatedAt,
@@ -387,6 +510,10 @@ class DatabaseManager {
       parentId: payload.item.parentId ?? null,
       chunkOrder: payload.item.chunkOrder,
       vector_index: -1,
+      vector_indexes: [],
+      ocrStatus: payload.item.ocrStatus ?? "pending",
+      ocrModelVersion: payload.item.ocrModelVersion ?? "",
+      ocrUpdatedAt: payload.item.ocrUpdatedAt ?? 0,
       isEmbedded: false,
       isMetaFetched: false,
       isDirty: true,

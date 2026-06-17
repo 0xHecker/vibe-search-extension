@@ -9,8 +9,9 @@ import { tagsController } from "@src/services/controllers/tags.controller";
 import { spacesController } from "@src/services/controllers/spaces.controller";
 import { vectorPipelineCoordinator } from "@src/services/vector-pipeline-coordinator";
 import { queryRankerService } from "@src/services/query-ranker.service";
+import { ocrService, OCR_MODEL_VERSION } from "@src/services/ocr.service";
 import type { ItemDocType } from "@src/schemas/item_schema";
-import { composeEmbeddingText, EMBEDDING_TEXT_VERSION } from "@src/search-core/embedding-text";
+import { composeEmbeddingTexts, EMBEDDING_TEXT_VERSION } from "@src/search-core/embedding-text";
 
 const sendStatusUpdate = (message: string) => {
   try {
@@ -23,7 +24,7 @@ const sendProcessStatus = (payload: {
   label: string;
   state: "processing" | "success" | "error";
   detail: string;
-  retryAction?: "RETRY_QUERY" | "TRIGGER_EMBEDDING" | "REBUILD_INDEX" | "REBUILD_VECTORS";
+  retryAction?: "RETRY_QUERY" | "TRIGGER_EMBEDDING" | "TRIGGER_OCR" | "REBUILD_INDEX" | "REBUILD_VECTORS";
 }) => {
   try {
     chrome.runtime.sendMessage({
@@ -173,6 +174,12 @@ const didTagNameChange = (changeEvent: any): boolean => {
 console.log("[Offscreen] Document script loaded.");
 
 const router = new OffscreenRouter();
+const ocrController = {
+  async extractImageText(payload: { url?: string }) {
+    const url = typeof payload?.url === "string" ? payload.url : "";
+    return ocrService.processImageUrl(url);
+  },
+};
 
 // Register all the services that the offscreen document will manage.
 router.registerService("dbManager", databaseManager, {
@@ -225,6 +232,9 @@ router.registerService("spaces", spacesController, {
     "getSpaceAccessState",
   ],
 });
+router.registerService("ocr", ocrController, {
+  methods: ["extractImageText"],
+});
 
 // Start listening for messages.
 router.listen();
@@ -236,19 +246,53 @@ let isEmbeddingRunning = false;
 let embeddingScheduled = false;
 let embeddingCheckTimer: number | null = null;
 let embeddingWaitNotified = false;
+const OCR_BATCH_SIZE = 3;
+const OCR_RETRY_AFTER_MS = 6 * 60 * 60 * 1000;
+let isOcrRunning = false;
+let ocrScheduled = false;
+let ocrCheckTimer: number | null = null;
+let ocrWaitNotified = false;
 
 type EmbeddingBatchItem = Pick<
   ItemDocType,
-  "id" | "title" | "textContent" | "url" | "source" | "authorUsername" | "media"
+  "id" | "title" | "textContent" | "ocrText" | "url" | "source" | "authorUsername" | "media"
 >;
+
+const getExtensionStorageLocal = (): chrome.storage.LocalStorageArea | null => {
+  const runtimeChrome = (globalThis as typeof globalThis & { chrome?: typeof chrome }).chrome;
+  return runtimeChrome?.storage?.local ?? null;
+};
+
+const getStoredEmbeddingTextVersion = async (): Promise<string> => {
+  const storage = getExtensionStorageLocal();
+  if (storage) {
+    const values = await storage.get(EMBEDDING_SCHEMA_VERSION_STORAGE_KEY);
+    const value = values[EMBEDDING_SCHEMA_VERSION_STORAGE_KEY];
+    return typeof value === "string" ? value : "";
+  }
+
+  try {
+    return globalThis.localStorage?.getItem(EMBEDDING_SCHEMA_VERSION_STORAGE_KEY) || "";
+  } catch {
+    return "";
+  }
+};
+
+const setStoredEmbeddingTextVersion = async (version: string): Promise<void> => {
+  const storage = getExtensionStorageLocal();
+  if (storage) {
+    await storage.set({ [EMBEDDING_SCHEMA_VERSION_STORAGE_KEY]: version });
+    return;
+  }
+
+  try {
+    globalThis.localStorage?.setItem(EMBEDDING_SCHEMA_VERSION_STORAGE_KEY, version);
+  } catch {}
+};
 
 const ensureEmbeddingSchemaVersion = async () => {
   try {
-    const storage = await chrome.storage.local.get(EMBEDDING_SCHEMA_VERSION_STORAGE_KEY);
-    const currentVersion =
-      typeof storage[EMBEDDING_SCHEMA_VERSION_STORAGE_KEY] === "string"
-        ? (storage[EMBEDDING_SCHEMA_VERSION_STORAGE_KEY] as string)
-        : "";
+    const currentVersion = await getStoredEmbeddingTextVersion();
 
     if (currentVersion === EMBEDDING_TEXT_VERSION) {
       return;
@@ -262,9 +306,7 @@ const ensureEmbeddingSchemaVersion = async () => {
     });
 
     const updatedCount = await databaseManager.markAllActiveItemsForReembedding();
-    await chrome.storage.local.set({
-      [EMBEDDING_SCHEMA_VERSION_STORAGE_KEY]: EMBEDDING_TEXT_VERSION,
-    });
+    await setStoredEmbeddingTextVersion(EMBEDDING_TEXT_VERSION);
 
     sendProcessStatus({
       id: "embedding-schema",
@@ -306,20 +348,30 @@ const maybeReportEmbeddingWait = () => {
 
 const runEmbeddingBatch = async (
   batch: EmbeddingBatchItem[],
-  updateForItem: (item: EmbeddingBatchItem, vectorIndex: number) => Record<string, unknown>
+  updateForItem: (item: EmbeddingBatchItem, vectorIndexes: number[]) => Record<string, unknown>
 ): Promise<number> => {
   maybeReportEmbeddingWait();
 
   return vectorPipelineCoordinator.runExclusive("embedding", async () => {
-    const sentences = batch.map((item) => composeEmbeddingText(item));
+    const entries = batch.flatMap((item) =>
+      composeEmbeddingTexts(item).map((text) => ({ itemId: item.id, text }))
+    );
+    const sentences = entries.map((entry) => entry.text);
     const appendResult = await vectorStoreService.generateAndStoreEmbeddings({ sentences });
-    if (appendResult.appendedCount !== batch.length) {
+    if (appendResult.appendedCount !== entries.length) {
       throw new Error(
-        `Embedding append mismatch: expected ${batch.length}, got ${appendResult.appendedCount}`
+        `Embedding append mismatch: expected ${entries.length}, got ${appendResult.appendedCount}`
       );
     }
 
-    const updates = batch.map((item, idx) => updateForItem(item, appendResult.startIndex + idx));
+    const vectorIndexesByItemId = new Map<string, number[]>();
+    entries.forEach((entry, idx) => {
+      const indexes = vectorIndexesByItemId.get(entry.itemId) || [];
+      indexes.push(appendResult.startIndex + idx);
+      vectorIndexesByItemId.set(entry.itemId, indexes);
+    });
+
+    const updates = batch.map((item) => updateForItem(item, vectorIndexesByItemId.get(item.id) || []));
     await databaseManager.bulkUpdateItems(updates);
     return appendResult.appendedCount;
   });
@@ -361,9 +413,10 @@ const processEmbeddingQueue = async () => {
       );
 
       try {
-        const appendedCount = await runEmbeddingBatch(batch, (item, vectorIndex) => ({
+        const appendedCount = await runEmbeddingBatch(batch, (item, vectorIndexes) => ({
           id: item.id,
-          vector_index: vectorIndex,
+          vector_index: vectorIndexes[0] ?? -1,
+          vector_indexes: vectorIndexes,
           isEmbedded: true,
           isDirty: false,
         }));
@@ -398,9 +451,10 @@ const processEmbeddingQueue = async () => {
         const batch = dirtyItems.slice(i, i + EMBEDDING_BATCH_SIZE);
 
         try {
-          await runEmbeddingBatch(batch, (item, vectorIndex) => ({
+          await runEmbeddingBatch(batch, (item, vectorIndexes) => ({
             id: item.id,
-            vector_index: vectorIndex,
+            vector_index: vectorIndexes[0] ?? -1,
+            vector_indexes: vectorIndexes,
             isEmbedded: true,
             isDirty: false,
           }));
@@ -475,6 +529,167 @@ const scheduleEmbeddingIfNeeded = () => {
   }, 250);
 };
 
+const maybeReportOcrWait = (): boolean => {
+  if (isEmbeddingRunning || vectorPipelineCoordinator.getActiveOperation() !== null) {
+    if (!ocrWaitNotified) {
+      sendProcessStatus({
+        id: "ocr-queue",
+        label: "Image OCR",
+        state: "processing",
+        detail: "Waiting for embedding/vector work to finish...",
+      });
+      ocrWaitNotified = true;
+    }
+    return true;
+  }
+  ocrWaitNotified = false;
+  return false;
+};
+
+const processOcrQueue = async () => {
+  if (isOcrRunning) {
+    ocrScheduled = true;
+    return;
+  }
+
+  if (maybeReportOcrWait()) {
+    ocrScheduled = true;
+    window.setTimeout(processOcrQueue, 5000);
+    return;
+  }
+
+  isOcrRunning = true;
+  ocrScheduled = false;
+  sendProcessStatus({
+    id: "ocr-queue",
+    label: "Image OCR",
+    state: "processing",
+    detail: "Reading text from images...",
+  });
+
+  let processed = 0;
+  let errored = 0;
+  let skipped = 0;
+  let processError: string | null = null;
+
+  try {
+    while (true) {
+      const items = await databaseManager.getItemsToOcr({
+        limit: OCR_BATCH_SIZE,
+        modelVersion: OCR_MODEL_VERSION,
+        retryErroredBefore: Date.now() - OCR_RETRY_AFTER_MS,
+      });
+      if (items.length === 0) break;
+
+      for (const item of items) {
+        const sourceHash = ocrService.getSourceHash(item);
+        if (
+          item.ocrStatus === "done" &&
+          item.ocrModelVersion === OCR_MODEL_VERSION &&
+          item.ocrSourceHash === sourceHash
+        ) {
+          continue;
+        }
+
+        try {
+          await databaseManager.markItemOcrProcessing({
+            id: item.id,
+            modelVersion: OCR_MODEL_VERSION,
+            sourceHash,
+          });
+          const result = await ocrService.processItem(item);
+          await databaseManager.saveItemOcrResult({
+            id: item.id,
+            status: result.status,
+            modelVersion: OCR_MODEL_VERSION,
+            sourceHash: result.sourceHash,
+            text: result.text,
+            confidence: result.confidence,
+            lineCount: result.lineCount,
+            error: result.error,
+          });
+
+          if (result.status === "done") processed += 1;
+          else if (result.status === "skipped") skipped += 1;
+          else errored += 1;
+        } catch (error) {
+          errored += 1;
+          const message = error instanceof Error ? error.message : "OCR failed for an item";
+          processError = message;
+          await databaseManager.saveItemOcrResult({
+            id: item.id,
+            status: "error",
+            modelVersion: OCR_MODEL_VERSION,
+            sourceHash,
+            text: item.ocrText || "",
+            confidence: item.ocrConfidence,
+            lineCount: item.ocrLineCount || 0,
+            error: message,
+          });
+        }
+      }
+
+      sendProcessStatus({
+        id: "ocr-queue",
+        label: "Image OCR",
+        state: "processing",
+        detail: `OCR processed ${processed} images${skipped ? `, skipped ${skipped}` : ""}${errored ? `, ${errored} errors` : ""}.`,
+      });
+    }
+
+    if (processError && processed === 0) {
+      sendProcessStatus({
+        id: "ocr-queue",
+        label: "Image OCR",
+        state: "error",
+        detail: processError,
+        retryAction: "TRIGGER_OCR",
+      });
+    } else {
+      sendProcessStatus({
+        id: "ocr-queue",
+        label: "Image OCR",
+        state: "success",
+        detail:
+          processed > 0
+            ? `OCR complete for ${processed} image records.`
+            : "Image OCR is idle.",
+      });
+    }
+  } finally {
+    isOcrRunning = false;
+    if (ocrScheduled) {
+      window.setTimeout(processOcrQueue, 500);
+    }
+    scheduleEmbeddingIfNeeded();
+  }
+};
+
+export const triggerOcr = () => {
+  if (isOcrRunning) {
+    ocrScheduled = true;
+  } else {
+    window.setTimeout(processOcrQueue, 500);
+  }
+};
+
+const scheduleOcrIfNeeded = () => {
+  if (ocrCheckTimer !== null) return;
+  ocrCheckTimer = window.setTimeout(async () => {
+    ocrCheckTimer = null;
+    try {
+      const items = await databaseManager.getItemsToOcr({
+        limit: 1,
+        modelVersion: OCR_MODEL_VERSION,
+        retryErroredBefore: Date.now() - OCR_RETRY_AFTER_MS,
+      });
+      if (items.length > 0) triggerOcr();
+    } catch (error) {
+      console.error("[Offscreen] Failed to check OCR backlog:", error);
+    }
+  }, 1000);
+};
+
 // Listen for direct embedding trigger messages
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.type === "TRIGGER_EMBEDDING" && message.isForwarded) {
@@ -484,6 +699,16 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     }
     console.log("[Offscreen] Received TRIGGER_EMBEDDING message");
     triggerEmbedding();
+    sendResponse({ success: true });
+    return true;
+  }
+
+  if (message.type === "TRIGGER_OCR" && message.isForwarded) {
+    if (!isTrustedForwarderSender(sender)) {
+      sendResponse({ success: false, error: "UNAUTHORIZED_FORWARDER" });
+      return true;
+    }
+    triggerOcr();
     sendResponse({ success: true });
     return true;
   }
@@ -513,6 +738,7 @@ const initializeApp = async () => {
 
     // Initial embedding process
     await processEmbeddingQueue();
+    scheduleOcrIfNeeded();
 
     // Subscribe to item changes and trigger embedding
     db.items.$.subscribe((changeEvent: any) => {
@@ -521,6 +747,7 @@ const initializeApp = async () => {
       scheduleDbChange("items", changedIds);
       // Trigger embedding only when there is actual pending work.
       scheduleEmbeddingIfNeeded();
+      scheduleOcrIfNeeded();
     });
 
     db.folders.$.subscribe(() => {

@@ -3,7 +3,7 @@ import { VECTOR_DIMENSION } from "@src/common/constants";
 import { embeddingService } from "./embedding.service";
 import { dotProduct } from "./vector-store/dot-product";
 import type { ItemDocType } from "@src/schemas/item_schema";
-import { composeEmbeddingText, composeQueryEmbeddingText } from "@src/search-core/embedding-text";
+import { composeEmbeddingTexts, composeQueryEmbeddingText } from "@src/search-core/embedding-text";
 
 interface SearchResult {
   index: number;
@@ -621,7 +621,10 @@ class VectorStoreService {
   public rebuildVectors = async (
     destFile: string,
     dirtyItems: Array<
-      Pick<ItemDocType, "id" | "title" | "textContent" | "url" | "source" | "authorUsername" | "media">
+      Pick<
+        ItemDocType,
+        "id" | "title" | "textContent" | "ocrText" | "url" | "source" | "authorUsername" | "media"
+      >
     >,
     cleanItems: { id: string; vector_index: number }[]
   ): Promise<{ newIndexMap: VectorIndexMapEntry[] }> => {
@@ -632,15 +635,18 @@ class VectorStoreService {
 
       // Re-embed dirty items
       if (dirtyItems.length > 0) {
-        const sentences = dirtyItems.map((item) => composeEmbeddingText(item));
+        const entries = dirtyItems.flatMap((item) =>
+          composeEmbeddingTexts(item).map((text) => ({ id: item.id, text }))
+        );
+        const sentences = entries.map((entry) => entry.text);
         const embeddings = await embeddingService.generateEmbeddings({ sentences });
         const destOpfs = new OpfsHandler();
         await destOpfs.open(destFile);
         const destOffset = this.HEADER_SIZE + newVectorCount * vectorSizeBytes;
         await destOpfs.write(this.toArrayBuffer(embeddings), destOffset);
         destOpfs.close();
-        for (let i = 0; i < dirtyItems.length; i++) {
-          newIndexMap.push({ id: dirtyItems[i].id, vector_index: newVectorCount });
+        for (let i = 0; i < entries.length; i++) {
+          newIndexMap.push({ id: entries[i].id, vector_index: newVectorCount });
           newVectorCount++;
         }
       }

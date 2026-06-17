@@ -140,6 +140,7 @@ type CandidateLite = {
   mediaTypes: Array<"image" | "video">;
   hasMedia: boolean;
   vectorIndex: number;
+  vectorIndexes: number[];
   title: string;
   createdAt: number;
   updatedAt: number;
@@ -268,7 +269,7 @@ export class ItemsController {
         ? (item.mediaTypes || []).join(" ")
         : (item.media || []).map((entry) => entry.type).join(" ");
     return this.normalizeText(
-      [item.title, item.textContent, item.url, item.source, item.authorUsername, mediaText]
+      [item.title, item.textContent, item.ocrText, item.url, item.source, item.authorUsername, mediaText]
         .filter(Boolean)
         .join(" ")
     );
@@ -283,19 +284,29 @@ export class ItemsController {
     return (1 - ageDays / 180) * 0.06;
   }
 
-  private toRankableItem(item: CandidateLite, textContent: string): RankableItem {
+  private toRankableItem(item: CandidateLite, textContent: string, ocrText: string): RankableItem {
     return {
       id: item.id,
       title: item.title || "",
       textContent: (textContent || "").slice(0, MAX_RANK_TEXT_CHARS),
+      ocrText: (ocrText || "").slice(0, MAX_RANK_TEXT_CHARS),
       url: item.url || "",
       source: item.source,
       authorUsername: item.authorUsername,
       mediaTypes: item.mediaTypes,
       vector_index: item.vectorIndex,
+      vector_indexes: item.vectorIndexes,
       createdAt: item.createdAt || 0,
       updatedAt: item.updatedAt || 0,
     };
+  }
+
+  private sanitizeVectorIndexes(raw: unknown, fallback: number): number[] {
+    const indexes = Array.isArray(raw) ? raw : [];
+    const normalized = indexes
+      .filter((index): index is number => Number.isInteger(index) && index >= 0);
+    if (normalized.length === 0 && fallback >= 0) normalized.push(fallback);
+    return Array.from(new Set(normalized));
   }
 
   private toCandidateLite(doc: any): CandidateLite {
@@ -313,6 +324,7 @@ export class ItemsController {
       typeof vectorIndexRaw === "number" && Number.isInteger(vectorIndexRaw) && vectorIndexRaw >= 0
         ? vectorIndexRaw
         : -1;
+    const vectorIndexes = this.sanitizeVectorIndexes(doc.get("vector_indexes"), vectorIndex);
 
     return {
       id: (doc.get("id") as string) || "",
@@ -326,6 +338,7 @@ export class ItemsController {
       mediaTypes,
       hasMedia: media.length > 0,
       vectorIndex,
+      vectorIndexes,
       title: (doc.get("title") as string | undefined) || "",
       createdAt: (doc.get("createdAt") as number | undefined) || 0,
       updatedAt: (doc.get("updatedAt") as number | undefined) || 0,
@@ -548,6 +561,25 @@ export class ItemsController {
         .sort((a, b) => b[1] - a[1])
         .map(([index], rank) => [index, rank + 1])
     );
+    const getBestVectorHit = (item: RankableItem): { score: number; rank?: number; hasHit: boolean } => {
+      const fallback =
+        typeof item.vector_index === "number" && Number.isInteger(item.vector_index) ? item.vector_index : -1;
+      const indexes = this.sanitizeVectorIndexes(item.vector_indexes, fallback);
+      let bestScore = 0;
+      let bestRank: number | undefined;
+      let hasHit = false;
+      for (const index of indexes) {
+        if (!args.vectorScoresByIndex.has(index)) continue;
+        const score = args.vectorScoresByIndex.get(index) || 0;
+        const rank = vectorRankByIndex.get(index);
+        if (!hasHit || score > bestScore) {
+          bestScore = score;
+          bestRank = rank;
+          hasHit = true;
+        }
+      }
+      return { score: bestScore, rank: bestRank, hasHit };
+    };
 
     const ranked = args.items.map((item) => {
       let itemText = "";
@@ -579,17 +611,11 @@ export class ItemsController {
           : boolMatch.matches
         : false;
 
-      const vectorScore =
-        typeof item.vector_index === "number" && item.vector_index > -1
-          ? args.vectorScoresByIndex.get(item.vector_index) || 0
-          : 0;
-      const hasVectorHit =
-        typeof item.vector_index === "number" && args.vectorScoresByIndex.has(item.vector_index);
+      const vectorHit = getBestVectorHit(item);
+      const vectorScore = vectorHit.score;
+      const hasVectorHit = vectorHit.hasHit;
       const lexicalRank = args.useLexical ? lexicalRankById.get(item.id) : undefined;
-      const vectorRank =
-        args.useVector && typeof item.vector_index === "number" && item.vector_index > -1
-          ? vectorRankByIndex.get(item.vector_index)
-          : undefined;
+      const vectorRank = args.useVector ? vectorHit.rank : undefined;
 
       const normalizedTextScore = args.useLexical
         ? lexicalScore > 0 && maxLexicalScore > 0
@@ -676,11 +702,13 @@ export class ItemsController {
               id: cursor.id,
               title: cursor.title || "",
               textContent: "",
+              ocrText: "",
               url: "",
               source: cursor.source,
               authorUsername: "",
               mediaTypes: [],
               vector_index: -1,
+              vector_indexes: [],
               createdAt: cursor.createdAt || 0,
               updatedAt: cursor.updatedAt || 0,
             } as RankableItem,
@@ -1542,7 +1570,7 @@ export class ItemsController {
     if (useVector) {
       const vectorStartedAt = now();
       const allCandidateIndices = Array.from(
-        new Set(candidates.map((item) => item.vectorIndex).filter((index) => index >= 0))
+        new Set(candidates.flatMap((item) => item.vectorIndexes).filter((index) => index >= 0))
       );
       let candidateIndices = allCandidateIndices;
 
@@ -1556,7 +1584,7 @@ export class ItemsController {
           new Set(
             candidates
               .filter((item) => lexicalTopSet.has(item.id))
-              .map((item) => item.vectorIndex)
+              .flatMap((item) => item.vectorIndexes)
               .filter((index) => index >= 0)
           )
         );
@@ -1608,9 +1636,7 @@ export class ItemsController {
           );
           if (includeDebug) {
             const candidateByVectorIndex = new Map<number, CandidateLite>(
-              candidates
-                .filter((item) => item.vectorIndex >= 0)
-                .map((item) => [item.vectorIndex, item])
+              candidates.flatMap((item) => item.vectorIndexes.map((index) => [index, item] as [number, CandidateLite]))
             );
             vectorTopHits = prunedVectorResults.slice(0, 12).map((entry) => {
               const candidate = candidateByVectorIndex.get(entry.index);
@@ -1723,8 +1749,8 @@ export class ItemsController {
       if (vectorScoresByIndex.size > 0) {
         const idByVectorIndex = new Map<number, string>();
         for (const item of candidates) {
-          if (item.vectorIndex >= 0) {
-            idByVectorIndex.set(item.vectorIndex, item.id);
+          for (const index of item.vectorIndexes) {
+            idByVectorIndex.set(index, item.id);
           }
         }
         for (const [vectorIndex] of vectorScoresByIndex.entries()) {
@@ -1745,7 +1771,10 @@ export class ItemsController {
       const textContent = needsTextForRanking
         ? (doc?.get("textContent") as string | undefined) || ""
         : "";
-      return this.toRankableItem(item, textContent);
+      const ocrText = needsTextForRanking
+        ? (doc?.get("ocrText") as string | undefined) || ""
+        : "";
+      return this.toRankableItem(item, textContent, ocrText);
     });
     rankInputCount = rankableItems.length;
 
@@ -1870,7 +1899,7 @@ export class ItemsController {
             vectorStats: useVector
               ? {
                   candidateCount: Array.from(
-                    new Set(candidates.map((item) => item.vectorIndex).filter((index) => index >= 0))
+                    new Set(candidates.flatMap((item) => item.vectorIndexes).filter((index) => index >= 0))
                   ).length,
                   rawHitCount: rawVectorHitCount,
                   keptHitCount: vectorScoresByIndex.size,
@@ -1897,6 +1926,12 @@ export class ItemsController {
     likes?: number;
     upvotes?: number;
     media?: ItemDocType["media"];
+    ocrText?: string;
+    ocrStatus?: ItemDocType["ocrStatus"];
+    ocrConfidence?: number | null;
+    ocrLineCount?: number;
+    ocrModelVersion?: string;
+    ocrSourceHash?: string;
     isMetaFetched?: boolean;
     isDirty?: boolean;
     shouldFetchMetadata?: boolean;
@@ -1936,6 +1971,14 @@ export class ItemsController {
       parentId: payload.parentId ?? null,
       chunkOrder: payload.chunkOrder ?? createdAt,
       vector_index: -1,
+      vector_indexes: [],
+      ocrText: payload.ocrText,
+      ocrStatus: payload.ocrStatus ?? "pending",
+      ocrConfidence: payload.ocrConfidence,
+      ocrLineCount: payload.ocrLineCount,
+      ocrModelVersion: payload.ocrModelVersion ?? "",
+      ocrSourceHash: payload.ocrSourceHash,
+      ocrUpdatedAt: payload.ocrStatus ? updatedAt : 0,
       isEmbedded: false,
       isMetaFetched: payload.isMetaFetched ?? false,
       isDirty: payload.isDirty ?? true,

@@ -6,6 +6,7 @@ type IndexedSearchDoc = {
   id: string;
   title: string;
   textContent: string;
+  ocrText: string;
   url: string;
   author: string;
   tagsText: string;
@@ -33,6 +34,7 @@ const FIELD_WEIGHTS: Record<string, number> = {
   title: 6,
   tagsText: 4.5,
   textContent: 3,
+  ocrText: 2.8,
   url: 2.5,
   author: 2.5,
   phoneticTitle: 2,
@@ -99,12 +101,14 @@ const toIndexDoc = (item: ItemDocType, tagsText: string): IndexedSearchDoc => {
   const title = normalizeForIndex(item.title || "");
   const author = normalizeForIndex(item.authorUsername || "");
   const textContent = normalizeForIndex(item.textContent || "").slice(0, 8000);
+  const ocrText = normalizeForIndex(item.ocrText || "").slice(0, 8000);
   const url = normalizeForIndex(item.url || "");
 
   return {
     id: item.id,
     title,
     textContent,
+    ocrText,
     url,
     author,
     tagsText: normalizeForIndex(tagsText).slice(0, 2000),
@@ -204,6 +208,7 @@ export class LocalSearchIndexService {
         index: [
           { field: "title", tokenize: "forward", resolution: 9 },
           { field: "textContent", tokenize: "forward", resolution: 4 },
+          { field: "ocrText", tokenize: "forward", resolution: 5 },
           { field: "url", tokenize: "forward", resolution: 5 },
           { field: "author", tokenize: "forward", resolution: 6 },
           { field: "tagsText", tokenize: "forward", resolution: 7 },

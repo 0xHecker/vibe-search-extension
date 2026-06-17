@@ -4,6 +4,7 @@ import { PlusLargeIcon } from "@icons/plus-large";
 import { Input } from "@components/ui/input";
 import { cn } from "@src/lib/utils";
 import { resolveToastErrorMessage, withToast } from "@src/utils/toast-feedback";
+import { inferSource } from "@src/utils/infer-source";
 
 export const AddTabButton = ({ folderId }: { folderId: string }) => {
   const [isExpanded, setIsExpanded] = useState(false);
@@ -37,7 +38,7 @@ export const AddTabButton = ({ folderId }: { folderId: string }) => {
               folderId,
               url: trimmed,
               userId: "user1",
-              source: "web",
+              source: inferSource(trimmed),
             },
           });
           if (response?.success === false || response?.payload?.success === false) {

@@ -38,6 +38,10 @@
     }
   ],
   "content_security_policy": {
-    "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'; worker-src 'self'; connect-src 'self' https://huggingface.co https://cas-bridge.xethub.hf.co https://cdn.jsdelivr.net https://meta.vibesearch.app"
+    "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'; worker-src 'self'; connect-src 'self' https://huggingface.co https://cas-bridge.xethub.hf.co https://cdn.jsdelivr.net https://metadata-worker.watermelons.workers.dev https://meta.vibesearch.app https://bucket.vibesearch.app https://preview-bucket.vibesearch.app",
+    "sandbox": "sandbox allow-scripts; script-src 'self' 'unsafe-eval' 'wasm-unsafe-eval'; object-src 'self'; worker-src 'self' blob:; connect-src 'self' https://metadata-worker.watermelons.workers.dev https://bucket.vibesearch.app https://preview-bucket.vibesearch.app"
+  },
+  "sandbox": {
+    "pages": ["src/pages/ocr-sandbox/index.html"]
   }
 }

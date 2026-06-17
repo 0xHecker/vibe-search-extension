@@ -3,7 +3,17 @@ import { v4 as uuidv4 } from "uuid";
 import { Button } from "@src/components/ui/button";
 import { Input } from "@src/components/ui/input";
 import { Checkbox } from "@src/components/ui/checkbox";
-import { ArrowRight, Bookmark } from "lucide-react";
+import { ArrowRight, Bookmark, Globe } from "lucide-react";
+import { 
+  SiInstagram, 
+  SiX, 
+  SiYoutube, 
+  SiReddit, 
+  SiGithub, 
+  SiTiktok, 
+  SiMedium, 
+  SiSubstack 
+} from "react-icons/si";
 import {
   Card,
   CardContent,
@@ -20,6 +30,7 @@ import {
   SelectValue,
 } from "@src/components/ui/select";
 import type { ItemDocType } from "@src/schemas/item_schema";
+import { inferSource } from "@src/utils/infer-source";
 import type { FolderDocType } from "@src/schemas/folder_schema";
 
 type TabSaveScope =
@@ -128,6 +139,21 @@ const formatDraftTime = (value: number): string => {
     hour: "2-digit",
     minute: "2-digit",
   })}`;
+};
+
+const getSourceIcon = (source: ItemDocType["source"]) => {
+  const iconProps = { className: "size-3.5 shrink-0" };
+  switch (source) {
+    case "instagram": return <SiInstagram {...iconProps} />;
+    case "twitter": return <SiX {...iconProps} />;
+    case "youtube": return <SiYoutube {...iconProps} />;
+    case "reddit": return <SiReddit {...iconProps} />;
+    case "github": return <SiGithub {...iconProps} />;
+    case "tiktok": return <SiTiktok {...iconProps} />;
+    case "article": return <SiMedium {...iconProps} />;
+    case "substack": return <SiSubstack {...iconProps} />;
+    default: return <Globe {...iconProps} />;
+  }
 };
 
 const parseTagsInput = (value: string): string[] => {
@@ -519,6 +545,30 @@ const ImportEditor = ({ requestedDraftId }: { requestedDraftId: string | null })
                 </div>
               )}
 
+              {/* Preview card with thumbnail and source */}
+              {(draft.displayImageUrl || draft.source !== "web") && (
+                <div className="flex items-start gap-3 rounded-md border border-border-neutral-faded bg-background-neutral-faded p-2.5">
+                  {draft.displayImageUrl && (
+                    <img 
+                      src={draft.displayImageUrl} 
+                      alt="" 
+                      className="size-16 shrink-0 rounded object-cover"
+                    />
+                  )}
+                  <div className="flex min-w-0 flex-1 flex-col gap-1">
+                    <div className="flex items-center gap-1.5">
+                      {getSourceIcon(draft.source)}
+                      <span className="text-xs font-medium capitalize text-foreground-secondary">
+                        {draft.source === "twitter" ? "X" : draft.source}
+                      </span>
+                    </div>
+                    <p className="line-clamp-2 text-xs text-foreground-neutral">
+                      {draft.title || "Untitled"}
+                    </p>
+                  </div>
+                </div>
+              )}
+
               <div className="space-y-1">
                 <label className="text-xs text-foreground-secondary">Title</label>
                 <Input value={title} onChange={(event) => setTitle(event.target.value)} />
@@ -746,7 +796,7 @@ const SaveTabsPopup = () => {
             textContent: "",
             url: tab.url!,
             iconUrl: tab.favIconUrl || "",
-            source: "web" as const,
+            source: inferSource(tab.url!),
             folderId,
             spaceId,
             isFavorite: false,

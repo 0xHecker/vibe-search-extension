@@ -30,7 +30,7 @@ const recencyBoost = (updatedAt: number, createdAt: number, now: number): number
 const getItemSearchText = (item: RankableItem): string => {
   const mediaText = (item.mediaTypes || []).join(" ");
   return normalizeText(
-    [item.title, item.textContent, item.url, item.source, item.authorUsername, mediaText]
+    [item.title, item.textContent, item.ocrText, item.url, item.source, item.authorUsername, mediaText]
       .filter(Boolean)
       .join(" ")
   );
@@ -223,11 +223,13 @@ const fromCursor = (cursor: RankQueryCursor): RankedEntry => ({
     id: cursor.id,
     title: cursor.title || "",
     textContent: "",
+    ocrText: "",
     url: "",
     source: cursor.source,
     authorUsername: "",
     mediaTypes: [],
     vector_index: -1,
+    vector_indexes: [],
     createdAt: cursor.createdAt || 0,
     updatedAt: cursor.updatedAt || 0,
   },
@@ -270,6 +272,32 @@ const rank = (request: RankQueryWorkerRequest): RankQueryWorkerResult => {
       .sort((a, b) => b[1] - a[1])
       .map(([index], rank) => [index, rank + 1])
   );
+  const getVectorIndexes = (item: RankableItem): number[] => {
+    const fallback =
+      typeof item.vector_index === "number" && Number.isInteger(item.vector_index) && item.vector_index >= 0
+        ? item.vector_index
+        : -1;
+    const indexes = Array.isArray(item.vector_indexes) ? item.vector_indexes : [];
+    const normalized = indexes.filter((index): index is number => Number.isInteger(index) && index >= 0);
+    if (normalized.length === 0 && fallback >= 0) normalized.push(fallback);
+    return Array.from(new Set(normalized));
+  };
+  const getBestVectorHit = (item: RankableItem): { score: number; rank?: number; hasHit: boolean } => {
+    let bestScore = 0;
+    let bestRank: number | undefined;
+    let hasHit = false;
+    for (const index of getVectorIndexes(item)) {
+      if (!vectorScoresByIndex.has(index)) continue;
+      const score = vectorScoresByIndex.get(index) || 0;
+      const rank = vectorRankByIndex.get(index);
+      if (!hasHit || score > bestScore) {
+        bestScore = score;
+        bestRank = rank;
+        hasHit = true;
+      }
+    }
+    return { score: bestScore, rank: bestRank, hasHit };
+  };
 
   const ranked: RankedEntry[] = payload.items.map((item) => {
     let itemText = "";
@@ -301,17 +329,11 @@ const rank = (request: RankQueryWorkerRequest): RankQueryWorkerResult => {
         : boolMatch.matches
       : false;
 
-    const vectorScore =
-      typeof item.vector_index === "number" && item.vector_index > -1
-        ? vectorScoresByIndex.get(item.vector_index) || 0
-        : 0;
-    const hasVectorHit =
-      typeof item.vector_index === "number" && vectorScoresByIndex.has(item.vector_index);
+    const vectorHit = getBestVectorHit(item);
+    const vectorScore = vectorHit.score;
+    const hasVectorHit = vectorHit.hasHit;
     const lexicalRank = payload.useLexical ? lexicalRankById.get(item.id) : undefined;
-    const vectorRank =
-      payload.useVector && typeof item.vector_index === "number" && item.vector_index > -1
-        ? vectorRankByIndex.get(item.vector_index)
-        : undefined;
+    const vectorRank = payload.useVector ? vectorHit.rank : undefined;
 
     const normalizedTextScore = payload.useLexical
       ? lexicalScore > 0 && maxLexicalScore > 0

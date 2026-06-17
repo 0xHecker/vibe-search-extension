@@ -268,6 +268,7 @@ const Search = () => {
   const [tagsCatalog, setTagsCatalog] = useState<Array<{ id: string; name: string }>>([]);
   const [domainsCatalog, setDomainsCatalog] = useState<string[]>([]);
   const [authorsCatalog, setAuthorsCatalog] = useState<string[]>([]);
+  const [availableFilters, setAvailableFilters] = useState<string[]>([]);
   const [recentQueries, setRecentQueries] = useState<string[]>([]);
   const [processStatusById, setProcessStatusById] = useState<
     Record<string, SearchProcessStatusItem>
@@ -379,6 +380,11 @@ const Search = () => {
     if (requestedScope === "public") return "Public only";
     return activeSpace?.name || "Current space";
   }, [activeSpace?.name, requestedScope]);
+
+  // Quick-filter pills reflect the active space/scope; reset so stale types don't linger.
+  useEffect(() => {
+    setAvailableFilters([]);
+  }, [activeSpaceId, requestedScope]);
 
   const visibleFolders = useMemo(() => {
     const shouldUseResultDrivenFolders =
@@ -981,6 +987,15 @@ const Search = () => {
           return;
         }
 
+        if (action === "TRIGGER_OCR") {
+          await chrome.runtime.sendMessage({
+            type: "TRIGGER_OCR",
+            target: "offscreen",
+          });
+          showSuccessToast("Image OCR queued.", { id: retryToastId, tempo: "quick" });
+          return;
+        }
+
         if (action === "REBUILD_INDEX") {
           await chrome.runtime.sendMessage({
             service: "items",
@@ -1271,6 +1286,21 @@ const Search = () => {
         });
       }
 
+      const resultItems = payload.items || [];
+      const nextFilterTokens = unique([
+        ...resultItems.map((item) => `source:${item.source}`),
+        ...(resultItems.some((item) => item.isFavorite) ? ["is:favorite"] : []),
+        ...(resultItems.some((item) => item.media?.some((m) => m.type === "image"))
+          ? ["has:image"]
+          : []),
+      ]);
+      if (nextFilterTokens.length > 0) {
+        setAvailableFilters((prev) => {
+          const merged = unique([...prev, ...nextFilterTokens]);
+          return sameStringArray(prev, merged) ? prev : merged;
+        });
+      }
+
       if (isDebugSearchEnabled && diagnostics) {
         console.groupCollapsed(
           `[SearchDebug][${diagnostics.queryHash}] "${freeText || "<empty>"}" (${mode})`
@@ -1519,7 +1549,14 @@ const Search = () => {
   };
 
   return (
-    <div id="search-results" data-theme={theme} className="min-h-dvh bg-background-page relative">
+    <div
+      id="search-results"
+      data-theme={theme}
+      className={cn(
+        "min-h-dvh bg-background-page relative transition-[padding] duration-400 ease-in-out",
+        isOpen && "md:pl-[272px] 2xl:pl-0"
+      )}
+    >
       <div
         className={cn(
           "fixed top-28 h-[70%] z-50 transition-transform duration-400 ease-in-out peer/sidepanel",
@@ -1649,6 +1686,7 @@ const Search = () => {
           committedValue={queryText}
           onSubmit={handleSubmitQuery}
           catalogs={catalogs}
+          availableFilters={availableFilters}
           placeholder="Search anything…"
         />
         <div className="w-full max-w-5xl mx-auto mt-1 px-1 flex items-center justify-between gap-3">

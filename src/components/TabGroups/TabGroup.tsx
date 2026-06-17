@@ -37,6 +37,7 @@ import { ConfirmDialog } from "@components/ui/confirm-dialog";
 import { OpenInCurrent } from "@icons/open-in-current";
 import { OpenInTabgroup } from "@icons/open-in-tabgroup";
 import { OpenInWindow } from "@icons/open-in-window";
+import { RefreshCw, FolderInput, FolderPlus } from "lucide-react";
 import { SelectionProvider, useSelection } from "./SelectionContext";
 import { BulkActionsBar } from "./BulkActionsBar";
 import { useDroppable } from "@dnd-kit/core";
@@ -599,38 +600,31 @@ const TabGroupContent = ({
                   <OpenArrowIcon />
                 </div>
               </DropdownMenuTrigger>
-              <DropdownMenuContent sideOffset={8} className="min-w-[200px]">
-                <DropdownMenuItem
-                  className="flex items-center gap-2"
-                  onClick={handleOpenInCurrentWindow}
-                >
+              <DropdownMenuContent sideOffset={8} className="min-w-[210px]">
+                <DropdownMenuItem onClick={handleOpenInCurrentWindow}>
                   <OpenInCurrent />
                   <span>Open in current window</span>
                 </DropdownMenuItem>
-                <DropdownMenuItem
-                  className="flex items-center gap-2"
-                  onClick={handleOpenInNewTabGroup}
-                >
-                  <OpenInTabgroup size={20} />
+                <DropdownMenuItem onClick={handleOpenInNewTabGroup}>
+                  <OpenInTabgroup />
                   <span>Open in new tab group</span>
                 </DropdownMenuItem>
-                <DropdownMenuItem
-                  className="flex items-center gap-2"
-                  onClick={handleOpenInNewWindow}
-                >
-                  <OpenInWindow size={20} />
+                <DropdownMenuItem onClick={handleOpenInNewWindow}>
+                  <OpenInWindow />
                   <span>Open in new window</span>
                 </DropdownMenuItem>
-                <DropdownMenuItem
-                  className="flex items-center gap-2"
-                  onClick={handleRefreshAllMetadata}
-                >
+                <DropdownMenuSeparator />
+                <DropdownMenuItem onClick={handleRefreshAllMetadata}>
+                  <RefreshCw />
                   <span>Refresh all metadata</span>
                 </DropdownMenuItem>
                 {moveSpaceOptions.length > 0 && <DropdownMenuSeparator />}
                 {moveSpaceOptions.length > 0 && (
                   <DropdownMenuSub>
-                    <DropdownMenuSubTrigger>Move to space</DropdownMenuSubTrigger>
+                    <DropdownMenuSubTrigger>
+                      <FolderInput />
+                      <span>Move to space</span>
+                    </DropdownMenuSubTrigger>
                     <DropdownMenuSubContent className="min-w-[220px]">
                       {moveSpaceOptions.map((space) => {
                         const isLocked = space.isPrivate && !space.access?.isUnlocked;
@@ -652,7 +646,10 @@ const TabGroupContent = ({
                 )}
                 {moveSpaceOptions.length > 0 && (
                   <DropdownMenuSub>
-                    <DropdownMenuSubTrigger>Copy to space</DropdownMenuSubTrigger>
+                    <DropdownMenuSubTrigger>
+                      <FolderPlus />
+                      <span>Copy to space</span>
+                    </DropdownMenuSubTrigger>
                     <DropdownMenuSubContent className="min-w-[220px]">
                       {moveSpaceOptions.map((space) => {
                         const isLocked = space.isPrivate && !space.access?.isUnlocked;

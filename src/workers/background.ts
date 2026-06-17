@@ -4,6 +4,7 @@ import { PRIVATE_SPACE_ID, PUBLIC_SPACE_ID } from "@src/common/spaces";
 import type { ImportTargetSpace } from "@src/services/db-manager";
 import type { FolderDocType } from "@src/schemas/folder_schema";
 import type { ItemDocType } from "@src/schemas/item_schema";
+import { inferSource } from "@src/utils/infer-source";
 
 const SYNC_ALARM_NAME = "vector-sync-alarm";
 const EMBEDDING_ALARM_NAME = "embedding-alarm";
@@ -24,7 +25,10 @@ const SEARCH_ONLY_OFFSCREEN_METHODS = new Set<string>([
 ]);
 const INTERNAL_ONLY_OFFSCREEN_METHODS = new Set<string>(["items:saveFetchedMetadata"]);
 
-const IMPORT_MEDIA_ENDPOINT = "https://meta.vibesearch.app/import-media";
+const METADATA_WORKER_BASE_URL = "https://metadata-worker.watermelons.workers.dev";
+const LEGACY_METADATA_WORKER_BASE_URL = "https://meta.vibesearch.app";
+const IMPORT_MEDIA_ENDPOINT = `${METADATA_WORKER_BASE_URL}/import-media`;
+const LEGACY_IMPORT_MEDIA_ENDPOINT = `${LEGACY_METADATA_WORKER_BASE_URL}/import-media`;
 const IMPORT_MEDIA_UPLOAD_TOKEN = `${(import.meta as any)?.env?.VITE_IMPORT_MEDIA_UPLOAD_TOKEN || ""}`.trim();
 const IMPORT_SETTINGS_KEY = "vs_import_settings_v1";
 const IMPORT_DRAFTS_KEY = "vs_import_drafts_v1";
@@ -41,9 +45,19 @@ const IMPORT_CONTEXTS: [`${chrome.contextMenus.ContextType}`, ...`${chrome.conte
 ];
 const MENU_ROOT_ID = "vs:root";
 const MENU_OPEN_SEARCH_ID = "vs:open:search";
-const MENU_QUICK_SAVE_ID = "vs:quick:save";
-const MENU_QUICK_SHOT_ID = "vs:quick:shot";
+// Content-aware primary actions
+const MENU_SAVE_IMAGE_ID = "vs:save:image";
+const MENU_SAVE_VIDEO_ID = "vs:save:video";
+const MENU_SAVE_LINK_ID = "vs:save:link";
+const MENU_SAVE_SELECTION_ID = "vs:save:selection";
+const MENU_SAVE_PAGE_ID = "vs:save:page";
+const MENU_EXTRACT_TEXT_ID = "vs:extract:text";
+// Screenshot actions
+const MENU_SHOT_VISIBLE_ID = "vs:shot:visible";
+const MENU_SHOT_REGION_ID = "vs:shot:region";
+// Targeting submenus
 const MENU_SAVE_TARGETS_ID = "vs:targets:save";
+const MENU_EXTRACT_TARGETS_ID = "vs:targets:extract";
 const MENU_SHOT_TARGETS_ID = "vs:targets:shot";
 const MENU_MAX_SPACES = 6;
 const MENU_MAX_FOLDERS = 8;
@@ -51,15 +65,14 @@ const MENU_MAX_ITEMS = 2;
 const MENU_REFRESH_DEBOUNCE_MS = 180;
 const MENU_REFRESH_LOW_PRIORITY_DEBOUNCE_MS = 900;
 const MENU_REFRESH_MIN_INTERVAL_MS = 2500;
-const MAX_SCREENSHOT_IMAGES_PER_ITEM = 8;
-const SCREENSHOT_CAPTURE_PROMPT_SETTLE_DELAY_MS = 120;
-const SCREENSHOT_CAPTURE_FALLBACK_DELAY_MS = 900;
+
+
 const LOCAL_IMPORT_HOST = "local.vibesearch.invalid";
 const PROCESS_STATUS_HISTORY_MAX = 120;
 
 type OffscreenResponse<T> = { success?: boolean; payload?: T; error?: string };
-type ImportMode = "save" | "shot";
-type ImportTarget = { mode: ImportMode; spaceId?: string; folderId?: string; itemId?: string };
+type ImportMode = "save" | "shot" | "extract";
+type ImportTarget = { mode: ImportMode; spaceId?: string; folderId?: string; itemId?: string; screenshotMode?: "visible" | "region" };
 type ImportSettings = { reviewBeforeSave: boolean };
 type ImportRetryAction = "RETRY_IMPORT";
 type ImportClickContext = {
@@ -75,6 +88,14 @@ type ImportClickContext = {
   capturedAt: number;
 };
 type MediaUploadResponse = { url?: string | null; key?: string; error?: string };
+type ExtractImageTextResponse = {
+  status: "done" | "skipped" | "error";
+  text: string;
+  confidence?: number;
+  lineCount: number;
+  sourceHash: string;
+  error?: string;
+};
 type SaveContentKind = "default" | "text-only" | "image-only";
 type ImageDomMetadata = {
   pageTitle: string;
@@ -95,25 +116,16 @@ type PreparedImportContent = {
   iconUrl?: string;
   displayImageUrl?: string;
   media?: ItemDocType["media"];
+  ocrText?: string;
+  ocrStatus?: ItemDocType["ocrStatus"];
+  ocrConfidence?: number;
+  ocrLineCount?: number;
+  ocrSourceHash?: string;
   tags: string[];
   shouldFetchMetadata: boolean;
   isMetaFetched: boolean;
 };
-type ScreenshotPromptChoice = "full" | "region" | "cancel";
-type ScreenshotPromptAction = {
-  id: ScreenshotPromptChoice;
-  label: string;
-};
-type ScreenshotPromptRequest = {
-  heading: string;
-  body: string;
-  actions: ScreenshotPromptAction[];
-  fallbackConfirmAction?: "full" | "region";
-};
-type ScreenshotPromptResult = {
-  choice: ScreenshotPromptChoice;
-  method: "overlay" | "confirm" | "fallback-auto";
-};
+
 type ScreenshotRegionSelection = {
   x: number;
   y: number;
@@ -126,6 +138,17 @@ type ScreenshotRegionSelectionResult =
   | { status: "selected"; selection: ScreenshotRegionSelection }
   | { status: "cancelled" }
   | { status: "unavailable" };
+
+type ExtractedContent = {
+  canonicalUrl: string;
+  title: string;
+  author?: string;
+  description?: string;
+  thumbnailUrl?: string;
+  mediaUrls?: Array<{ url: string; type: "image" | "video" | "audio" }>;
+  platform: string;
+  timestamp?: number;
+};
 
 class ImportCancelledError extends Error {
   constructor(message: string) {
@@ -152,6 +175,11 @@ type ImportDraft = {
   iconUrl?: string;
   displayImageUrl?: string;
   media?: ItemDocType["media"];
+  ocrText?: string;
+  ocrStatus?: ItemDocType["ocrStatus"];
+  ocrConfidence?: number;
+  ocrLineCount?: number;
+  ocrSourceHash?: string;
   shouldFetchMetadata?: boolean;
   isMetaFetched?: boolean;
   context: ImportClickContext;
@@ -243,7 +271,7 @@ const normalizeSelectionText = (value: string): string => {
 const buildSyntheticImportUrl = (context: ImportClickContext, mode: ImportMode): string => {
   const host = pickHostLabel(context).replace(/[^a-z0-9-]/gi, "-").replace(/-+/g, "-").replace(/^-|-$/g, "");
   const safeHost = host || "capture";
-  const pathMode = mode === "shot" ? "screenshot" : "import";
+  const pathMode = mode === "shot" ? "screenshot" : mode === "extract" ? "image-text" : "import";
   return `https://${LOCAL_IMPORT_HOST}/${pathMode}/${safeHost}/${context.capturedAt}`;
 };
 const getHostname = (url: string | null | undefined): string | null => {
@@ -277,21 +305,8 @@ const pickHostLabel = (context: ImportClickContext) =>
     .replace(/^www\./, "");
 const autoFolderName = (context: ImportClickContext, mode: ImportMode) => {
   const day = new Date(context.capturedAt).toISOString().slice(0, 10);
-  return trimText(`${mode === "shot" ? "Screenshots" : "Imports"} · ${pickHostLabel(context)} · ${day}`, 80);
-};
-const inferSource = (url: string | null): ItemDocType["source"] => {
-  const host = getHostname(url);
-  if (!host) return "web";
-  if (host.includes("x.com") || host.includes("twitter.com")) return "twitter";
-  if (host.includes("reddit.com")) return "reddit";
-  if (host.includes("youtube.com") || host.includes("youtu.be")) return "youtube";
-  if (host.includes("instagram.com")) return "instagram";
-  if (host.includes("tiktok.com")) return "tiktok";
-  if (host.includes("substack.com")) return "substack";
-  if (host.includes("linkedin.com")) return "linkedin";
-  if (host.includes("github.com")) return "github";
-  if (host.includes("medium.com") || host.includes("dev.to")) return "article";
-  return "web";
+  const label = mode === "shot" ? "Screenshots" : mode === "extract" ? "Image text" : "Imports";
+  return trimText(`${label} · ${pickHostLabel(context)} · ${day}`, 80);
 };
 const looksLikeMediaUrl = (url: string | null) =>
   !!url &&
@@ -349,7 +364,7 @@ const listRecentProcessStatuses = (max = 24): ProcessStatusRecord[] =>
     .slice(0, Math.max(1, Math.min(200, max)));
 const createImportJob = (mode: ImportMode, context: ImportClickContext) => ({
   id: `import-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-  label: `${mode === "shot" ? "Screenshot" : "Import"} • ${pickHostLabel(context)}`,
+  label: `${mode === "shot" ? "Screenshot" : mode === "extract" ? "Extract text" : "Import"} • ${pickHostLabel(context)}`,
 });
 
 const getStorageValue = async <T>(key: string, fallback: T): Promise<T> => {
@@ -443,25 +458,43 @@ const sendForwardedToOffscreen = async <T = unknown>(request: {
   return response.payload as T;
 };
 
+const postImportMedia = async (init: RequestInit, label: string): Promise<MediaUploadResponse> => {
+  let lastError = "";
+  for (const endpoint of [IMPORT_MEDIA_ENDPOINT, LEGACY_IMPORT_MEDIA_ENDPOINT]) {
+    try {
+      const response = await fetch(endpoint, init);
+      const payload = (await response.json().catch(() => ({}))) as MediaUploadResponse;
+      if (response.ok) return payload;
+      lastError = payload.error || `${label} failed (${response.status})`;
+    } catch (error) {
+      lastError = error instanceof Error ? error.message : String(error);
+    }
+  }
+  throw new Error(lastError || `${label} failed`);
+};
+
 const postImportMediaJson = async (body: Record<string, unknown>) => {
-  const headers = buildImportUploadHeaders("application/json");
-  const response = await fetch(IMPORT_MEDIA_ENDPOINT, {
-    method: "POST",
-    headers,
-    body: JSON.stringify(body),
-  });
-  const payload = (await response.json().catch(() => ({}))) as MediaUploadResponse;
-  if (!response.ok) throw new Error(payload.error || `Media upload failed (${response.status})`);
-  return { ...payload, url: payload.url || (payload.key ? `https://bucket.vibesearch.app/${payload.key}` : null) };
+  const payload = await postImportMedia(
+    {
+      method: "POST",
+      headers: buildImportUploadHeaders("application/json"),
+      body: JSON.stringify(body),
+    },
+    "Media upload"
+  );
+  return { ...payload, url: resolveUploadedMediaUrl(payload) };
 };
 const postImportMediaBinary = async (blob: Blob, sourcePageUrl?: string | null, fileName?: string) => {
   const headers = buildImportUploadHeaders(blob.type || "image/png");
   if (sourcePageUrl) headers.set("X-VS-Source-Url", sourcePageUrl);
   if (fileName) headers.set("X-VS-File-Name", fileName);
-  const response = await fetch(IMPORT_MEDIA_ENDPOINT, { method: "POST", headers, body: blob });
-  const payload = (await response.json().catch(() => ({}))) as MediaUploadResponse;
-  if (!response.ok) throw new Error(payload.error || `Binary upload failed (${response.status})`);
-  return { ...payload, url: payload.url || (payload.key ? `https://bucket.vibesearch.app/${payload.key}` : null) };
+  const payload = await postImportMedia({ method: "POST", headers, body: blob }, "Binary upload");
+  return { ...payload, url: resolveUploadedMediaUrl(payload) };
+};
+
+const resolveUploadedMediaUrl = (payload: MediaUploadResponse): string | null => {
+  if (payload.key) return `${METADATA_WORKER_BASE_URL}/r2/${encodeURIComponent(payload.key)}`;
+  return payload.url || null;
 };
 
 const captureVisibleTabPng = async (tab?: chrome.tabs.Tab) =>
@@ -475,9 +508,9 @@ const captureVisibleTabPng = async (tab?: chrome.tabs.Tab) =>
     else chrome.tabs.captureVisibleTab({ format: "png" }, callback);
   });
 const parseTargetFromMenuId = (menuId: string): ImportTarget | null => {
-  const bySpace = /^vs:(save|shot):space:([^:]+)$/i.exec(menuId);
+  const bySpace = /^vs:(save|shot|extract):space:([^:]+)$/i.exec(menuId);
   if (bySpace) return { mode: bySpace[1] as ImportMode, spaceId: bySpace[2] };
-  const byFolder = /^vs:(save|shot):folder:([^:]+)$/i.exec(menuId);
+  const byFolder = /^vs:(save|shot|extract):folder:([^:]+)$/i.exec(menuId);
   if (byFolder) return { mode: byFolder[1] as ImportMode, folderId: byFolder[2] };
   const byItem = /^vs:(save|shot):item:([^:]+):([^:]+)$/i.exec(menuId);
   if (byItem) return { mode: byItem[1] as ImportMode, folderId: byItem[2], itemId: byItem[3] };
@@ -499,10 +532,14 @@ const resolvePrimaryUrl = (context: ImportClickContext, mode: ImportMode) => {
   if (mode === "shot") {
     return context.pageUrl || context.tabUrl || context.linkUrl || context.mediaUrl || null;
   }
+  if (mode === "extract") {
+    return context.mediaUrl || context.linkUrl || context.pageUrl || context.frameUrl || context.tabUrl || null;
+  }
   return context.linkUrl || context.pageUrl || context.frameUrl || context.mediaUrl || context.tabUrl || null;
 };
 const createTitle = (context: ImportClickContext, mode: ImportMode, fallbackUrl: string) => {
   if (mode === "shot") return trimText(context.tabTitle ? `Screenshot · ${context.tabTitle}` : `Screenshot · ${fallbackUrl}`);
+  if (mode === "extract") return trimText(context.tabTitle ? `Image text · ${context.tabTitle}` : `Image text · ${fallbackUrl}`);
   if (context.selectionText) return trimText(context.selectionText.replace(/\s+/g, " "));
   if (context.tabTitle) return trimText(context.tabTitle);
   return trimText(fallbackUrl);
@@ -510,7 +547,7 @@ const createTitle = (context: ImportClickContext, mode: ImportMode, fallbackUrl:
 const contextText = (context: ImportClickContext, mode: ImportMode) => {
   const lines: string[] = [];
   if (context.selectionText) lines.push(context.selectionText, "");
-  lines.push(`Imported via: ${mode === "shot" ? "page-screenshot" : "context-menu"}`);
+  lines.push(`Imported via: ${mode === "shot" ? "page-screenshot" : mode === "extract" ? "image-ocr" : "context-menu"}`);
   lines.push(`Imported at: ${new Date(context.capturedAt).toISOString()}`);
   if (context.tabTitle) lines.push(`Tab: ${context.tabTitle}`);
   if (context.pageUrl) lines.push(`Page: ${context.pageUrl}`);
@@ -630,250 +667,199 @@ const executeScriptInTab = async <T>(
   }
 };
 
-const showCaptureToastInTab = async (
+const extractContentFromPage = async (
+  tab: chrome.tabs.Tab | undefined,
+  clickedUrl?: string
+): Promise<ExtractedContent | null> => {
+  if (!tab || typeof tab.id !== "number") return null;
+  
+  try {
+    // Inject a minimal universal extractor (OG meta + canonical link)
+    const result = await chrome.scripting.executeScript({
+      target: { tabId: tab.id },
+      func: (clickedUrl?: string) => {
+        const getMeta = (name: string): string | null => {
+          for (const sel of [`meta[property="${name}"]`, `meta[name="${name}"]`, `meta[property="og:${name}"]`, `meta[name="twitter:${name}"]`]) {
+            const el = document.querySelector(sel);
+            if (el) return el.getAttribute("content") || null;
+          }
+          return null;
+        };
+        const trim = (s: string | null | undefined, max = 500): string => {
+          const v = (s || "").trim();
+          return v.length <= max ? v : v.slice(0, max - 1) + "…";
+        };
+        const resolveUrl = (href: string | null | undefined): string | null => {
+          if (!href) return null;
+          try { return new URL(href, window.location.href).href; } catch { return null; }
+        };
+
+        const canonicalUrl = clickedUrl || getMeta("url") || document.querySelector('link[rel="canonical"]')?.getAttribute("href") || window.location.href;
+        const title = getMeta("title") || document.querySelector("h1")?.textContent?.trim() || document.title || "Saved page";
+        const description = getMeta("description");
+        const thumbnailUrl = resolveUrl(getMeta("image"));
+        const author = getMeta("author");
+
+        return {
+          canonicalUrl,
+          title: trim(title),
+          author: author ?? undefined,
+          description: trim(description, 300),
+          thumbnailUrl: thumbnailUrl ?? undefined,
+          platform: "web",
+        };
+      },
+      args: [clickedUrl],
+    });
+    
+    return (result?.[0]?.result as ExtractedContent | undefined) ?? null;
+  } catch {
+    return null;
+  }
+};
+
+const showBrandedToast = async (
   tab: chrome.tabs.Tab | undefined,
   message: string,
-  tone: "info" | "success" | "error" = "info"
+  actions?: Array<{ label: string; action: string; payload?: Record<string, unknown> }>,
+  duration = 4000
 ) => {
   await executeScriptInTab(
     tab,
-    (payload: { message: string; tone: "info" | "success" | "error" }) => {
+    (payload: {
+      message: string;
+      actions?: Array<{ label: string; action: string; payload?: Record<string, unknown> }>;
+      duration: number;
+    }) => {
       try {
-        const rootId = "__vibesearch_capture_toast_root__";
+        const TOKENS = {
+          bg: "#ffffff",
+          border: "#c6c6c6",
+          accent: "#ff4d4d",
+          accentFaded: "#ffe5e5",
+          text: "#212121",
+          shadow: "0px 20px 35px rgba(15, 23, 42, 0.18)",
+          radius: "10px",
+          radiusSm: "6px",
+          fontSans: '"Neutral Sans", ui-sans-serif, system-ui, sans-serif',
+        };
+
+        const rootId = "__vibesearch_toast_root__";
         let root = document.getElementById(rootId);
         if (!root) {
           root = document.createElement("div");
           root.id = rootId;
-          root.style.position = "fixed";
-          root.style.right = "14px";
-          root.style.bottom = "14px";
-          root.style.zIndex = "2147483647";
-          root.style.display = "flex";
-          root.style.flexDirection = "column";
-          root.style.gap = "8px";
-          root.style.pointerEvents = "none";
+          const shadow = root.attachShadow({ mode: "open" });
+          const container = document.createElement("div");
+          container.id = "container";
+          Object.assign(container.style, {
+            position: "fixed",
+            right: "16px",
+            bottom: "16px",
+            zIndex: "2147483647",
+            display: "flex",
+            flexDirection: "column",
+            gap: "10px",
+            pointerEvents: "none",
+            fontFamily: TOKENS.fontSans,
+          });
+          shadow.appendChild(container);
           document.documentElement.appendChild(root);
         }
+
+        const shadow = root.shadowRoot!;
+        const container = shadow.getElementById("container")!;
 
         const toast = document.createElement("div");
-        toast.style.maxWidth = "320px";
-        toast.style.padding = "9px 12px";
-        toast.style.borderRadius = "10px";
-        toast.style.fontFamily = "system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif";
-        toast.style.fontSize = "12px";
-        toast.style.fontWeight = "600";
-        toast.style.lineHeight = "1.35";
-        toast.style.pointerEvents = "none";
-        toast.style.boxShadow = "0 14px 26px rgba(2, 6, 23, 0.35)";
-        toast.style.border = "1px solid rgba(148, 163, 184, 0.45)";
-        if (payload.tone === "success") {
-          toast.style.background = "rgba(22, 163, 74, 0.9)";
-          toast.style.color = "#dcfce7";
-        } else if (payload.tone === "error") {
-          toast.style.background = "rgba(185, 28, 28, 0.92)";
-          toast.style.color = "#fee2e2";
-        } else {
-          toast.style.background = "rgba(15, 23, 42, 0.92)";
-          toast.style.color = "#e2e8f0";
-        }
-        toast.textContent = payload.message;
-        root.appendChild(toast);
-        window.setTimeout(() => {
-          toast.remove();
-          if (root && root.childElementCount === 0) {
-            root.remove();
+        Object.assign(toast.style, {
+          maxWidth: "380px",
+          minWidth: "280px",
+          padding: "12px 14px",
+          borderRadius: TOKENS.radius,
+          background: TOKENS.bg,
+          border: `1px solid ${TOKENS.border}`,
+          boxShadow: TOKENS.shadow,
+          display: "flex",
+          alignItems: "center",
+          gap: "12px",
+          pointerEvents: "auto",
+          fontSize: "13px",
+          lineHeight: "1.4",
+          color: TOKENS.text,
+          fontFamily: TOKENS.fontSans,
+        });
+
+        const messageEl = document.createElement("div");
+        messageEl.textContent = payload.message;
+        Object.assign(messageEl.style, { flex: "1", fontWeight: "500" });
+        toast.appendChild(messageEl);
+
+        if (payload.actions && payload.actions.length > 0) {
+          const actionsRow = document.createElement("div");
+          Object.assign(actionsRow.style, {
+            display: "flex",
+            gap: "8px",
+            alignItems: "center",
+          });
+
+          for (const action of payload.actions) {
+            const btn = document.createElement("button");
+            btn.type = "button";
+            btn.textContent = action.label;
+            Object.assign(btn.style, {
+              padding: "5px 10px",
+              borderRadius: TOKENS.radiusSm,
+              border: `1px solid ${TOKENS.accent}`,
+              background: "transparent",
+              color: TOKENS.accent,
+              fontSize: "12px",
+              fontWeight: "600",
+              cursor: "pointer",
+              fontFamily: TOKENS.fontSans,
+              transition: "all 150ms",
+            });
+            btn.addEventListener("mouseenter", () => {
+              btn.style.background = TOKENS.accentFaded;
+            });
+            btn.addEventListener("mouseleave", () => {
+              btn.style.background = "transparent";
+            });
+            btn.addEventListener("click", () => {
+              if (action.action === "UNDO_SAVE") {
+                chrome.runtime.sendMessage({
+                  target: "background",
+                  type: "UNDO_SAVE",
+                  payload: action.payload,
+                });
+              } else if (action.action === "OPEN_SEARCH") {
+                chrome.runtime.sendMessage({
+                  target: "background",
+                  type: "OPEN_SEARCH",
+                });
+              }
+              toast.remove();
+              if (container.childElementCount === 0) root!.remove();
+            });
+            actionsRow.appendChild(btn);
           }
-        }, 2200);
+
+          toast.appendChild(actionsRow);
+        }
+
+        container.appendChild(toast);
+
+        if (payload.duration > 0) {
+          setTimeout(() => {
+            toast.remove();
+            if (container.childElementCount === 0) root!.remove();
+          }, payload.duration);
+        }
       } catch {}
     },
-    [{ message, tone }]
+    [{ message, actions, duration }]
   );
 };
 
-const pickPromptFallbackAction = (request: ScreenshotPromptRequest): "full" | "region" => {
-  if (request.fallbackConfirmAction === "region") {
-    return "region";
-  }
-  if (request.actions.some((action) => action.id === "full")) {
-    return "full";
-  }
-  if (request.actions.some((action) => action.id === "region")) {
-    return "region";
-  }
-  return "full";
-};
-
-const promptScreenshotCapture = async (
-  tab: chrome.tabs.Tab | undefined,
-  request: ScreenshotPromptRequest
-): Promise<ScreenshotPromptResult> => {
-  const overlayResult = await executeScriptInTab<ScreenshotPromptChoice | null>(
-    tab,
-    (payload: ScreenshotPromptRequest) => {
-      try {
-        return new Promise<ScreenshotPromptChoice>((resolve) => {
-          const rootId = "__vibesearch_screenshot_prompt__";
-          const existing = document.getElementById(rootId);
-          if (existing) existing.remove();
-
-          const root = document.createElement("div");
-          root.id = rootId;
-          root.style.position = "fixed";
-          root.style.top = "14px";
-          root.style.right = "14px";
-          root.style.zIndex = "2147483647";
-          root.style.pointerEvents = "none";
-
-          const panel = document.createElement("div");
-          panel.style.pointerEvents = "auto";
-          panel.style.maxWidth = "360px";
-          panel.style.minWidth = "280px";
-          panel.style.padding = "12px";
-          panel.style.borderRadius = "12px";
-          panel.style.border = "1px solid rgba(148, 163, 184, 0.5)";
-          panel.style.background = "rgba(15, 23, 42, 0.95)";
-          panel.style.color = "#f8fafc";
-          panel.style.fontFamily = "system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif";
-          panel.style.boxShadow = "0 18px 36px rgba(2, 6, 23, 0.45)";
-
-          const heading = document.createElement("div");
-          heading.textContent = payload.heading || "Capture screenshot";
-          heading.style.fontSize = "14px";
-          heading.style.fontWeight = "700";
-          heading.style.marginBottom = "6px";
-
-          const body = document.createElement("div");
-          body.textContent = payload.body || "";
-          body.style.fontSize = "12px";
-          body.style.lineHeight = "1.4";
-          body.style.opacity = "0.95";
-          body.style.marginBottom = "10px";
-
-          const normalizedActions = Array.isArray(payload.actions)
-            ? payload.actions.filter((action) => !!action && typeof action.id === "string" && typeof action.label === "string")
-            : [];
-          if (normalizedActions.length === 0) {
-            normalizedActions.push(
-              { id: "full", label: "Full tab" },
-              { id: "region", label: "Select area" },
-              { id: "cancel", label: "Cancel" }
-            );
-          }
-          const preferredConfirmChoice =
-            normalizedActions.find((action) => action.id === "full")?.id ||
-            normalizedActions.find((action) => action.id === "region")?.id ||
-            normalizedActions[0]?.id ||
-            "full";
-          const cancelChoice =
-            normalizedActions.find((action) => action.id === "cancel")?.id || preferredConfirmChoice;
-
-          const actionRow = document.createElement("div");
-          actionRow.style.display = "flex";
-          actionRow.style.flexWrap = "wrap";
-          actionRow.style.gap = "8px";
-          actionRow.style.justifyContent = "flex-end";
-
-          for (const action of normalizedActions) {
-            const button = document.createElement("button");
-            button.type = "button";
-            button.textContent = action.label;
-            button.style.borderRadius = "8px";
-            button.style.padding = "6px 10px";
-            button.style.fontSize = "12px";
-            button.style.fontWeight = action.id === preferredConfirmChoice ? "700" : "600";
-            button.style.cursor = "pointer";
-            if (action.id === "cancel") {
-              button.style.border = "1px solid rgba(148, 163, 184, 0.55)";
-              button.style.background = "transparent";
-              button.style.color = "#e2e8f0";
-            } else if (action.id === "region") {
-              button.style.border = "1px solid rgba(34, 197, 94, 0.75)";
-              button.style.background = "rgba(34, 197, 94, 0.18)";
-              button.style.color = "#dcfce7";
-            } else {
-              button.style.border = "1px solid rgba(14, 165, 233, 0.8)";
-              button.style.background = "#0ea5e9";
-              button.style.color = "#082f49";
-            }
-            button.addEventListener("click", () => clear(action.id));
-            actionRow.appendChild(button);
-          }
-
-          panel.appendChild(heading);
-          panel.appendChild(body);
-          panel.appendChild(actionRow);
-          root.appendChild(panel);
-          document.documentElement.appendChild(root);
-
-          let settled = false;
-          const clear = (choice: ScreenshotPromptChoice) => {
-            if (settled) return;
-            settled = true;
-            window.removeEventListener("keydown", onKeyDown, true);
-            root.remove();
-            resolve(choice);
-          };
-          const isTypingContext = () => {
-            const active = document.activeElement as HTMLElement | null;
-            if (!active) return false;
-            const tag = active.tagName;
-            return tag === "INPUT" || tag === "TEXTAREA" || active.isContentEditable;
-          };
-          const onKeyDown = (event: KeyboardEvent) => {
-            if (isTypingContext()) return;
-            if (event.key === "Escape") {
-              event.preventDefault();
-              clear(cancelChoice);
-              return;
-            }
-            if (event.key === "Enter") {
-              event.preventDefault();
-              clear(preferredConfirmChoice);
-              return;
-            }
-            if (event.key.toLowerCase() === "f") {
-              const fullChoice = normalizedActions.find((action) => action.id === "full")?.id;
-              if (fullChoice) {
-                event.preventDefault();
-                clear(fullChoice);
-              }
-              return;
-            }
-            if (event.key.toLowerCase() === "r") {
-              const regionChoice = normalizedActions.find((action) => action.id === "region")?.id;
-              if (regionChoice) {
-                event.preventDefault();
-                clear(regionChoice);
-              }
-            }
-          };
-          window.addEventListener("keydown", onKeyDown, true);
-        });
-      } catch {
-        return null;
-      }
-    },
-    [request]
-  );
-
-  if (overlayResult === "full" || overlayResult === "region" || overlayResult === "cancel") {
-    return { choice: overlayResult, method: "overlay" };
-  }
-
-  const fallbackAction = pickPromptFallbackAction(request);
-  const fallbackLabel = fallbackAction === "region" ? "Select area" : "Capture full tab";
-  const confirmMessage = [request.heading, "", request.body, "", `OK = ${fallbackLabel}, Cancel = Skip`].join("\n");
-  const confirmResult = await executeScriptInTab<boolean>(
-    tab,
-    (text: string) => window.confirm(text),
-    [confirmMessage]
-  );
-  if (confirmResult !== null) {
-    return { choice: confirmResult ? fallbackAction : "cancel", method: "confirm" };
-  }
-
-  return { choice: "full", method: "fallback-auto" };
-};
 
 const selectScreenshotRegion = async (
   tab: chrome.tabs.Tab | undefined
@@ -882,231 +868,179 @@ const selectScreenshotRegion = async (
     tab,
     () => {
       try {
-        return new Promise<ScreenshotRegionSelectionResult>((resolve) => {
-          const rootId = "__vibesearch_region_selector__";
+        return new Promise<{
+          status: "selected";
+          selection: {
+            x: number;
+            y: number;
+            width: number;
+            height: number;
+            viewportWidth: number;
+            viewportHeight: number;
+          };
+        } | { status: "cancelled" }>((resolve) => {
+          const TOKENS = {
+            bg: "#ffffff",
+            border: "#c6c6c6",
+            accent: "#ff4d4d",
+            text: "#212121",
+            shadow: "0px 20px 35px rgba(15, 23, 42, 0.18)",
+            radius: "10px",
+            fontSans: '"Neutral Sans", ui-sans-serif, system-ui, sans-serif',
+          };
+
+          const rootId = "__vibesearch_screenshot_selector__";
           const existing = document.getElementById(rootId);
           if (existing) existing.remove();
 
-          const clamp = (value: number, min: number, max: number) => {
-            if (Number.isNaN(value)) return min;
-            return Math.min(max, Math.max(min, value));
-          };
-
-          const viewportWidth = Math.max(1, Math.floor(window.innerWidth || document.documentElement.clientWidth || 1));
-          const viewportHeight = Math.max(1, Math.floor(window.innerHeight || document.documentElement.clientHeight || 1));
-          const minimumSize = 12;
-
           const root = document.createElement("div");
           root.id = rootId;
-          root.style.position = "fixed";
-          root.style.inset = "0";
-          root.style.zIndex = "2147483647";
-          root.style.cursor = "crosshair";
-          root.style.userSelect = "none";
-          root.style.background = "rgba(2, 6, 23, 0.30)";
-          root.style.pointerEvents = "auto";
+          const shadow = root.attachShadow({ mode: "open" });
 
-          const marquee = document.createElement("div");
-          marquee.style.position = "fixed";
-          marquee.style.border = "2px solid rgba(34, 197, 94, 0.95)";
-          marquee.style.background = "rgba(34, 197, 94, 0.16)";
-          marquee.style.boxShadow = "0 0 0 99999px rgba(2, 6, 23, 0.35)";
-          marquee.style.pointerEvents = "none";
-          marquee.style.display = "none";
-          root.appendChild(marquee);
+          // Scrim
+          const scrim = document.createElement("div");
+          Object.assign(scrim.style, {
+            position: "fixed",
+            top: "0",
+            left: "0",
+            width: "100%",
+            height: "100%",
+            background: "rgba(0, 0, 0, 0.4)",
+            zIndex: "2147483646",
+            cursor: "crosshair",
+          });
 
-          const panel = document.createElement("div");
-          panel.style.position = "fixed";
-          panel.style.top = "14px";
-          panel.style.left = "50%";
-          panel.style.transform = "translateX(-50%)";
-          panel.style.maxWidth = "560px";
-          panel.style.padding = "12px 14px";
-          panel.style.borderRadius = "12px";
-          panel.style.border = "1px solid rgba(148, 163, 184, 0.55)";
-          panel.style.background = "rgba(15, 23, 42, 0.96)";
-          panel.style.color = "#f8fafc";
-          panel.style.fontFamily = "system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif";
-          panel.style.boxShadow = "0 18px 36px rgba(2, 6, 23, 0.45)";
-          panel.style.pointerEvents = "auto";
+          // Selection box
+          const box = document.createElement("div");
+          Object.assign(box.style, {
+            position: "fixed",
+            border: `2px solid ${TOKENS.accent}`,
+            background: "rgba(255, 77, 77, 0.08)",
+            pointerEvents: "none",
+            display: "none",
+            zIndex: "2147483647",
+          });
 
-          const heading = document.createElement("div");
-          heading.textContent = "Select screenshot area";
-          heading.style.fontSize = "14px";
-          heading.style.fontWeight = "700";
-          heading.style.marginBottom = "4px";
-
+          // Hint
           const hint = document.createElement("div");
-          hint.textContent = "Drag to draw a selection. Press Enter to confirm, Esc to cancel.";
-          hint.style.fontSize = "12px";
-          hint.style.opacity = "0.9";
-          hint.style.marginBottom = "8px";
+          hint.textContent = "Drag to select \u2022 Enter to save \u2022 Esc to cancel";
+          Object.assign(hint.style, {
+            position: "fixed",
+            top: "20px",
+            left: "50%",
+            transform: "translateX(-50%)",
+            padding: "10px 16px",
+            borderRadius: TOKENS.radius,
+            background: TOKENS.bg,
+            border: `1px solid ${TOKENS.border}`,
+            boxShadow: TOKENS.shadow,
+            fontSize: "13px",
+            fontWeight: "500",
+            color: TOKENS.text,
+            fontFamily: TOKENS.fontSans,
+            zIndex: "2147483647",
+            pointerEvents: "none",
+          });
 
-          const sizeText = document.createElement("div");
-          sizeText.textContent = "Selection: none";
-          sizeText.style.fontSize = "12px";
-          sizeText.style.marginBottom = "10px";
-          sizeText.style.opacity = "0.92";
-
-          const actions = document.createElement("div");
-          actions.style.display = "flex";
-          actions.style.justifyContent = "flex-end";
-          actions.style.gap = "8px";
-
-          const cancelButton = document.createElement("button");
-          cancelButton.type = "button";
-          cancelButton.textContent = "Cancel";
-          cancelButton.style.border = "1px solid rgba(148, 163, 184, 0.55)";
-          cancelButton.style.borderRadius = "8px";
-          cancelButton.style.padding = "6px 10px";
-          cancelButton.style.background = "transparent";
-          cancelButton.style.color = "#e2e8f0";
-          cancelButton.style.fontSize = "12px";
-          cancelButton.style.fontWeight = "600";
-          cancelButton.style.cursor = "pointer";
-
-          const applyButton = document.createElement("button");
-          applyButton.type = "button";
-          applyButton.textContent = "Use selection";
-          applyButton.style.border = "1px solid rgba(34, 197, 94, 0.8)";
-          applyButton.style.borderRadius = "8px";
-          applyButton.style.padding = "6px 10px";
-          applyButton.style.background = "rgba(34, 197, 94, 0.2)";
-          applyButton.style.color = "#dcfce7";
-          applyButton.style.fontSize = "12px";
-          applyButton.style.fontWeight = "700";
-          applyButton.style.cursor = "pointer";
-          applyButton.disabled = true;
-          applyButton.style.opacity = "0.5";
-
-          actions.appendChild(cancelButton);
-          actions.appendChild(applyButton);
-          panel.appendChild(heading);
-          panel.appendChild(hint);
-          panel.appendChild(sizeText);
-          panel.appendChild(actions);
-          root.appendChild(panel);
+          shadow.appendChild(scrim);
+          shadow.appendChild(box);
+          shadow.appendChild(hint);
           document.documentElement.appendChild(root);
 
-          let isDragging = false;
           let startX = 0;
           let startY = 0;
-          let currentRect: { x: number; y: number; width: number; height: number } | null = null;
-          let settled = false;
+          let isDragging = false;
 
-          const hasValidSelection = () =>
-            !!currentRect && currentRect.width >= minimumSize && currentRect.height >= minimumSize;
-          const refreshUi = () => {
-            const valid = hasValidSelection();
-            applyButton.disabled = !valid;
-            applyButton.style.opacity = valid ? "1" : "0.5";
-            if (!currentRect || currentRect.width <= 0 || currentRect.height <= 0) {
-              sizeText.textContent = "Selection: none";
-              marquee.style.display = "none";
-              return;
-            }
-            sizeText.textContent = `Selection: ${Math.round(currentRect.width)} x ${Math.round(currentRect.height)} px`;
-            marquee.style.display = "block";
-            marquee.style.left = `${currentRect.x}px`;
-            marquee.style.top = `${currentRect.y}px`;
-            marquee.style.width = `${currentRect.width}px`;
-            marquee.style.height = `${currentRect.height}px`;
-          };
-          const setRect = (sx: number, sy: number, ex: number, ey: number) => {
-            const x1 = clamp(sx, 0, viewportWidth);
-            const y1 = clamp(sy, 0, viewportHeight);
-            const x2 = clamp(ex, 0, viewportWidth);
-            const y2 = clamp(ey, 0, viewportHeight);
-            currentRect = {
-              x: Math.min(x1, x2),
-              y: Math.min(y1, y2),
-              width: Math.abs(x2 - x1),
-              height: Math.abs(y2 - y1),
-            };
-            refreshUi();
-          };
-          const cleanup = () => {
-            window.removeEventListener("mousemove", onMouseMove, true);
-            window.removeEventListener("mouseup", onMouseUp, true);
+          const cleanup = (
+            selection: {
+              x: number;
+              y: number;
+              width: number;
+              height: number;
+              viewportWidth: number;
+              viewportHeight: number;
+            } | null
+          ) => {
             window.removeEventListener("keydown", onKeyDown, true);
             root.remove();
-          };
-          const settle = (result: ScreenshotRegionSelectionResult) => {
-            if (settled) return;
-            settled = true;
-            cleanup();
-            resolve(result);
-          };
-          const onMouseMove = (event: MouseEvent) => {
-            if (!isDragging) return;
-            event.preventDefault();
-            setRect(startX, startY, event.clientX, event.clientY);
-          };
-          const onMouseUp = (event: MouseEvent) => {
-            if (!isDragging) return;
-            event.preventDefault();
-            isDragging = false;
-            setRect(startX, startY, event.clientX, event.clientY);
-          };
-          const onKeyDown = (event: KeyboardEvent) => {
-            if (event.key === "Escape") {
-              event.preventDefault();
-              settle({ status: "cancelled" });
-              return;
-            }
-            if (event.key === "Enter" && hasValidSelection()) {
-              event.preventDefault();
-              settle({
-                status: "selected",
-                selection: {
-                  x: currentRect!.x,
-                  y: currentRect!.y,
-                  width: currentRect!.width,
-                  height: currentRect!.height,
-                  viewportWidth,
-                  viewportHeight,
-                },
-              });
+            if (selection) {
+              resolve({ status: "selected", selection });
+            } else {
+              resolve({ status: "cancelled" });
             }
           };
 
-          root.addEventListener(
-            "mousedown",
-            (event) => {
-              if (event.button !== 0) return;
-              const target = event.target as Node | null;
-              if (target && panel.contains(target)) return;
-              event.preventDefault();
-              isDragging = true;
-              startX = clamp(event.clientX, 0, viewportWidth);
-              startY = clamp(event.clientY, 0, viewportHeight);
-              setRect(startX, startY, startX, startY);
-            },
-            true
-          );
-          window.addEventListener("mousemove", onMouseMove, true);
-          window.addEventListener("mouseup", onMouseUp, true);
+          const onMouseDown = (e: MouseEvent) => {
+            startX = e.clientX;
+            startY = e.clientY;
+            isDragging = true;
+            box.style.display = "block";
+            box.style.left = `${startX}px`;
+            box.style.top = `${startY}px`;
+            box.style.width = "0";
+            box.style.height = "0";
+          };
+
+          const onMouseMove = (e: MouseEvent) => {
+            if (!isDragging) return;
+            const x = Math.min(startX, e.clientX);
+            const y = Math.min(startY, e.clientY);
+            const width = Math.abs(e.clientX - startX);
+            const height = Math.abs(e.clientY - startY);
+            box.style.left = `${x}px`;
+            box.style.top = `${y}px`;
+            box.style.width = `${width}px`;
+            box.style.height = `${height}px`;
+          };
+
+          const onMouseUp = (e: MouseEvent) => {
+            if (!isDragging) return;
+            isDragging = false;
+            const x = Math.min(startX, e.clientX);
+            const y = Math.min(startY, e.clientY);
+            const width = Math.abs(e.clientX - startX);
+            const height = Math.abs(e.clientY - startY);
+            if (width > 10 && height > 10) {
+              cleanup({
+                x,
+                y,
+                width,
+                height,
+                viewportWidth: window.innerWidth,
+                viewportHeight: window.innerHeight,
+              });
+            } else {
+              box.style.display = "none";
+            }
+          };
+
+          const onKeyDown = (e: KeyboardEvent) => {
+            if (e.key === "Escape") {
+              e.preventDefault();
+              cleanup(null);
+            } else if (e.key === "Enter" && box.style.display === "block") {
+              e.preventDefault();
+              const x = parseInt(box.style.left, 10);
+              const y = parseInt(box.style.top, 10);
+              const width = parseInt(box.style.width, 10);
+              const height = parseInt(box.style.height, 10);
+              if (width > 10 && height > 10) {
+                cleanup({
+                  x,
+                  y,
+                  width,
+                  height,
+                  viewportWidth: window.innerWidth,
+                  viewportHeight: window.innerHeight,
+                });
+              }
+            }
+          };
+
+          scrim.addEventListener("mousedown", onMouseDown);
+          scrim.addEventListener("mousemove", onMouseMove);
+          scrim.addEventListener("mouseup", onMouseUp);
           window.addEventListener("keydown", onKeyDown, true);
-          cancelButton.addEventListener("click", (event) => {
-            event.preventDefault();
-            settle({ status: "cancelled" });
-          });
-          applyButton.addEventListener("click", (event) => {
-            event.preventDefault();
-            if (!hasValidSelection()) return;
-            settle({
-              status: "selected",
-              selection: {
-                x: currentRect!.x,
-                y: currentRect!.y,
-                width: currentRect!.width,
-                height: currentRect!.height,
-                viewportWidth,
-                viewportHeight,
-              },
-            });
-          });
-          refreshUi();
         });
       } catch {
         return { status: "unavailable" } satisfies ScreenshotRegionSelectionResult;
@@ -1138,19 +1072,6 @@ const selectScreenshotRegion = async (
     return result;
   }
   return { status: "unavailable" };
-};
-
-const wait = async (ms: number) =>
-  await new Promise<void>((resolve) => {
-    setTimeout(resolve, ms);
-  });
-
-const waitForScreenshotPromptSettle = async (promptResult: ScreenshotPromptResult) => {
-  const delayMs =
-    promptResult.method === "fallback-auto"
-      ? SCREENSHOT_CAPTURE_FALLBACK_DELAY_MS
-      : SCREENSHOT_CAPTURE_PROMPT_SETTLE_DELAY_MS;
-  await wait(delayMs);
 };
 
 const resolveSaveContentKind = (context: ImportClickContext): SaveContentKind => {
@@ -1359,62 +1280,92 @@ const buildImageOnlyContent = async (
   };
 };
 
-const captureScreenshotMedia = async (
+const buildExtractedImageTextContent = async (
   context: ImportClickContext,
   tab: chrome.tabs.Tab | undefined,
   job: { id: string; label: string }
-): Promise<{ media?: ItemDocType["media"]; displayImageUrl?: string }> => {
-  const initialPrompt = await promptScreenshotCapture(
-    tab,
-    {
-      heading: "Capture screenshot",
-      body: "Choose capture mode: full tab or selected area. Press Enter for full tab or Esc to cancel.",
-      actions: [
-        { id: "full", label: "Full tab" },
-        { id: "region", label: "Select area" },
-        { id: "cancel", label: "Cancel" },
-      ],
-      fallbackConfirmAction: "full",
-    }
-  );
-  if (initialPrompt.choice === "cancel") {
-    throw new ImportCancelledError("Screenshot capture cancelled.");
+): Promise<PreparedImportContent> => {
+  const mediaUrl =
+    context.mediaUrl || (!context.mediaUrl && looksLikeMediaUrl(context.linkUrl) ? context.linkUrl : null);
+  if (!mediaUrl || resolveMediaType(context.mediaType, mediaUrl) !== "image") {
+    throw new Error("No image found for text extraction.");
   }
-  let captureChoice: Exclude<ScreenshotPromptChoice, "cancel"> =
-    initialPrompt.choice === "region" ? "region" : "full";
-  if (initialPrompt.method === "fallback-auto") {
-    sendProcessStatus(
-      job.id,
-      job.label,
-      "processing",
-      "Capture prompt unavailable here. Using full-tab capture."
-    );
-  }
-  await waitForScreenshotPromptSettle(initialPrompt);
 
-  const uploads: string[] = [];
-  let sequence = 0;
-  while (sequence < MAX_SCREENSHOT_IMAGES_PER_ITEM) {
-    let regionSelection: ScreenshotRegionSelection | undefined;
-    if (captureChoice === "region") {
-      if (typeof OffscreenCanvas === "undefined" || typeof createImageBitmap === "undefined") {
-        sendProcessStatus(
-          job.id,
-          job.label,
-          "processing",
-          "Area crop is not available in this browser context. Capturing full tab instead."
-        );
-        captureChoice = "full";
-      }
-    }
-    if (captureChoice === "region") {
+  const domMeta = await fetchImageDomMetadata(tab, mediaUrl);
+  const pageUrl = normalizeHttpUrl(domMeta?.pageUrl || null) || context.pageUrl || context.tabUrl || null;
+  const source = inferSource(pageUrl || mediaUrl);
+
+  sendProcessStatus(job.id, job.label, "processing", "Running OCR...");
+  const result = await sendForwardedToOffscreen<ExtractImageTextResponse>({
+    service: "ocr",
+    type: "extractImageText",
+    payload: { url: mediaUrl },
+  });
+  if (result.status !== "done" || !result.text.trim()) {
+    throw new Error(result.error || "No readable text found in image.");
+  }
+
+  const text = trimMultilineText(result.text, 12000);
+  const firstLine = text.split(/\n+/).find((line) => line.trim()) || "";
+  const titleSeed =
+    firstLine ||
+    domMeta?.altText ||
+    domMeta?.titleText ||
+    domMeta?.ariaLabel ||
+    getFileNameFromUrl(mediaUrl);
+  const metadataLines = [
+    "",
+    "Image metadata:",
+    domMeta?.altText ? `Alt: ${domMeta.altText}` : "",
+    domMeta?.titleText ? `Title: ${domMeta.titleText}` : "",
+    domMeta?.siteName ? `Site: ${domMeta.siteName}` : "",
+    domMeta?.pageTitle ? `Page title: ${domMeta.pageTitle}` : "",
+    pageUrl ? `Page URL: ${pageUrl}` : "",
+    `Image URL: ${mediaUrl}`,
+    domMeta?.width && domMeta?.height ? `Dimensions: ${domMeta.width}x${domMeta.height}` : "",
+    result.lineCount ? `OCR lines: ${result.lineCount}` : "",
+    typeof result.confidence === "number" ? `OCR confidence: ${Math.round(result.confidence * 100)}%` : "",
+    `Extracted at: ${new Date(context.capturedAt).toISOString()}`,
+  ].filter(Boolean);
+
+  return {
+    primaryUrl: mediaUrl,
+    title: trimText(`Image text · ${titleSeed}`, 80),
+    textContent: trimMultilineText([text, ...metadataLines].join("\n"), 16000),
+    source,
+    iconUrl: normalizeIconUrl(domMeta?.faviconUrl || null) || context.tabFavIconUrl || undefined,
+    ocrText: text,
+    ocrStatus: "done",
+    ocrConfidence: result.confidence,
+    ocrLineCount: result.lineCount,
+    ocrSourceHash: result.sourceHash,
+    tags: uniqueList([source !== "web" ? source : "", "image-text", "ocr", pickHostLabel(context)]),
+    shouldFetchMetadata: false,
+    isMetaFetched: true,
+  };
+};
+
+const captureScreenshotMedia = async (
+  context: ImportClickContext,
+  tab: chrome.tabs.Tab | undefined,
+  job: { id: string; label: string },
+  mode: "visible" | "region" = "visible"
+): Promise<{ media?: ItemDocType["media"]; displayImageUrl?: string }> => {
+  let regionSelection: ScreenshotRegionSelection | undefined;
+
+  if (mode === "region") {
+    if (typeof OffscreenCanvas === "undefined" || typeof createImageBitmap === "undefined") {
+      sendProcessStatus(
+        job.id,
+        job.label,
+        "processing",
+        "Area crop is not available in this browser context. Capturing full tab instead."
+      );
+    } else {
       sendProcessStatus(job.id, job.label, "processing", "Select an area to capture...");
       const regionResult = await selectScreenshotRegion(tab);
       if (regionResult.status === "cancelled") {
-        if (sequence === 0) {
-          throw new ImportCancelledError("Screenshot area selection cancelled.");
-        }
-        break;
+        throw new ImportCancelledError("Screenshot area selection cancelled.");
       }
       if (regionResult.status === "selected") {
         regionSelection = regionResult.selection;
@@ -1425,120 +1376,51 @@ const captureScreenshotMedia = async (
           "processing",
           "Area selection is unavailable on this page. Capturing full tab instead."
         );
-        captureChoice = "full";
       }
     }
-
-    sendProcessStatus(
-      job.id,
-      job.label,
-      "processing",
-      sequence === 0 ? "Capturing screenshot..." : `Capturing screenshot ${sequence + 1}...`
-    );
-    let upload: MediaUploadResponse;
-    try {
-      upload = await uploadScreenshot(
-        context,
-        tab,
-        sequence,
-        regionSelection,
-        async () => {
-          sendProcessStatus(
-            job.id,
-            job.label,
-            "processing",
-            sequence === 0
-              ? "Screenshot captured. Uploading..."
-              : `Screenshot ${sequence + 1} captured. Uploading...`
-          );
-          await showCaptureToastInTab(
-            tab,
-            sequence === 0 ? "Screenshot captured. Uploading..." : `Screenshot ${sequence + 1} captured.`,
-            "success"
-          );
-        }
-      );
-    } catch (error) {
-      const detail = error instanceof Error ? error.message : "Screenshot capture failed.";
-      await showCaptureToastInTab(tab, detail, "error");
-      throw error;
-    }
-    if (upload.url) {
-      uploads.push(upload.url);
-      sendProcessStatus(
-        job.id,
-        job.label,
-        "processing",
-        sequence === 0 ? "Screenshot uploaded." : `Screenshot ${sequence + 1} uploaded.`
-      );
-    }
-    sequence += 1;
-
-    if (sequence >= MAX_SCREENSHOT_IMAGES_PER_ITEM) {
-      break;
-    }
-    const continuePrompt = await promptScreenshotCapture(
-      tab,
-      {
-        heading: "Screenshot saved",
-        body: "Capture another screenshot for the same item?",
-        actions: [
-          { id: "full", label: "Full tab" },
-          { id: "region", label: "Select area" },
-          { id: "cancel", label: "Finish" },
-        ],
-        fallbackConfirmAction: "full",
-      }
-    );
-    if (continuePrompt.choice === "cancel") {
-      break;
-    }
-    captureChoice = continuePrompt.choice === "region" ? "region" : "full";
-    if (continuePrompt.method === "fallback-auto") {
-      sendProcessStatus(
-        job.id,
-        job.label,
-        "processing",
-        "Capture prompt unavailable here. Using full-tab capture for next screenshot."
-      );
-    }
-    await waitForScreenshotPromptSettle(continuePrompt);
   }
 
-  if (uploads.length === 0) {
+  sendProcessStatus(job.id, job.label, "processing", "Capturing screenshot...");
+  let upload: MediaUploadResponse;
+  try {
+    upload = await uploadScreenshot(
+      context,
+      tab,
+      0,
+      regionSelection,
+      async () => {
+        sendProcessStatus(job.id, job.label, "processing", "Screenshot captured. Uploading...");
+        await showBrandedToast(tab, "Screenshot captured. Uploading...");
+      }
+    );
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : "Screenshot capture failed.";
+    await showBrandedToast(tab, detail);
+    throw error;
+  }
+
+  if (!upload.url) {
     throw new Error("Screenshot upload failed. Nothing was captured.");
   }
-  sendProcessStatus(
-    job.id,
-    job.label,
-    "processing",
-    uploads.length === 1 ? "1 screenshot attached to import." : `${uploads.length} screenshots attached to import.`
-  );
-  await showCaptureToastInTab(
-    tab,
-    uploads.length === 1
-      ? "Screenshot saved to import."
-      : `${uploads.length} screenshots saved to import.`,
-    "success"
-  );
+
+  sendProcessStatus(job.id, job.label, "processing", "Screenshot uploaded.");
 
   const sourcePage = context.pageUrl || context.tabUrl || "screenshot";
-  const media: ItemDocType["media"] = uploads.map((url, index) => ({
+  const media: ItemDocType["media"] = [{
     type: "image",
-    originalUrl: `${sourcePage}#screenshot-${index + 1}`,
+    originalUrl: `${sourcePage}#screenshot-1`,
     storageType: "s3",
-    s3Url: url,
+    s3Url: upload.url,
     pageUrl: context.pageUrl || context.tabUrl || undefined,
     pageTitle: context.tabTitle || undefined,
     faviconUrl: context.tabFavIconUrl || undefined,
-    capturedAt: context.capturedAt + index,
-  }));
+    capturedAt: context.capturedAt,
+  }];
   return {
     media,
-    displayImageUrl: uploads[0],
+    displayImageUrl: upload.url,
   };
 };
-
 const prepareImportContent = async (
   target: ImportTarget,
   context: ImportClickContext,
@@ -1548,7 +1430,7 @@ const prepareImportContent = async (
   if (target.mode === "shot") {
     const resolved = resolveSavePrimaryUrlOrFallback(context, "shot");
     const primaryUrl = resolved.url;
-    const screenshot = await captureScreenshotMedia(context, tab, job);
+    const screenshot = await captureScreenshotMedia(context, tab, job, target.screenshotMode || "visible");
     const source = inferSource(primaryUrl);
     return {
       primaryUrl,
@@ -1564,6 +1446,9 @@ const prepareImportContent = async (
     };
   }
 
+  // Extract platform-aware content (canonical URL, title, author, media)
+  const extracted = await extractContentFromPage(tab, context.linkUrl || context.pageUrl || undefined);
+
   const kind = resolveSaveContentKind(context);
   if (kind === "text-only") {
     const textOnly = buildTextOnlyContent(context);
@@ -1575,42 +1460,62 @@ const prepareImportContent = async (
   }
 
   const resolved = resolveSavePrimaryUrlOrFallback(context, "save");
-  const primaryUrl = resolved.url;
+  const primaryUrl = extracted?.canonicalUrl || resolved.url;
   const source = inferSource(primaryUrl);
   let media: ItemDocType["media"] | undefined;
   let displayImageUrl: string | undefined;
-  try {
-    const mediaResult = await uploadRemoteMediaIfPresent(context);
-    if (mediaResult.upload?.url && mediaResult.mediaType) {
-      media = [{
-        type: mediaResult.mediaType,
-        originalUrl: mediaResult.originalUrl || primaryUrl,
-        storageType: "s3",
-        s3Url: mediaResult.upload.url,
-      }];
-      if (mediaResult.mediaType === "image") displayImageUrl = mediaResult.upload.url || undefined;
+  
+  // Use extracted media if available
+  if (extracted?.mediaUrls && extracted.mediaUrls.length > 0) {
+    media = extracted.mediaUrls.slice(0, 4).map((m) => ({
+      type: m.type,
+      originalUrl: m.url,
+      storageType: "hotlink" as const,
+    }));
+    if (extracted.mediaUrls[0].type === "image") {
+      displayImageUrl = extracted.thumbnailUrl || extracted.mediaUrls[0].url;
     }
-  } catch (error) {
-    const detail = error instanceof Error ? error.message : "Media upload failed.";
-    sendProcessStatus(
-      job.id,
-      job.label,
-      "processing",
-      `Media upload failed (${detail}). Continuing without media preview.`
-    );
   }
+  
+  // Otherwise try to upload remote media from context
+  if (!media) {
+    try {
+      const mediaResult = await uploadRemoteMediaIfPresent(context);
+      if (mediaResult.upload?.url && mediaResult.mediaType) {
+        media = [{
+          type: mediaResult.mediaType,
+          originalUrl: mediaResult.originalUrl || primaryUrl,
+          storageType: "s3",
+          s3Url: mediaResult.upload.url,
+        }];
+        if (mediaResult.mediaType === "image") displayImageUrl = mediaResult.upload.url || undefined;
+      }
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : "Media upload failed.";
+      sendProcessStatus(
+        job.id,
+        job.label,
+        "processing",
+        `Media upload failed (${detail}). Continuing without media preview.`
+      );
+    }
+  }
+
+  // Use extracted content for title, description, author
+  const title = extracted?.title || createTitle(context, target.mode, primaryUrl);
+  const textContent = extracted?.description || contextText(context, target.mode);
 
   return {
     primaryUrl,
-    title: createTitle(context, target.mode, primaryUrl),
-    textContent: contextText(context, target.mode),
+    title,
+    textContent,
     source,
     iconUrl: context.tabFavIconUrl || undefined,
     displayImageUrl,
     media,
     tags: suggestedTags(context, source),
-    shouldFetchMetadata: !resolved.synthetic,
-    isMetaFetched: resolved.synthetic,
+    shouldFetchMetadata: !resolved.synthetic && !extracted,
+    isMetaFetched: resolved.synthetic || !!extracted,
   };
 };
 
@@ -1626,6 +1531,11 @@ const toItemPayload = (params: {
   iconUrl?: string;
   displayImageUrl?: string;
   media?: ItemDocType["media"];
+  ocrText?: string;
+  ocrStatus?: ItemDocType["ocrStatus"];
+  ocrConfidence?: number;
+  ocrLineCount?: number;
+  ocrSourceHash?: string;
   shouldFetchMetadata?: boolean;
   isMetaFetched?: boolean;
 }) => ({
@@ -1637,6 +1547,11 @@ const toItemPayload = (params: {
   iconUrl: params.iconUrl,
   displayImageUrl: params.displayImageUrl,
   media: params.media,
+  ocrText: params.ocrText,
+  ocrStatus: params.ocrStatus,
+  ocrConfidence: params.ocrConfidence,
+  ocrLineCount: params.ocrLineCount,
+  ocrSourceHash: params.ocrSourceHash,
   parentId: params.parentId,
   chunkOrder: params.context.capturedAt,
   allowLockedPrivateWrite: true,
@@ -1701,61 +1616,149 @@ const refreshContextMenus = async () => {
         );
       });
 
-    await add({ id: MENU_ROOT_ID, title: "Save to VibeSearch", contexts: IMPORT_CONTEXTS });
-    await add({ id: MENU_QUICK_SAVE_ID, parentId: MENU_ROOT_ID, title: "Quick save (Public, auto folder)", contexts: IMPORT_CONTEXTS });
-    await add({ id: MENU_QUICK_SHOT_ID, parentId: MENU_ROOT_ID, title: "Capture page screenshot (Public, auto folder)", contexts: IMPORT_CONTEXTS });
-    await add({ id: `${MENU_ROOT_ID}:sep:1`, parentId: MENU_ROOT_ID, type: "separator", contexts: IMPORT_CONTEXTS });
-    await add({ id: MENU_SAVE_TARGETS_ID, parentId: MENU_ROOT_ID, title: "Save content to…", contexts: IMPORT_CONTEXTS });
-    await add({ id: MENU_SHOT_TARGETS_ID, parentId: MENU_ROOT_ID, title: "Capture screenshot to…", contexts: IMPORT_CONTEXTS });
+    await add({ id: MENU_ROOT_ID, title: "VibeSearch", contexts: IMPORT_CONTEXTS });
+    
+    // Content-aware primary actions
+    await add({ 
+      id: MENU_SAVE_IMAGE_ID, 
+      parentId: MENU_ROOT_ID, 
+      title: "Save image", 
+      contexts: [chrome.contextMenus.ContextType.IMAGE] 
+    });
+    await add({
+      id: MENU_EXTRACT_TEXT_ID,
+      parentId: MENU_ROOT_ID,
+      title: "Extract text from image",
+      contexts: [chrome.contextMenus.ContextType.IMAGE]
+    });
+    await add({ 
+      id: MENU_SAVE_VIDEO_ID, 
+      parentId: MENU_ROOT_ID, 
+      title: "Save video", 
+      contexts: [chrome.contextMenus.ContextType.VIDEO] 
+    });
+    await add({ 
+      id: MENU_SAVE_LINK_ID, 
+      parentId: MENU_ROOT_ID, 
+      title: "Save link", 
+      contexts: [chrome.contextMenus.ContextType.LINK] 
+    });
+    await add({ 
+      id: MENU_SAVE_SELECTION_ID, 
+      parentId: MENU_ROOT_ID, 
+      title: "Save quote", 
+      contexts: [chrome.contextMenus.ContextType.SELECTION] 
+    });
+    await add({ 
+      id: MENU_SAVE_PAGE_ID, 
+      parentId: MENU_ROOT_ID, 
+      title: "Save this page", 
+      contexts: [chrome.contextMenus.ContextType.PAGE, chrome.contextMenus.ContextType.FRAME] 
+    });
+
+    // Screenshot submenu
+    await add({ id: `${MENU_ROOT_ID}:sep:shot`, parentId: MENU_ROOT_ID, type: "separator", contexts: IMPORT_CONTEXTS });
+    await add({ 
+      id: MENU_SHOT_VISIBLE_ID, 
+      parentId: MENU_ROOT_ID, 
+      title: "Screenshot visible area", 
+      contexts: IMPORT_CONTEXTS 
+    });
+    await add({ 
+      id: MENU_SHOT_REGION_ID, 
+      parentId: MENU_ROOT_ID, 
+      title: "Screenshot a region", 
+      contexts: IMPORT_CONTEXTS 
+    });
+
+    // Save to… submenu (spaces/folders)
+    await add({ id: `${MENU_ROOT_ID}:sep:targets`, parentId: MENU_ROOT_ID, type: "separator", contexts: IMPORT_CONTEXTS });
+    await add({ id: MENU_SAVE_TARGETS_ID, parentId: MENU_ROOT_ID, title: "Save to…", contexts: IMPORT_CONTEXTS });
 
     const spaces = await loadImportTargets();
-    for (const mode of ["save", "shot"] as ImportMode[]) {
-      const root = mode === "save" ? MENU_SAVE_TARGETS_ID : MENU_SHOT_TARGETS_ID;
-      for (const space of spaces) {
-        const spaceNodeId = `vs:node:${mode}:space:${space.id}`;
+    const root = MENU_SAVE_TARGETS_ID;
+    for (const space of spaces) {
+      const spaceNodeId = `vs:node:save:space:${space.id}`;
+      await add({
+        id: spaceNodeId,
+        parentId: root,
+        title: trimText(space.isPrivate && !space.isUnlocked ? `${space.name} (locked)` : space.name, 60),
+        contexts: IMPORT_CONTEXTS,
+        enabled: true,
+      });
+      if (!space.isUnlocked) {
         await add({
-          id: spaceNodeId,
-          parentId: root,
-          title: trimText(space.isPrivate && !space.isUnlocked ? `${space.name} (locked)` : space.name, 60),
-          contexts: IMPORT_CONTEXTS,
-          enabled: true,
-        });
-        if (!space.isUnlocked) {
-          await add({
-            id: `vs:${mode}:space:${space.id}`,
-            parentId: spaceNodeId,
-            title:
-              mode === "save"
-                ? "Save in this locked space (new folder)"
-                : "Screenshot in this locked space (new folder)",
-            contexts: IMPORT_CONTEXTS,
-          });
-          continue;
-        }
-        await add({
-          id: `vs:${mode}:space:${space.id}`,
+          id: `vs:save:space:${space.id}`,
           parentId: spaceNodeId,
-          title: mode === "save" ? "Save in this space (new folder)" : "Screenshot in this space (new folder)",
+          title: "Save in this locked space (new folder)",
           contexts: IMPORT_CONTEXTS,
         });
-        for (const folder of space.folders.slice(0, MENU_MAX_FOLDERS)) {
-          const folderNodeId = `vs:node:${mode}:folder:${space.id}:${folder.id}`;
-          await add({ id: folderNodeId, parentId: spaceNodeId, title: trimText(folder.name || "Untitled folder", 60), contexts: IMPORT_CONTEXTS });
+        continue;
+      }
+      await add({
+        id: `vs:save:space:${space.id}`,
+        parentId: spaceNodeId,
+        title: "Save in this space (new folder)",
+        contexts: IMPORT_CONTEXTS,
+      });
+      for (const folder of space.folders.slice(0, MENU_MAX_FOLDERS)) {
+        const folderNodeId = `vs:node:save:folder:${space.id}:${folder.id}`;
+        await add({ id: folderNodeId, parentId: spaceNodeId, title: trimText(folder.name || "Untitled folder", 60), contexts: IMPORT_CONTEXTS });
+        await add({
+          id: `vs:save:folder:${folder.id}`,
+          parentId: folderNodeId,
+          title: "Save in this folder",
+          contexts: IMPORT_CONTEXTS,
+        });
+        for (const item of folder.recentItems.slice(0, MENU_MAX_ITEMS)) {
           await add({
-            id: `vs:${mode}:folder:${folder.id}`,
+            id: `vs:save:item:${folder.id}:${item.id}`,
             parentId: folderNodeId,
-            title: mode === "save" ? "Save in this folder" : "Screenshot in this folder",
+            title: trimText(`Attach under: ${item.title}`, 60),
             contexts: IMPORT_CONTEXTS,
           });
-          for (const item of folder.recentItems.slice(0, MENU_MAX_ITEMS)) {
-            await add({
-              id: `vs:${mode}:item:${folder.id}:${item.id}`,
-              parentId: folderNodeId,
-              title: trimText(`Attach under: ${item.title}`, 60),
-              contexts: IMPORT_CONTEXTS,
-            });
-          }
         }
+      }
+    }
+
+    await add({ id: `${MENU_ROOT_ID}:sep:extract`, parentId: MENU_ROOT_ID, type: "separator", contexts: [chrome.contextMenus.ContextType.IMAGE] });
+    await add({
+      id: MENU_EXTRACT_TARGETS_ID,
+      parentId: MENU_ROOT_ID,
+      title: "Extract text to…",
+      contexts: [chrome.contextMenus.ContextType.IMAGE],
+    });
+    for (const space of spaces) {
+      const spaceNodeId = `vs:node:extract:space:${space.id}`;
+      await add({
+        id: spaceNodeId,
+        parentId: MENU_EXTRACT_TARGETS_ID,
+        title: trimText(space.isPrivate && !space.isUnlocked ? `${space.name} (locked)` : space.name, 60),
+        contexts: [chrome.contextMenus.ContextType.IMAGE],
+        enabled: true,
+      });
+      if (!space.isUnlocked) {
+        await add({
+          id: `vs:extract:space:${space.id}`,
+          parentId: spaceNodeId,
+          title: "Extract into this locked space (new folder)",
+          contexts: [chrome.contextMenus.ContextType.IMAGE],
+        });
+        continue;
+      }
+      await add({
+        id: `vs:extract:space:${space.id}`,
+        parentId: spaceNodeId,
+        title: "Extract into this space (new folder)",
+        contexts: [chrome.contextMenus.ContextType.IMAGE],
+      });
+      for (const folder of space.folders.slice(0, MENU_MAX_FOLDERS)) {
+        await add({
+          id: `vs:extract:folder:${folder.id}`,
+          parentId: spaceNodeId,
+          title: trimText(folder.name || "Untitled folder", 60),
+          contexts: [chrome.contextMenus.ContextType.IMAGE],
+        });
       }
     }
 
@@ -1875,6 +1878,92 @@ const runImportAction = async (
 
   sendProcessStatus(job.id, job.label, "success", "Imported.");
   scheduleContextMenuRefresh("low");
+
+  // Show branded toast with Undo / Open actions
+  const primaryHostname = (() => {
+    try {
+      return new URL(prepared.primaryUrl).hostname.replace(/^www\./, "");
+    } catch {
+      return "this page";
+    }
+  })();
+  await showBrandedToast(
+    tab,
+    `Saved from ${primaryHostname}`,
+    [
+      { label: "Undo", action: "UNDO_SAVE", payload: { primaryUrl: prepared.primaryUrl } },
+      { label: "Open", action: "OPEN_SEARCH" },
+    ],
+    5000
+  );
+};
+
+const runExtractTextAction = async (
+  target: ImportTarget,
+  context: ImportClickContext,
+  tab?: chrome.tabs.Tab
+) => {
+  const job = createImportJob("extract", context);
+  sendProcessStatus(job.id, job.label, "processing", "Resolving destination...");
+
+  const folderId = await resolveTargetFolder(
+    {
+      spaceId: target.spaceId || PUBLIC_SPACE_ID,
+      folderId: target.folderId,
+      newFolderName: autoFolderName(context, "extract"),
+    },
+    context,
+    "extract"
+  );
+
+  const prepared = await buildExtractedImageTextContent(context, tab, job);
+  sendProcessStatus(job.id, job.label, "processing", "Saving extracted text...");
+  const inserted = await sendForwardedToOffscreen<ItemDocType>({
+    service: "items",
+    type: "addToFolder",
+    payload: toItemPayload({
+      context,
+      mode: "extract",
+      primaryUrl: prepared.primaryUrl,
+      folderId,
+      parentId: null,
+      title: prepared.title,
+      textContent: prepared.textContent,
+      source: prepared.source,
+      iconUrl: prepared.iconUrl,
+      ocrText: prepared.ocrText,
+      ocrStatus: prepared.ocrStatus,
+      ocrConfidence: prepared.ocrConfidence,
+      ocrLineCount: prepared.ocrLineCount,
+      ocrSourceHash: prepared.ocrSourceHash,
+      shouldFetchMetadata: false,
+      isMetaFetched: true,
+    }),
+  });
+
+  sendProcessStatus(job.id, job.label, "success", "Extracted text saved.");
+  scheduleContextMenuRefresh("low");
+  await showBrandedToast(
+    tab,
+    "Extracted text saved",
+    [
+      { label: "Undo", action: "UNDO_SAVE", payload: { primaryUrl: inserted.url } },
+      { label: "Open", action: "OPEN_SEARCH" },
+    ],
+    5000
+  );
+};
+
+const runTargetAction = async (
+  target: ImportTarget,
+  context: ImportClickContext,
+  tab?: chrome.tabs.Tab
+) => {
+  if (target.mode === "extract") {
+    await runExtractTextAction(target, context, tab);
+    return;
+  }
+  await runImportAction(target, context, tab);
 };
 const isSearchPageSender = (sender: chrome.runtime.MessageSender) => {
   const senderUrl = typeof sender.url === "string" ? sender.url : "";
@@ -1929,7 +2018,7 @@ const handleImportControlMessage = async (message: any, sender: chrome.runtime.M
     const attempt = getFailedImportAttempt(statusId);
     if (!attempt) return { success: false, error: "IMPORT_RETRY_NOT_FOUND" };
     const retryTab = await resolveRetryTab(attempt.tab);
-    await runImportAction(attempt.target, attempt.context, retryTab);
+    await runTargetAction(attempt.target, attempt.context, retryTab);
     failedImportAttempts.delete(statusId);
     return { success: true, payload: { retried: true } };
   }
@@ -2093,20 +2182,39 @@ chrome.contextMenus.onClicked.addListener((info, tab) => {
     }
     const context = collectContext(info, tab);
     attemptedContext = context;
-    if (menuId === MENU_QUICK_SAVE_ID) {
+    
+    // Content-aware primary actions (instant save to Public/auto-folder)
+    if (menuId === MENU_SAVE_IMAGE_ID || menuId === MENU_SAVE_VIDEO_ID || 
+        menuId === MENU_SAVE_LINK_ID || menuId === MENU_SAVE_SELECTION_ID || 
+        menuId === MENU_SAVE_PAGE_ID) {
       attemptedTarget = { mode: "save", spaceId: PUBLIC_SPACE_ID };
-      await runImportAction(attemptedTarget, context, tab);
+      await runTargetAction(attemptedTarget, context, tab);
       return;
     }
-    if (menuId === MENU_QUICK_SHOT_ID) {
+
+    if (menuId === MENU_EXTRACT_TEXT_ID) {
+      attemptedTarget = { mode: "extract", spaceId: PUBLIC_SPACE_ID };
+      await runTargetAction(attemptedTarget, context, tab);
+      return;
+    }
+    
+    // Screenshot actions
+    if (menuId === MENU_SHOT_VISIBLE_ID) {
       attemptedTarget = { mode: "shot", spaceId: PUBLIC_SPACE_ID };
-      await runImportAction(attemptedTarget, context, tab);
+      await runTargetAction(attemptedTarget, context, tab);
       return;
     }
+    if (menuId === MENU_SHOT_REGION_ID) {
+      attemptedTarget = { mode: "shot", spaceId: PUBLIC_SPACE_ID, screenshotMode: "region" };
+      await runTargetAction(attemptedTarget, context, tab);
+      return;
+    }
+    
+    // Targeting submenu (Save to…)
     const target = parseTargetFromMenuId(menuId);
     if (target) {
       attemptedTarget = target;
-      await runImportAction(target, context, tab);
+      await runTargetAction(target, context, tab);
     }
   })().catch((error) => {
     const detail = error instanceof Error ? error.message : "Import failed.";
@@ -2171,6 +2279,23 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message?.target === "background" && message?.type === "FETCH_METADATA") {
     const { urls, revalidate } = message.payload || { urls: [], revalidate: false };
     scheduleForProcessing(urls, revalidate === true);
+    return;
+  }
+
+  if (message?.target === "background" && message?.type === "UNDO_SAVE") {
+    const primaryUrl = typeof message?.payload?.primaryUrl === "string" ? message.payload.primaryUrl : "";
+    if (primaryUrl) {
+      void sendForwardedToOffscreen({
+        service: "items",
+        type: "deleteByUrl",
+        payload: { url: primaryUrl },
+      }).catch(() => {});
+    }
+    return;
+  }
+
+  if (message?.target === "background" && message?.type === "OPEN_SEARCH") {
+    void chrome.tabs.create({ url: chrome.runtime.getURL("src/pages/search/index.html") });
     return;
   }
 

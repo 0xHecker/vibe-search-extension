@@ -350,6 +350,7 @@ export class FoldersController {
         spaceId: targetSpaceId,
         parentId: mappedParentId,
         vector_index: -1,
+        vector_indexes: [],
         isEmbedded: false,
         isDirty: true,
         createdAt: now + index,

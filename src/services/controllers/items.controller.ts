@@ -1,6 +1,18 @@
 import { getDb } from "@src/services/DatabaseService";
 import { ItemDocType } from "@src/schemas/item_schema";
 import { FolderDocType } from "@src/schemas/folder_schema";
+import {
+  saveMediaToOpfs,
+  deleteMediaFromOpfs,
+  deleteAllMediaForItem,
+  inferMediaType,
+  isGifUrl,
+  categorizeMedia,
+  getMediaCounts,
+  canAddMedia,
+  MEDIA_LIMITS,
+  type MediaCategory,
+} from "@src/services/media-storage";
 import type {
   QueryDebugPayload,
   QueryTextExpression,
@@ -9,8 +21,18 @@ import type {
 } from "@src/search-core/contracts";
 import { v4 as uuidv4 } from "uuid";
 import { databaseManager } from "@src/services/db-manager";
+import { appendOcrTextToTextContent } from "@src/services/ocr-text";
+import { isYouTubeShortsUrl } from "@src/utils/media-embed";
 import { vectorStoreService } from "@src/services/vector-store.service";
 import { localSearchIndexService } from "@src/services/local-search-index.service";
+import { appendUnorderedIds } from "@src/utils/ordered-ids";
+import { isMetadataFetchableUrl } from "@src/utils/metadata-url";
+import {
+  computeBaseRelevance,
+  shouldKeepHybridRankHit,
+  VECTOR_HIT_FLOOR,
+} from "@src/search-core/hybrid-ranking";
+import { MAX_GRID_QUERY_LIMIT, splitLookaheadPage } from "@src/search-core/pagination";
 import { PRIVATE_SPACE_ID, PUBLIC_SPACE_ID } from "@src/common/spaces";
 import { spaceSessionService } from "@src/services/space-session.service";
 import {
@@ -23,7 +45,6 @@ type LocalQuerySortBy = "relevance" | "createdAt" | "updatedAt" | "title" | "sou
 type LocalQuerySortOrder = "asc" | "desc";
 const MAX_VECTOR_TOPK = 4000;
 const MAX_LEXICAL_SCORE_BUDGET = 8000;
-const MAX_VECTOR_CANDIDATES_FROM_LEXICAL = 3000;
 const MAX_RANK_INPUT_ITEMS = 12000;
 const MIN_PRUNE_CANDIDATES = 80;
 const MIN_SCORE_BUDGET = 600;
@@ -33,12 +54,66 @@ const MS_PER_DAY = 24 * 60 * 60 * 1000;
 const LEXICAL_SEARCH_TIMEOUT_MS = 4000;
 const VECTOR_SEARCH_TIMEOUT_MS = 3500;
 const VECTOR_QUERY_MIN_CHARS = 3;
-const VECTOR_MIN_SCORE_VECTOR_ONLY = 0.28;
-const VECTOR_MIN_SCORE_HYBRID = 0.2;
-const VECTOR_MIN_TOP_SCORE_VECTOR_ONLY = 0.3;
-const VECTOR_MIN_TOP_SCORE_HYBRID = 0.24;
-const VECTOR_TAIL_DROP_DELTA = 0.18;
-const VECTOR_RESERVED_SEMANTIC_CANDIDATES = 700;
+
+type ItemMediaEntry = NonNullable<ItemDocType["media"]>[number];
+
+const mediaEntryKey = (entry: ItemMediaEntry): string | null => {
+  const value = entry.embedUrl || entry.s3Url || entry.opfsPath || entry.originalUrl;
+  if (typeof value !== "string" || value.trim().length === 0) return null;
+  return `${entry.type}:${value.trim()}`;
+};
+
+const mergeFetchedMedia = (
+  currentMedia: ItemDocType["media"],
+  fetchedMedia: ItemDocType["media"]
+): ItemDocType["media"] => {
+  if (!fetchedMedia || fetchedMedia.length === 0) return currentMedia;
+  if (!currentMedia || currentMedia.length === 0) return fetchedMedia;
+
+  const existing: ItemMediaEntry[] = [];
+  const acceptedFetched: ItemMediaEntry[] = [];
+  const seen = new Set<string>();
+  const counts = getMediaCounts(
+    currentMedia.map((entry) => ({
+      type: entry.type,
+      originalUrl: entry.originalUrl || entry.s3Url || "",
+    }))
+  );
+
+  const remember = (entry: ItemMediaEntry) => {
+    const key = mediaEntryKey(entry);
+    if (key && seen.has(key)) return;
+    if (key) seen.add(key);
+    existing.push(entry);
+  };
+
+  for (const entry of currentMedia) remember(entry);
+
+  for (const entry of fetchedMedia) {
+    const key = mediaEntryKey(entry);
+    if (key && seen.has(key)) continue;
+    const category = categorizeMedia({
+      type: entry.type,
+      originalUrl: entry.originalUrl || entry.s3Url || "",
+    });
+    if (counts[category] >= MEDIA_LIMITS[category]) continue;
+    counts[category] += 1;
+    if (key) seen.add(key);
+    acceptedFetched.push(entry);
+  }
+
+  const storedExisting = existing.filter(
+    (entry) => entry.storageType === "opfs" || entry.storageType === "s3"
+  );
+  const hotlinkExisting = existing.filter(
+    (entry) => entry.storageType === "hotlink"
+  );
+
+  return [...storedExisting, ...acceptedFetched, ...hotlinkExisting];
+};
+
+const hasStoredMedia = (media: ItemDocType["media"]): boolean =>
+  (media || []).some((entry) => entry.storageType === "opfs" || entry.storageType === "s3");
 
 type LocalQueryPayload = {
   query?: string;
@@ -51,6 +126,7 @@ type LocalQueryPayload = {
   useVector?: boolean;
   useFuzzy?: boolean;
   topK?: number;
+  minScore?: number;
   pagination?: {
     limit?: number;
     page?: number;
@@ -71,8 +147,8 @@ type LocalQueryPayload = {
     excludeDomains?: string[];
     authors?: string[];
     excludeAuthors?: string[];
-    hasAny?: Array<"image" | "video" | "media">;
-    excludeHasAny?: Array<"image" | "video" | "media">;
+    hasAny?: Array<"image" | "video" | "media" | "embed">;
+    excludeHasAny?: Array<"image" | "video" | "media" | "embed">;
     dateFrom?: number;
     dateTo?: number;
     createdFrom?: number;
@@ -98,6 +174,7 @@ type LocalQueryPayload = {
 type LocalQueryResponse = {
   items: ItemDocType[];
   total: number;
+  totalIsExact: boolean;
   vectorHits: number;
   lexicalHits: number;
   vectorError?: string | null;
@@ -139,6 +216,7 @@ type CandidateLite = {
   domain: string | null;
   mediaTypes: Array<"image" | "video">;
   hasMedia: boolean;
+  hasEmbed: boolean;
   vectorIndex: number;
   vectorIndexes: number[];
   title: string;
@@ -188,6 +266,15 @@ export class ItemsController {
 
   scheduleSearchIndexSync(changedItemIds?: string[]) {
     localSearchIndexService.scheduleItemSync(changedItemIds);
+  }
+
+  private triggerBackgroundProcessing(type: "TRIGGER_EMBEDDING" | "TRIGGER_OCR") {
+    try {
+      chrome.runtime.sendMessage({
+        type,
+        target: "background",
+      }).catch?.(() => {});
+    } catch {}
   }
 
   private tokenizeQuery(query: string): string[] {
@@ -337,6 +424,7 @@ export class ItemsController {
       domain: this.parseHostname(url),
       mediaTypes,
       hasMedia: media.length > 0,
+      hasEmbed: media.some((entry) => entry.embedType === "iframe" || !!entry.embedUrl),
       vectorIndex,
       vectorIndexes,
       title: (doc.get("title") as string | undefined) || "",
@@ -454,29 +542,17 @@ export class ItemsController {
     };
   }
 
-  private sampleSemanticReserveIndices(indices: number[], limit: number): number[] {
-    if (indices.length <= limit) {
-      return indices;
-    }
-
-    const sampled: number[] = [];
-    const step = indices.length / limit;
-    for (let i = 0; i < limit; i += 1) {
-      const index = Math.min(indices.length - 1, Math.floor(i * step));
-      sampled.push(indices[index]);
-    }
-    return Array.from(new Set(sampled));
-  }
-
-  private pruneVectorResults(
-    results: VectorScoreResult[],
-    useLexical: boolean
-  ): {
+  private selectVectorResults(results: VectorScoreResult[], minScore?: number): {
     pruned: VectorScoreResult[];
     topScore: number;
     minAcceptedScore: number;
   } {
-    if (results.length === 0) {
+    const threshold =
+      typeof minScore === "number" && Number.isFinite(minScore) ? minScore : null;
+    // Results arrive sorted by score (desc), so filtering preserves order.
+    const filtered =
+      threshold !== null ? results.filter((result) => result.score >= threshold) : results;
+    if (filtered.length === 0) {
       return {
         pruned: [],
         topScore: Number.NEGATIVE_INFINITY,
@@ -484,27 +560,10 @@ export class ItemsController {
       };
     }
 
-    const topScore = results[0]?.score ?? Number.NEGATIVE_INFINITY;
-    const minTopScore = useLexical
-      ? VECTOR_MIN_TOP_SCORE_HYBRID
-      : VECTOR_MIN_TOP_SCORE_VECTOR_ONLY;
-    if (topScore < minTopScore) {
-      return {
-        pruned: [],
-        topScore,
-        minAcceptedScore: minTopScore,
-      };
-    }
-
-    const minAcceptedScore = Math.max(
-      useLexical ? VECTOR_MIN_SCORE_HYBRID : VECTOR_MIN_SCORE_VECTOR_ONLY,
-      topScore - VECTOR_TAIL_DROP_DELTA
-    );
-    const pruned = results.filter((result) => result.score >= minAcceptedScore);
     return {
-      pruned,
-      topScore,
-      minAcceptedScore,
+      pruned: filtered,
+      topScore: filtered[0]?.score ?? Number.NEGATIVE_INFINITY,
+      minAcceptedScore: filtered[filtered.length - 1]?.score ?? Number.POSITIVE_INFINITY,
     };
   }
 
@@ -535,7 +594,6 @@ export class ItemsController {
     nextCursor?: RankQueryCursor | null;
     debugScores?: QueryDebugPayload["perItem"];
   } {
-    const RRF_K = 60;
     const RECENCY_TIE_BREAK_WEIGHT = 0.45;
     const hasPositiveTextTerms = args.flatPositiveTerms.length > 0;
     const hasLexicalScores = args.lexicalScores.size > 0;
@@ -549,36 +607,37 @@ export class ItemsController {
       }
       return max;
     })();
-    const reciprocalRank = (rank?: number): number => (rank ? 1 / (RRF_K + rank) : 0);
-    const maxRrfScore = reciprocalRank(1) * 2;
-    const lexicalRankById = new Map<string, number>(
-      Array.from(args.lexicalScores.entries())
-        .sort((a, b) => b[1] - a[1])
-        .map(([id], index) => [id, index + 1])
-    );
-    const vectorRankByIndex = new Map<number, number>(
-      Array.from(args.vectorScoresByIndex.entries())
-        .sort((a, b) => b[1] - a[1])
-        .map(([index], rank) => [index, rank + 1])
-    );
+    const lexicalRankById = args.includeDebug
+      ? new Map<string, number>(
+          Array.from(args.lexicalScores.entries())
+            .sort((a, b) => b[1] - a[1])
+            .map(([id], index) => [id, index + 1])
+        )
+      : null;
+    const vectorRankByIndex = args.includeDebug
+      ? new Map<number, number>(
+          Array.from(args.vectorScoresByIndex.entries())
+            .sort((a, b) => b[1] - a[1])
+            .map(([index], rank) => [index, rank + 1])
+        )
+      : null;
     const getBestVectorHit = (item: RankableItem): { score: number; rank?: number; hasHit: boolean } => {
       const fallback =
         typeof item.vector_index === "number" && Number.isInteger(item.vector_index) ? item.vector_index : -1;
       const indexes = this.sanitizeVectorIndexes(item.vector_indexes, fallback);
       let bestScore = 0;
       let bestRank: number | undefined;
-      let hasHit = false;
+      let found = false;
       for (const index of indexes) {
         if (!args.vectorScoresByIndex.has(index)) continue;
         const score = args.vectorScoresByIndex.get(index) || 0;
-        const rank = vectorRankByIndex.get(index);
-        if (!hasHit || score > bestScore) {
+        if (!found || score > bestScore) {
           bestScore = score;
-          bestRank = rank;
-          hasHit = true;
+          bestRank = vectorRankByIndex?.get(index);
+          found = true;
         }
       }
-      return { score: bestScore, rank: bestRank, hasHit };
+      return { score: bestScore, rank: bestRank, hasHit: found && bestScore >= VECTOR_HIT_FLOOR };
     };
 
     const ranked = args.items.map((item) => {
@@ -614,28 +673,20 @@ export class ItemsController {
       const vectorHit = getBestVectorHit(item);
       const vectorScore = vectorHit.score;
       const hasVectorHit = vectorHit.hasHit;
-      const lexicalRank = args.useLexical ? lexicalRankById.get(item.id) : undefined;
+      const lexicalRank = args.useLexical ? lexicalRankById?.get(item.id) : undefined;
       const vectorRank = args.useVector ? vectorHit.rank : undefined;
 
-      const normalizedTextScore = args.useLexical
-        ? lexicalScore > 0 && maxLexicalScore > 0
-          ? Math.min(1, lexicalScore / maxLexicalScore)
-          : Math.min(1, boolMatch.matchedTermCount / 4)
-        : 0;
-      const normalizedVectorScore = hasVectorHit ? (vectorScore + 1) / 2 : 0;
-      let baseRelevance = 0;
-      if (args.useVector && args.useLexical) {
-        const lexicalRrf = hasLexicalHit ? reciprocalRank(lexicalRank) : 0;
-        const vectorRrf = hasVectorHit ? reciprocalRank(vectorRank) : 0;
-        baseRelevance = maxRrfScore > 0 ? (lexicalRrf + vectorRrf) / maxRrfScore : 0;
-      } else if (args.useVector) {
-        baseRelevance = normalizedVectorScore;
-      } else if (args.useLexical) {
-        const termCoverage = hasPositiveTextTerms
-          ? Math.min(1, boolMatch.matchedTermCount / Math.max(1, args.flatPositiveTerms.length))
-          : 0;
-        baseRelevance = normalizedTextScore + termCoverage * 0.18;
-      }
+      const baseRelevance = computeBaseRelevance({
+        useLexical: args.useLexical,
+        useVector: args.useVector,
+        hasLexicalHit,
+        hasVectorHit,
+        vectorScore,
+        lexicalScore,
+        maxLexicalScore,
+        matchedTermCount: boolMatch.matchedTermCount,
+        positiveTermCount: args.flatPositiveTerms.length,
+      });
       const recencyTieBreak =
         this.recencyBoost(item.updatedAt || 0, item.createdAt || 0, now) *
         RECENCY_TIE_BREAK_WEIGHT;
@@ -674,9 +725,13 @@ export class ItemsController {
         return entry.boolMatch.matches;
       });
     }
-    if (args.useVector && !args.useLexical) {
-      filtered = filtered.filter((entry) => entry.hasVectorHit);
-    }
+    filtered = filtered.filter((entry) =>
+      shouldKeepHybridRankHit(entry, {
+        useLexical: args.useLexical,
+        useVector: args.useVector,
+        hasPositiveTextTerms,
+      })
+    );
 
     const compareEntries = (
       a: { item: RankableItem; relevance: number },
@@ -796,9 +851,15 @@ export class ItemsController {
 
   async saveFetchedMetadata(payload: {
     metaMap: Record<string, Partial<ItemDocType>>;
+    forceRefresh?: boolean;
+    forceRefreshUrls?: string[];
   }): Promise<{ updated: number }> {
     const db = await getDb();
     const { metaMap } = payload;
+    const forceRefreshUrls = new Set(payload.forceRefreshUrls || []);
+    const shouldForceRefreshItem = (url: string) =>
+      payload.forceRefresh === true &&
+      (payload.forceRefreshUrls === undefined || forceRefreshUrls.has(url));
     const urls = Object.keys(metaMap);
     if (urls.length === 0) return { updated: 0 };
 
@@ -815,6 +876,7 @@ export class ItemsController {
 
         const meta = metaMap[fresh.get("url") as string];
         const current = fresh.toMutableJSON() as ItemDocType;
+        const forceRefresh = shouldForceRefreshItem(current.url);
 
         const patchData: Partial<ItemDocType> = {};
         if (!meta) {
@@ -829,27 +891,42 @@ export class ItemsController {
           }
 
           if (m.textContent !== undefined) {
-            if (m.textContent !== current.textContent) {
-              patchData.textContent = m.textContent as ItemDocType["textContent"];
+            const nextTextContent = appendOcrTextToTextContent(
+              m.textContent as ItemDocType["textContent"],
+              current.ocrText
+            );
+            if (nextTextContent !== current.textContent) {
+              patchData.textContent = nextTextContent;
               embeddingRelevantChanged = true;
             }
           }
 
           if (m.iconUrl !== undefined) patchData.iconUrl = m.iconUrl as ItemDocType["iconUrl"];
-          if (m.displayImageUrl !== undefined && !current.displayImageUrl) {
+          if (
+            m.displayImageUrl !== undefined &&
+            !hasStoredMedia(current.media) &&
+            (forceRefresh || !current.displayImageUrl || isYouTubeShortsUrl(current.url))
+          ) {
             patchData.displayImageUrl = m.displayImageUrl as ItemDocType["displayImageUrl"];
           }
           if (m.source && m.source !== current.source) {
+            // `source` is a hard filter, not part of the embedding text
+            // (see composeEmbeddingTexts), so changing it does not require a
+            // re-embed.
             patchData.source = m.source as ItemDocType["source"];
-            embeddingRelevantChanged = true;
           }
-          if (m.authorUsername !== undefined) {
+          if (m.authorUsername !== undefined && m.authorUsername !== current.authorUsername) {
+            // `authorUsername` IS part of the embedding text, so a change must
+            // re-embed the item to keep its vector in sync with the content.
             patchData.authorUsername = m.authorUsername as ItemDocType["authorUsername"];
+            embeddingRelevantChanged = true;
           }
           if (typeof m.updatedAt === "number" && m.updatedAt > 0) {
             patchData.updatedAt = m.updatedAt;
           }
-          if (m.media !== undefined) patchData.media = m.media as ItemDocType["media"];
+          if (m.media !== undefined) {
+            patchData.media = mergeFetchedMedia(current.media, m.media as ItemDocType["media"]);
+          }
 
           if (embeddingRelevantChanged) {
             patchData.isDirty = true;
@@ -870,18 +947,8 @@ export class ItemsController {
       }
     }
 
-    try {
-      chrome.runtime.sendMessage({ type: "DB_CHANGE", scope: "items" });
-    } catch {}
-
     // Trigger embedding for newly updated items
-    try {
-      chrome.runtime.sendMessage({
-        type: "TRIGGER_EMBEDDING",
-        target: "offscreen",
-        isForwarded: true,
-      });
-    } catch {}
+    this.triggerBackgroundProcessing("TRIGGER_EMBEDDING");
 
     return { updated: itemsToUpdate.length };
   }
@@ -993,7 +1060,6 @@ export class ItemsController {
     if (targetSpaceDoc.get("isArchived") === true) {
       throw new Error("TARGET_SPACE_ARCHIVED");
     }
-    this.assertSpaceUnlocked(targetSpaceId);
 
     const itemDocsById = await db.items.findByIds(itemIds).exec();
     const sourceItems = itemIds
@@ -1165,6 +1231,199 @@ export class ItemsController {
     };
   }
 
+  async copyToSpace(payload: {
+    itemIds: string[];
+    targetSpaceId: string;
+  }): Promise<{ copied: number; createdFolders: number }> {
+    const db = await getDb();
+    const itemIds = Array.from(new Set((payload.itemIds || []).filter(Boolean)));
+    const targetSpaceId = (payload.targetSpaceId || "").trim();
+    if (itemIds.length === 0 || !targetSpaceId) {
+      return { copied: 0, createdFolders: 0 };
+    }
+
+    const targetSpaceDoc = await db.spaces.findOne(targetSpaceId).exec();
+    if (!targetSpaceDoc) {
+      throw new Error("TARGET_SPACE_NOT_FOUND");
+    }
+    if (targetSpaceDoc.get("isArchived") === true) {
+      throw new Error("TARGET_SPACE_ARCHIVED");
+    }
+
+    const itemDocsById = await db.items.findByIds(itemIds).exec();
+    const sourceItems = itemIds
+      .map((id) => itemDocsById.get(id))
+      .filter((doc): doc is any => !!doc)
+      .map((doc) => doc.toMutableJSON() as ItemDocType)
+      .filter((item) => (item.deletedAt || 0) === 0);
+    if (sourceItems.length === 0) {
+      return { copied: 0, createdFolders: 0 };
+    }
+
+    for (const item of sourceItems) {
+      this.assertSpaceUnlocked(item.spaceId || PUBLIC_SPACE_ID);
+    }
+
+    const sourceFolderIds = Array.from(new Set(sourceItems.map((item) => item.folderId).filter(Boolean)));
+    const sourceFolderDocs = await db.folders.findByIds(sourceFolderIds).exec();
+    const sourceFoldersById = new Map<string, FolderDocType>();
+    for (const [folderId, folderDoc] of sourceFolderDocs.entries()) {
+      const folder = folderDoc.toMutableJSON() as FolderDocType;
+      this.assertSpaceUnlocked(folder.spaceId || PUBLIC_SPACE_ID);
+      sourceFoldersById.set(folderId, folder);
+    }
+
+    const targetFolderDocs = await db.folders.find({ selector: { spaceId: { $eq: targetSpaceId } } }).exec();
+    const targetFolderByMirrorKey = new Map<string, string>();
+    let maxSortOrder = 0;
+    for (const doc of targetFolderDocs) {
+      const folder = doc.toMutableJSON() as FolderDocType;
+      const sortOrder = folder.sortOrder ?? 0;
+      if (sortOrder > maxSortOrder) maxSortOrder = sortOrder;
+      const key = this.folderMirrorKey(folder);
+      if (!targetFolderByMirrorKey.has(key)) {
+        targetFolderByMirrorKey.set(key, folder.id);
+      }
+    }
+
+    const now = Date.now();
+    const sourceToTargetFolderId = new Map<string, string>();
+    const foldersToInsert: FolderDocType[] = [];
+    let createdFolders = 0;
+
+    for (const sourceFolderId of sourceFolderIds) {
+      const sourceFolder = sourceFoldersById.get(sourceFolderId);
+      if (!sourceFolder) continue;
+
+      if ((sourceFolder.spaceId || PUBLIC_SPACE_ID) === targetSpaceId) {
+        sourceToTargetFolderId.set(sourceFolderId, sourceFolderId);
+        continue;
+      }
+
+      const mirrorKey = this.folderMirrorKey(sourceFolder);
+      const existingTargetFolderId = targetFolderByMirrorKey.get(mirrorKey);
+      if (existingTargetFolderId) {
+        sourceToTargetFolderId.set(sourceFolderId, existingTargetFolderId);
+        continue;
+      }
+
+      maxSortOrder += 1;
+      const clonedFolder: FolderDocType = {
+        id: uuidv4(),
+        name: sourceFolder.name,
+        userId: this.normalizeUserId(sourceFolder.userId),
+        spaceId: targetSpaceId,
+        parentId: null,
+        type: sourceFolder.type || "folder",
+        sortOrder: maxSortOrder,
+        isLocked: !!sourceFolder.isLocked,
+        isPinned: !!sourceFolder.isPinned,
+        isCollapsed: !!sourceFolder.isCollapsed,
+        isDirty: false,
+        serverVersion: 0,
+        createdAt: sourceFolder.createdAt || now,
+        updatedAt: now,
+      };
+      foldersToInsert.push(clonedFolder);
+      createdFolders += 1;
+      sourceToTargetFolderId.set(sourceFolderId, clonedFolder.id);
+      targetFolderByMirrorKey.set(mirrorKey, clonedFolder.id);
+    }
+
+    if (foldersToInsert.length > 0) {
+      const insertResult = await db.folders.bulkInsert(foldersToInsert);
+      if (insertResult.error.length > 0) {
+        throw new Error(`Failed to create ${insertResult.error.length} destination folders.`);
+      }
+    }
+
+    const targetFolderIds = Array.from(new Set(Array.from(sourceToTargetFolderId.values())));
+    const existingTargetItems =
+      targetFolderIds.length > 0
+        ? await db.items
+            .find({
+              selector: {
+                folderId: { $in: targetFolderIds },
+                deletedAt: { $eq: 0 },
+              },
+            })
+            .exec()
+        : [];
+    const maxChunkOrderByFolderId = new Map<string, number>();
+    for (const doc of existingTargetItems) {
+      const folderId = (doc.get("folderId") as string | undefined) || "";
+      const chunkOrder = (doc.get("chunkOrder") as number | undefined) ?? -1;
+      const current = maxChunkOrderByFolderId.get(folderId) ?? -1;
+      if (chunkOrder > current) {
+        maxChunkOrderByFolderId.set(folderId, chunkOrder);
+      }
+    }
+
+    const itemsBySourceFolder = new Map<string, ItemDocType[]>();
+    for (const item of sourceItems) {
+      const list = itemsBySourceFolder.get(item.folderId) || [];
+      list.push(item);
+      itemsBySourceFolder.set(item.folderId, list);
+    }
+
+    const itemClones: ItemDocType[] = [];
+    for (const [sourceFolderId, folderItems] of itemsBySourceFolder.entries()) {
+      const targetFolderId = sourceToTargetFolderId.get(sourceFolderId);
+      if (!targetFolderId) continue;
+
+      const ordered = [...folderItems].sort((a, b) => {
+        const ao = a.chunkOrder ?? Number.MAX_SAFE_INTEGER;
+        const bo = b.chunkOrder ?? Number.MAX_SAFE_INTEGER;
+        if (ao !== bo) return ao - bo;
+        return a.createdAt - b.createdAt;
+      });
+
+      let nextOrder = (maxChunkOrderByFolderId.get(targetFolderId) ?? -1) + 1;
+      for (const item of ordered) {
+        itemClones.push({
+          ...item,
+          id: uuidv4(),
+          userId: this.normalizeUserId(item.userId),
+          folderId: targetFolderId,
+          spaceId: targetSpaceId,
+          chunkOrder: nextOrder,
+          vector_index: -1,
+          vector_indexes: [],
+          isEmbedded: false,
+          isDirty: true,
+          serverVersion: 0,
+          createdAt: now,
+          updatedAt: now,
+        });
+        nextOrder += 1;
+      }
+      maxChunkOrderByFolderId.set(targetFolderId, nextOrder - 1);
+    }
+
+    if (itemClones.length > 0) {
+      const insertResult = await db.items.bulkInsert(itemClones);
+      if (insertResult.error.length > 0) {
+        throw new Error(`Failed to copy ${insertResult.error.length} items.`);
+      }
+    }
+
+    if (createdFolders > 0) {
+      try {
+        chrome.runtime.sendMessage({ type: "DB_CHANGE", scope: "folders" });
+      } catch {}
+    }
+    if (itemClones.length > 0) {
+      try {
+        chrome.runtime.sendMessage({ type: "DB_CHANGE", scope: "items" });
+      } catch {}
+    }
+
+    return {
+      copied: itemClones.length,
+      createdFolders,
+    };
+  }
+
   async queryLocal(payload: LocalQueryPayload): Promise<LocalQueryResponse> {
     const now = () =>
       typeof performance !== "undefined" && typeof performance.now === "function"
@@ -1223,7 +1482,10 @@ export class ItemsController {
       payload.sort?.order || (sortBy === "title" || sortBy === "source" ? "asc" : "desc");
     const page = Math.max(1, payload.pagination?.page || 1);
     const rawAfterCursor = payload.pagination?.afterCursor || null;
-    const limit = Math.max(1, Math.min(payload.pagination?.limit || payload.topK || 100, 500));
+    const limit = Math.max(
+      1,
+      Math.min(payload.pagination?.limit || payload.topK || 100, MAX_GRID_QUERY_LIMIT)
+    );
     const scoreBudget = Math.max(
       MIN_SCORE_BUDGET,
       payload.topK || MIN_SCORE_BUDGET,
@@ -1251,6 +1513,7 @@ export class ItemsController {
       return {
         items: [],
         total: 0,
+        totalIsExact: true,
         vectorHits: 0,
         lexicalHits: 0,
         vectorError: null,
@@ -1331,6 +1594,7 @@ export class ItemsController {
     const hasExplicitTextConstraint = !!expression || excludedTerms.length > 0;
     const hasImplicitTextConstraint = normalizedGroups.length > 0 || query.length > 0;
     const lexicalQuery = useLexical ? vectorQuery : "";
+    const lexicalQueries = flatPositiveTerms.length > 0 ? flatPositiveTerms : [lexicalQuery];
 
     let lexicalScores = new Map<string, number>();
     if (useLexical && lexicalQuery) {
@@ -1339,6 +1603,7 @@ export class ItemsController {
         lexicalScores = await this.withTimeout(
           localSearchIndexService.search({
             query: lexicalQuery,
+            queries: lexicalQueries,
             limit: lexicalScoreLimit,
             keyword: useKeyword,
             fuzzy: useFuzzy,
@@ -1359,37 +1624,119 @@ export class ItemsController {
       selector.id = { $in: Array.from(lexicalScores.keys()) };
     }
 
+    // The default “open this space” view must not hydrate the entire library
+    // before it can show the first page. Keep it in Dexie/RxDB when no filter
+    // needs the in-memory ranker.
+    const hasInMemoryOnlyFilters =
+      (filters.excludeFolderIds?.length || 0) > 0 ||
+      (filters.excludeSources?.length || 0) > 0 ||
+      (filters.authors?.length || 0) > 0 ||
+      (filters.excludeAuthors?.length || 0) > 0 ||
+      (filters.domains?.length || 0) > 0 ||
+      (filters.excludeDomains?.length || 0) > 0 ||
+      (filters.hasAny?.length || 0) > 0 ||
+      (filters.excludeHasAny?.length || 0) > 0 ||
+      (filters.tagIds?.length || 0) > 0 ||
+      (filters.tagNames?.length || 0) > 0 ||
+      (filters.excludeTagNames?.length || 0) > 0;
+    const canUseDatabasePagePath =
+      !hasExplicitTextConstraint &&
+      !hasImplicitTextConstraint &&
+      !useVector &&
+      !hasInMemoryOnlyFilters &&
+      sortBy !== "relevance";
+    if (canUseDatabasePagePath) {
+      usedSimpleSortPath = true;
+      const fieldSortBy = sortBy as Exclude<LocalQuerySortBy, "relevance">;
+      const offset = Math.max(0, (page - 1) * limit);
+      const selectorStartedAt = now();
+      const pageDocsWithLookahead = await db.items
+        .find({
+          selector,
+          sort: [{ [fieldSortBy]: sortOrder }],
+          skip: offset,
+          limit: limit + 1,
+        } as any)
+        .exec();
+      selectorMs = now() - selectorStartedAt;
+      const hydrateStartedAt = now();
+      const pageResult = splitLookaheadPage(pageDocsWithLookahead, limit, offset);
+      const pageDocs = pageResult.items;
+      const items = pageDocs.map((doc) => doc.toMutableJSON() as ItemDocType);
+      hydrateMs = now() - hydrateStartedAt;
+      const lastItem = items[items.length - 1];
+      return {
+        items,
+        total: pageResult.total,
+        totalIsExact: pageResult.totalIsExact,
+        vectorHits: 0,
+        lexicalHits: 0,
+        vectorError: null,
+        sortBy,
+        sortOrder,
+        page,
+        limit,
+        hasMore: pageResult.hasMore,
+        nextCursor:
+          pageResult.hasMore && lastItem
+            ? {
+                queryHash,
+                id: lastItem.id,
+                relevance: 0,
+                createdAt: lastItem.createdAt || 0,
+                updatedAt: lastItem.updatedAt || 0,
+                title: lastItem.title || "",
+                source: lastItem.source,
+              }
+            : null,
+        diagnostics: {
+          queryHash,
+          candidateCount: pageResult.total,
+          rankInputCount: 0,
+          usedSimpleSortPath,
+          scoreBudget,
+          supersededCount: this.rankTelemetry.supersededCount,
+          fallbackCount: this.rankTelemetry.fallbackCount,
+          selectorMs,
+          filterMs,
+          lexicalMs,
+          vectorMs,
+          vectorEmbedMs,
+          vectorScanMs,
+          rankMs,
+          hydrateMs,
+          totalMs: now() - startedAt,
+        },
+      };
+    }
+
     const selectorStartedAt = now();
-    const docs = await db.items.find({ selector }).exec();
-    const docById = new Map<string, any>();
     let candidates: CandidateLite[] = [];
-    for (const doc of docs) {
-      const candidate = this.toCandidateLite(doc);
-      if (!candidate.id) continue;
-      docById.set(candidate.id, doc);
-      candidates.push(candidate);
+    {
+      // Project in-scope items to lightweight candidates and release the heavy
+      // RxDocuments immediately. Retaining every in-scope document (with its
+      // full text) for the whole query is what made large libraries memory-heavy;
+      // the ranker only needs the lite projection, plus the text of the bounded
+      // ranking set for text queries (fetched on demand below).
+      const docs = await db.items.find({ selector }).exec();
+      for (const doc of docs) {
+        const candidate = this.toCandidateLite(doc);
+        if (!candidate.id) continue;
+        candidates.push(candidate);
+      }
     }
     selectorMs = now() - selectorStartedAt;
 
     const hydrateFromDocMap = async (itemIds: string[]): Promise<ItemDocType[]> => {
       if (itemIds.length === 0) return [];
+      // Hydrate only the requested ids (the final page or a sort page) instead
+      // of reading from a retained full-document map.
+      const byId = await db.items.findByIds(itemIds).exec();
       const itemById = new Map<string, ItemDocType>();
-      const missingIds: string[] = [];
       for (const id of itemIds) {
-        const doc = docById.get(id);
-        if (!doc) {
-          missingIds.push(id);
-          continue;
-        }
+        const doc = byId.get(id);
+        if (!doc) continue;
         itemById.set(id, doc.toMutableJSON() as ItemDocType);
-      }
-      if (missingIds.length > 0) {
-        const missingById = await db.items.findByIds(missingIds).exec();
-        for (const id of missingIds) {
-          const doc = missingById.get(id);
-          if (!doc) continue;
-          itemById.set(id, doc.toMutableJSON() as ItemDocType);
-        }
       }
       return itemIds
         .map((id) => itemById.get(id) || null)
@@ -1437,6 +1784,7 @@ export class ItemsController {
         if (required.has("media") && !item.hasMedia) return false;
         if (required.has("image") && !item.mediaTypes.includes("image")) return false;
         if (required.has("video") && !item.mediaTypes.includes("video")) return false;
+        if (required.has("embed") && !item.hasEmbed) return false;
         return true;
       });
     }
@@ -1447,6 +1795,7 @@ export class ItemsController {
         if (excluded.has("media") && item.hasMedia) return false;
         if (excluded.has("image") && item.mediaTypes.includes("image")) return false;
         if (excluded.has("video") && item.mediaTypes.includes("video")) return false;
+        if (excluded.has("embed") && item.hasEmbed) return false;
         return true;
       });
     }
@@ -1514,6 +1863,7 @@ export class ItemsController {
       return {
         items: [],
         total: 0,
+        totalIsExact: true,
         vectorHits: 0,
         lexicalHits: 0,
         vectorError: null,
@@ -1572,36 +1922,7 @@ export class ItemsController {
       const allCandidateIndices = Array.from(
         new Set(candidates.flatMap((item) => item.vectorIndexes).filter((index) => index >= 0))
       );
-      let candidateIndices = allCandidateIndices;
-
-      if (lexicalScores.size > 0 && allCandidateIndices.length > MAX_VECTOR_CANDIDATES_FROM_LEXICAL) {
-        const lexicalTopIds = Array.from(lexicalScores.entries())
-          .sort((a, b) => b[1] - a[1])
-          .slice(0, MAX_VECTOR_CANDIDATES_FROM_LEXICAL)
-          .map(([id]) => id);
-        const lexicalTopSet = new Set(lexicalTopIds);
-        const lexicalCandidateIndices = Array.from(
-          new Set(
-            candidates
-              .filter((item) => lexicalTopSet.has(item.id))
-              .flatMap((item) => item.vectorIndexes)
-              .filter((index) => index >= 0)
-          )
-        );
-        const semanticReservedIndices = Array.from(
-          new Set(
-            this.sampleSemanticReserveIndices(
-              [...allCandidateIndices].sort((a, b) => a - b),
-              VECTOR_RESERVED_SEMANTIC_CANDIDATES
-            )
-          )
-        );
-        if (lexicalCandidateIndices.length > 0) {
-          candidateIndices = Array.from(
-            new Set([...lexicalCandidateIndices, ...semanticReservedIndices])
-          );
-        }
-      }
+      const candidateIndices = allCandidateIndices;
 
       if (candidateIndices.length > 0) {
         try {
@@ -1625,7 +1946,7 @@ export class ItemsController {
           vectorScanMs = vectorSearch.timings.scanMs;
           const rawVectorResults = vectorSearch.results;
           rawVectorHitCount = rawVectorResults.length;
-          const vectorPrune = this.pruneVectorResults(rawVectorResults, useLexical);
+          const vectorPrune = this.selectVectorResults(rawVectorResults, payload.minScore);
           vectorTopScore = Number.isFinite(vectorPrune.topScore) ? vectorPrune.topScore : null;
           vectorMinAcceptedScore = Number.isFinite(vectorPrune.minAcceptedScore)
             ? vectorPrune.minAcceptedScore
@@ -1705,6 +2026,7 @@ export class ItemsController {
       return {
         items,
         total,
+        totalIsExact: true,
         vectorHits: 0,
         lexicalHits: 0,
         vectorError,
@@ -1766,14 +2088,23 @@ export class ItemsController {
 
     const needsTextForRanking =
       effectiveHasTextConstraint || (useLexical && lexicalScores.size === 0);
+    // Text is only used for boolean/expression evaluation and the lexical
+    // fallback. Fetch it for the bounded ranking set on demand rather than
+    // holding every in-scope document in memory for the whole query.
+    const rankingTextById = new Map<string, { textContent: string; ocrText: string }>();
+    if (needsTextForRanking && itemsForRanking.length > 0) {
+      const textDocs = await db.items.findByIds(itemsForRanking.map((item) => item.id)).exec();
+      for (const [id, doc] of textDocs) {
+        rankingTextById.set(id, {
+          textContent: (doc.get("textContent") as string | undefined) || "",
+          ocrText: (doc.get("ocrText") as string | undefined) || "",
+        });
+      }
+    }
     const rankableItems = itemsForRanking.map((item) => {
-      const doc = docById.get(item.id);
-      const textContent = needsTextForRanking
-        ? (doc?.get("textContent") as string | undefined) || ""
-        : "";
-      const ocrText = needsTextForRanking
-        ? (doc?.get("ocrText") as string | undefined) || ""
-        : "";
+      const text = rankingTextById.get(item.id);
+      const textContent = needsTextForRanking ? text?.textContent || "" : "";
+      const ocrText = needsTextForRanking ? text?.ocrText || "" : "";
       return this.toRankableItem(item, textContent, ocrText);
     });
     rankInputCount = rankableItems.length;
@@ -1864,6 +2195,7 @@ export class ItemsController {
     return {
       items: rankedItems,
       total: rankTotal,
+      totalIsExact: true,
       vectorHits: rankVectorHits,
       lexicalHits: rankLexicalHits,
       vectorError,
@@ -1913,7 +2245,39 @@ export class ItemsController {
     };
   }
 
+  async getByIds(payload: {
+    itemIds?: string[];
+    spaceIds?: string[];
+    accessContext?: LocalQueryPayload["accessContext"];
+  }): Promise<ItemDocType[]> {
+    const itemIds = Array.from(new Set((payload.itemIds || []).filter(Boolean))).slice(
+      0,
+      MAX_GRID_QUERY_LIMIT
+    );
+    if (itemIds.length === 0) return [];
+
+    const db = await getDb();
+    const baseAllowedSpaceIds = await this.resolveAllowedSpaceIds(db, {
+      accessContext: payload.accessContext,
+    });
+    const requestedSpaceIds = new Set((payload.spaceIds || []).filter(Boolean));
+    const allowedSpaceIds =
+      requestedSpaceIds.size > 0
+        ? baseAllowedSpaceIds.filter((spaceId) => requestedSpaceIds.has(spaceId))
+        : baseAllowedSpaceIds;
+    if (allowedSpaceIds.length === 0) return [];
+
+    const allowedSpaceIdSet = new Set(allowedSpaceIds);
+    const docsById = await db.items.findByIds(itemIds).exec();
+    return itemIds
+      .map((itemId) => docsById.get(itemId))
+      .filter(Boolean)
+      .map((doc) => doc!.toMutableJSON() as ItemDocType)
+      .filter((item) => (item.deletedAt || 0) === 0 && allowedSpaceIdSet.has(item.spaceId));
+  }
+
   async addToFolder(payload: {
+    id?: string;
     folderId: string;
     url: string;
     title?: string;
@@ -1935,6 +2299,7 @@ export class ItemsController {
     isMetaFetched?: boolean;
     isDirty?: boolean;
     shouldFetchMetadata?: boolean;
+    deferBackgroundProcessing?: boolean;
     allowLockedPrivateWrite?: boolean;
     parentId?: string | null;
     chunkOrder?: number;
@@ -1953,8 +2318,24 @@ export class ItemsController {
       throw new Error("INVALID_URL");
     }
 
+    // Cap a single tab group at 500 tabs so groups stay performant. Pagination
+    // handles display; this prevents unbounded manual growth.
+    const MAX_TABS_PER_FOLDER = 500;
+    const existingCount = await db.items
+      .count({ selector: { folderId: { $eq: payload.folderId }, deletedAt: { $eq: 0 } } })
+      .exec();
+    if (existingCount >= MAX_TABS_PER_FOLDER) {
+      throw new Error(`Tab group is full — max ${MAX_TABS_PER_FOLDER} tabs per group.`);
+    }
+
+    const shouldFetchMetadata =
+      payload.shouldFetchMetadata !== false && isMetadataFetchableUrl(normalizedUrl);
+    const initialIsMetaFetched = shouldFetchMetadata
+      ? payload.isMetaFetched ?? false
+      : true;
+
     const base: ItemDocType = {
-      id: uuidv4(),
+      id: payload.id || uuidv4(),
       userId: this.normalizeUserId(payload.userId),
       title: (payload.title || normalizedUrl).slice(0, 80),
       textContent: payload.textContent ?? "",
@@ -1980,7 +2361,7 @@ export class ItemsController {
       ocrSourceHash: payload.ocrSourceHash,
       ocrUpdatedAt: payload.ocrStatus ? updatedAt : 0,
       isEmbedded: false,
-      isMetaFetched: payload.isMetaFetched ?? false,
+      isMetaFetched: initialIsMetaFetched,
       isDirty: payload.isDirty ?? true,
       serverVersion: 0,
       createdAt,
@@ -1995,23 +2376,30 @@ export class ItemsController {
     try {
       chrome.runtime.sendMessage({ type: "DB_CHANGE", scope: "items" });
     } catch {}
-    try {
-      if (payload.shouldFetchMetadata !== false) {
-        chrome.runtime.sendMessage({
-          type: "FETCH_METADATA",
-          payload: { urls: [normalizedUrl], revalidate: false },
-          target: "background",
-        });
+    if (!payload.deferBackgroundProcessing) {
+      try {
+        if (shouldFetchMetadata) {
+          chrome.runtime.sendMessage({
+            type: "FETCH_METADATA",
+            payload: { urls: [normalizedUrl], revalidate: false },
+            target: "background",
+          });
+        }
+      } catch {}
+
+      this.triggerBackgroundProcessing("TRIGGER_EMBEDDING");
+      if ((item.media || []).some((entry) => entry?.type === "image")) {
+        this.triggerBackgroundProcessing("TRIGGER_OCR");
       }
-    } catch {}
-    // Trigger embedding immediately
-    try {
-      chrome.runtime.sendMessage({
-        type: "TRIGGER_EMBEDDING",
-        target: "offscreen",
-        isForwarded: true,
-      });
-    } catch {}
+      if ((item.media || []).some((entry) => typeof entry?.opfsPath === "string" && entry.opfsPath)) {
+        try {
+          chrome.runtime.sendMessage({
+            type: "PROMOTE_OPFS_MEDIA",
+            target: "background",
+          });
+        } catch {}
+      }
+    }
     return item as ItemDocType;
   }
 
@@ -2039,7 +2427,7 @@ export class ItemsController {
         ...item,
         userId: this.normalizeUserId(item.userId),
         spaceId: targetSpaceId,
-        isMetaFetched: false,
+        isMetaFetched: isMetadataFetchableUrl(item.url) ? item.isMetaFetched === true : true,
       };
     });
 
@@ -2052,7 +2440,10 @@ export class ItemsController {
     } catch {}
 
     // Trigger metadata fetch for all newly inserted URLs
-    const urlsToFetch = toInsert.map((item) => item.url).filter((url): url is string => !!url);
+    const urlsToFetch = toInsert
+      .filter((item) => item.isMetaFetched !== true && isMetadataFetchableUrl(item.url))
+      .map((item) => item.url)
+      .filter((url): url is string => !!url);
     if (urlsToFetch.length > 0) {
       try {
         chrome.runtime.sendMessage({
@@ -2064,13 +2455,7 @@ export class ItemsController {
     }
 
     // Trigger embedding immediately for new items
-    try {
-      chrome.runtime.sendMessage({
-        type: "TRIGGER_EMBEDDING",
-        target: "offscreen",
-        isForwarded: true,
-      });
-    } catch {}
+    this.triggerBackgroundProcessing("TRIGGER_EMBEDDING");
 
     return { inserted: toInsert.length };
   }
@@ -2084,7 +2469,8 @@ export class ItemsController {
     });
     if (items.length === 0) return;
 
-    const urls = items.map((i) => i.url);
+    const urls = items.map((i) => i.url).filter((url) => isMetadataFetchableUrl(url));
+    if (urls.length === 0) return;
     chrome.runtime.sendMessage({
       type: "FETCH_METADATA",
       payload: { urls, revalidate: true },
@@ -2204,8 +2590,7 @@ export class ItemsController {
         .find({ selector: { folderId: { $eq: folderId }, deletedAt: { $eq: 0 } } })
         .exec();
       const allIds = docs.map((d) => d.primary);
-      const remainder = allIds.filter((id) => !orderedIds.includes(id));
-      const finalOrder = [...orderedIds, ...remainder];
+      const finalOrder = appendUnorderedIds(orderedIds, allIds);
 
       for (let i = 0; i < finalOrder.length; i++) {
         const id = finalOrder[i];
@@ -2264,6 +2649,426 @@ export class ItemsController {
     try {
       chrome.runtime.sendMessage({ type: "DB_CHANGE", scope: "items" });
     } catch {}
+
+    return { success: true };
+  }
+
+  async updateMedia(payload: {
+    id: string;
+    media: ItemDocType["media"];
+    preserveOcr?: boolean;
+  }): Promise<{ success: boolean; error?: string }> {
+    const db = await getDb();
+    const doc = await db.items.findOne(payload.id).exec();
+    if (!doc) return { success: false, error: "NOT_FOUND" };
+
+    const current = doc.toMutableJSON() as ItemDocType;
+    this.assertSpaceUnlocked((current.spaceId as string | undefined) || PUBLIC_SPACE_ID);
+
+    const incomingMedia = payload.media || [];
+    const hasImageMedia = incomingMedia.some((m) => m?.type === "image");
+    const shouldResetOcr = hasImageMedia && payload.preserveOcr !== true;
+    const nextMedia = shouldResetOcr
+      ? incomingMedia.map((m) => {
+          if (m?.type !== "image") return m;
+          const { ocr, ...rest } = m as any;
+          return {
+            ...rest,
+            ocr: {
+              status: "pending" as const,
+              lineCount: 0,
+              extractedAt: Date.now(),
+              engine: "paddleocr",
+            },
+          };
+        })
+      : incomingMedia;
+
+    const counts = getMediaCounts(
+      nextMedia.map((m) => ({
+        type: m.type,
+        originalUrl: m.originalUrl || m.s3Url || "",
+      }))
+    );
+    if (counts.image > MEDIA_LIMITS.image)
+      return { success: false, error: `Too many images (max ${MEDIA_LIMITS.image})` };
+    if (counts.gif > MEDIA_LIMITS.gif)
+      return { success: false, error: `Too many GIFs (max ${MEDIA_LIMITS.gif})` };
+    if (counts.video > MEDIA_LIMITS.video)
+      return { success: false, error: `Too many videos (max ${MEDIA_LIMITS.video})` };
+
+    const MAX_TRIES = 5;
+    let attempt = 0;
+    while (attempt < MAX_TRIES) {
+      attempt += 1;
+      const fresh = await db.items.findOne(payload.id).exec();
+      if (!fresh) break;
+      try {
+        const patchData: Record<string, any> = {
+          media: nextMedia,
+          updatedAt: Date.now(),
+          isDirty: true,
+        };
+        if (shouldResetOcr) {
+          patchData.ocrText = "";
+          patchData.ocrStatus = "pending";
+          patchData.ocrError = "";
+          patchData.ocrModelVersion = "";
+          patchData.ocrSourceHash = "";
+          patchData.ocrUpdatedAt = 0;
+          patchData.ocrConfidence = null;
+          patchData.ocrLineCount = 0;
+        }
+        const nextDisplayImageUrl =
+          nextMedia.find((m) => m.type === "image")?.s3Url ||
+          nextMedia.find((m) => m.type === "image")?.originalUrl;
+        if (nextDisplayImageUrl) patchData.displayImageUrl = nextDisplayImageUrl;
+        await fresh.patch(patchData);
+        break;
+      } catch (e: any) {
+        const status = e?.status ?? e?.rxdb?.status ?? e?.parameters?.writeError?.status;
+        if (status !== 409) throw e;
+        continue;
+      }
+    }
+
+    try {
+      chrome.runtime.sendMessage({ type: "DB_CHANGE", scope: "items" });
+    } catch {}
+    this.triggerBackgroundProcessing("TRIGGER_EMBEDDING");
+
+    if (hasImageMedia && !payload.preserveOcr) {
+      this.triggerBackgroundProcessing("TRIGGER_OCR");
+    }
+
+    if (nextMedia.some((m) => typeof m?.opfsPath === "string" && m.opfsPath)) {
+      chrome.runtime.sendMessage({
+        type: "PROMOTE_OPFS_MEDIA",
+        target: "background",
+      }).catch?.(() => {});
+    }
+
+    return { success: true };
+  }
+
+  async removeMedia(payload: {
+    id: string;
+    index: number;
+  }): Promise<{ success: boolean; error?: string }> {
+    const db = await getDb();
+    const doc = await db.items.findOne(payload.id).exec();
+    if (!doc) return { success: false, error: "NOT_FOUND" };
+
+    const current = doc.toMutableJSON() as ItemDocType;
+    this.assertSpaceUnlocked((current.spaceId as string | undefined) || PUBLIC_SPACE_ID);
+
+    const media = current.media || [];
+    if (payload.index < 0 || payload.index >= media.length) {
+      return { success: false, error: "INVALID_INDEX" };
+    }
+
+    const removed = media[payload.index];
+    if (removed?.opfsPath) {
+      deleteMediaFromOpfs(removed.opfsPath).catch(() => {});
+    }
+
+    const nextMedia = media.filter((_, i) => i !== payload.index);
+    const nextDisplayImageUrl =
+      nextMedia.find((m) => m.type === "image")?.s3Url ||
+      nextMedia.find((m) => m.type === "image")?.originalUrl;
+
+    const MAX_TRIES = 5;
+    let attempt = 0;
+    while (attempt < MAX_TRIES) {
+      attempt += 1;
+      const fresh = await db.items.findOne(payload.id).exec();
+      if (!fresh) break;
+      try {
+        const patchData: Record<string, any> = {
+          media: nextMedia,
+          updatedAt: Date.now(),
+          isDirty: true,
+        };
+        if (nextDisplayImageUrl) patchData.displayImageUrl = nextDisplayImageUrl;
+        await fresh.patch(patchData);
+        break;
+      } catch (e: any) {
+        const status = e?.status ?? e?.rxdb?.status ?? e?.parameters?.writeError?.status;
+        if (status !== 409) throw e;
+        continue;
+      }
+    }
+
+    try {
+      chrome.runtime.sendMessage({ type: "DB_CHANGE", scope: "items" });
+    } catch {}
+
+    return { success: true };
+  }
+
+  async addMedia(payload: {
+    id: string;
+    url: string;
+    type?: "image" | "video";
+    altText?: string;
+  }): Promise<{ success: boolean; error?: string }> {
+    const db = await getDb();
+    const doc = await db.items.findOne(payload.id).exec();
+    if (!doc) return { success: false, error: "NOT_FOUND" };
+
+    const current = doc.toMutableJSON() as ItemDocType;
+    this.assertSpaceUnlocked((current.spaceId as string | undefined) || PUBLIC_SPACE_ID);
+
+    const trimmedUrl = payload.url.trim();
+    if (!trimmedUrl) return { success: false, error: "URL_REQUIRED" };
+
+    const type = payload.type || inferMediaType(trimmedUrl);
+    const category: MediaCategory = type === "video" ? "video" : isGifUrl(trimmedUrl) ? "gif" : "image";
+
+    const existingMedia = current.media || [];
+    if (!canAddMedia(
+      existingMedia.map((m) => ({ type: m.type, originalUrl: m.originalUrl })),
+      category
+    )) {
+      return {
+        success: false,
+        error: `Limit reached for ${category}s (max ${MEDIA_LIMITS[category]})`,
+      };
+    }
+
+    const newEntry: NonNullable<ItemDocType["media"]>[number] = {
+      type,
+      originalUrl: trimmedUrl,
+      storageType: "hotlink",
+      altText: payload.altText,
+    };
+
+    const nextMedia = [...existingMedia, newEntry];
+    const nextDisplayImageUrl =
+      nextMedia.find((m) => m.type === "image")?.s3Url ||
+      nextMedia.find((m) => m.type === "image")?.originalUrl ||
+      current.displayImageUrl;
+
+    const MAX_TRIES = 5;
+    let attempt = 0;
+    while (attempt < MAX_TRIES) {
+      attempt += 1;
+      const fresh = await db.items.findOne(payload.id).exec();
+      if (!fresh) break;
+      try {
+        const patchData: Record<string, any> = {
+          media: nextMedia,
+          updatedAt: Date.now(),
+          isDirty: true,
+        };
+        if (nextDisplayImageUrl) patchData.displayImageUrl = nextDisplayImageUrl;
+        await fresh.patch(patchData);
+        break;
+      } catch (e: any) {
+        const status = e?.status ?? e?.rxdb?.status ?? e?.parameters?.writeError?.status;
+        if (status !== 409) throw e;
+        continue;
+      }
+    }
+
+    try {
+      chrome.runtime.sendMessage({ type: "DB_CHANGE", scope: "items" });
+    } catch {}
+
+    return { success: true };
+  }
+
+  async replaceMedia(payload: {
+    id: string;
+    index: number;
+    url: string;
+    type?: "image" | "video";
+  }): Promise<{ success: boolean; error?: string }> {
+    const db = await getDb();
+    const doc = await db.items.findOne(payload.id).exec();
+    if (!doc) return { success: false, error: "NOT_FOUND" };
+
+    const current = doc.toMutableJSON() as ItemDocType;
+    this.assertSpaceUnlocked((current.spaceId as string | undefined) || PUBLIC_SPACE_ID);
+
+    const media = current.media || [];
+    if (payload.index < 0 || payload.index >= media.length) {
+      return { success: false, error: "INVALID_INDEX" };
+    }
+
+    const trimmedUrl = payload.url.trim();
+    if (!trimmedUrl) return { success: false, error: "URL_REQUIRED" };
+
+    const old = media[payload.index];
+    if (old?.opfsPath) {
+      deleteMediaFromOpfs(old.opfsPath).catch(() => {});
+    }
+
+    const type = payload.type || inferMediaType(trimmedUrl);
+    const newEntry: NonNullable<ItemDocType["media"]>[number] = {
+      type,
+      originalUrl: trimmedUrl,
+      storageType: "hotlink",
+      altText: old?.altText,
+    };
+
+    const nextMedia = media.map((m, i) => (i === payload.index ? newEntry : m));
+    const nextDisplayImageUrl =
+      nextMedia.find((m) => m.type === "image")?.s3Url ||
+      nextMedia.find((m) => m.type === "image")?.originalUrl;
+
+    const MAX_TRIES = 5;
+    let attempt = 0;
+    while (attempt < MAX_TRIES) {
+      attempt += 1;
+      const fresh = await db.items.findOne(payload.id).exec();
+      if (!fresh) break;
+      try {
+        const patchData: Record<string, any> = {
+          media: nextMedia,
+          updatedAt: Date.now(),
+          isDirty: true,
+        };
+        if (nextDisplayImageUrl) patchData.displayImageUrl = nextDisplayImageUrl;
+        await fresh.patch(patchData);
+        break;
+      } catch (e: any) {
+        const status = e?.status ?? e?.rxdb?.status ?? e?.parameters?.writeError?.status;
+        if (status !== 409) throw e;
+        continue;
+      }
+    }
+
+    try {
+      chrome.runtime.sendMessage({ type: "DB_CHANGE", scope: "items" });
+    } catch {}
+
+    return { success: true };
+  }
+
+  async listItemsWithOpfsMedia(): Promise<
+    { id: string; media: NonNullable<ItemDocType["media"]> }[]
+  > {
+    const db = await getDb();
+    const docs = await db.items
+      .find({ selector: { deletedAt: { $eq: 0 } } })
+      .exec();
+
+    const out: { id: string; media: NonNullable<ItemDocType["media"]> }[] = [];
+    for (const doc of docs) {
+      const media = (doc.get("media") as ItemDocType["media"] | undefined) || [];
+      if (media.some((m) => typeof m?.opfsPath === "string" && m.opfsPath.length > 0)) {
+        const spaceId = (doc.get("spaceId") as string | undefined) || PUBLIC_SPACE_ID;
+        if (spaceId === PRIVATE_SPACE_ID && !spaceSessionService.isUnlocked(PRIVATE_SPACE_ID)) {
+          continue;
+        }
+        out.push({ id: doc.primary, media });
+      }
+    }
+    return out;
+  }
+
+  async update(payload: {
+    id: string;
+    title?: string;
+    url?: string;
+    textContent?: string;
+    source?: ItemDocType["source"];
+    isFavorite?: boolean;
+    authorUsername?: string;
+    likes?: number;
+    upvotes?: number;
+  }): Promise<{ success: boolean; error?: string }> {
+    const db = await getDb();
+    const doc = await db.items.findOne(payload.id).exec();
+    if (!doc) {
+      return { success: false, error: "NOT_FOUND" };
+    }
+
+    const current = doc.toMutableJSON() as ItemDocType;
+    this.assertSpaceUnlocked((current.spaceId as string | undefined) || PUBLIC_SPACE_ID);
+
+    const patchData: Partial<ItemDocType> = {};
+    let embeddingRelevantChanged = false;
+
+    if (payload.title !== undefined && payload.title !== current.title) {
+      const next = payload.title.trim().slice(0, 500);
+      if (next.length > 0) {
+        patchData.title = next;
+        embeddingRelevantChanged = true;
+      }
+    }
+
+    if (payload.url !== undefined && payload.url !== current.url) {
+      const next = payload.url.trim();
+      if (next.length > 0) {
+        try {
+          new URL(next);
+          patchData.url = next;
+        } catch {
+          return { success: false, error: "INVALID_URL" };
+        }
+      }
+    }
+
+    if (payload.textContent !== undefined && payload.textContent !== current.textContent) {
+      patchData.textContent = payload.textContent;
+      embeddingRelevantChanged = true;
+    }
+
+    if (payload.source !== undefined && payload.source !== current.source) {
+      patchData.source = payload.source;
+      embeddingRelevantChanged = true;
+    }
+
+    if (payload.isFavorite !== undefined && payload.isFavorite !== current.isFavorite) {
+      patchData.isFavorite = payload.isFavorite;
+    }
+
+    if (payload.authorUsername !== undefined && payload.authorUsername !== current.authorUsername) {
+      patchData.authorUsername = payload.authorUsername.trim() || undefined;
+    }
+
+    if (payload.likes !== undefined && payload.likes !== current.likes) {
+      patchData.likes = Math.max(0, Math.floor(payload.likes));
+    }
+
+    if (payload.upvotes !== undefined && payload.upvotes !== current.upvotes) {
+      patchData.upvotes = Math.max(0, Math.floor(payload.upvotes));
+    }
+
+    if (Object.keys(patchData).length === 0) {
+      return { success: true };
+    }
+
+    if (embeddingRelevantChanged) {
+      patchData.isDirty = true;
+    }
+    patchData.updatedAt = Date.now();
+
+    const MAX_TRIES = 5;
+    let attempt = 0;
+    while (attempt < MAX_TRIES) {
+      attempt += 1;
+      const fresh = await db.items.findOne(payload.id).exec();
+      if (!fresh) break;
+      try {
+        await fresh.patch(patchData);
+        break;
+      } catch (e: any) {
+        const status = e?.status ?? e?.rxdb?.status ?? e?.parameters?.writeError?.status;
+        if (status !== 409) throw e;
+        continue;
+      }
+    }
+
+    try {
+      chrome.runtime.sendMessage({ type: "DB_CHANGE", scope: "items" });
+    } catch {}
+
+    if (embeddingRelevantChanged) {
+      this.triggerBackgroundProcessing("TRIGGER_EMBEDDING");
+    }
 
     return { success: true };
   }

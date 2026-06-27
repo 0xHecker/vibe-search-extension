@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { formatTabsForClipboard, getClipboardFormat } from "@src/pages/search/components/settings/clipboard-format";
 import {
   FolderPlus,
   FolderInput,
@@ -7,6 +8,7 @@ import {
   Copy,
   ExternalLink,
   MoreHorizontal,
+  Share2,
   X,
   RefreshCw,
   TagsIcon,
@@ -48,13 +50,14 @@ import {
 } from "@src/utils/toast-feedback";
 
 interface BulkActionsBarProps {
-  items: ItemDocType[];
+  items?: ItemDocType[];
   folders: FolderDocType[];
   spaces: SpaceMoveOption[];
-  currentFolderId: string;
+  activeSpaceId?: string;
+  onShareSelectedItems?: (itemIds: string[]) => void;
 }
 
-export const BulkActionsBar = ({ items, folders, spaces, currentFolderId }: BulkActionsBarProps) => {
+export const BulkActionsBar = ({ items = [], folders, spaces, activeSpaceId, onShareSelectedItems }: BulkActionsBarProps) => {
   const {
     selectedIds,
     selectedCount,
@@ -73,11 +76,11 @@ export const BulkActionsBar = ({ items, folders, spaces, currentFolderId }: Bulk
 
   if (!isSelectionMode) return null;
 
-  const selectedItems = getSelectedItems(items);
-  const allSelected = selectedCount === items.length;
-  const someSelected = selectedCount > 0 && selectedCount < items.length;
-  const selectedItemIds = selectedItems.map((item) => item.id);
+  const selectedItems = getSelectedItems();
+  const selectedItemIds = Array.from(selectedIds);
   const selectedLabel = `${selectedCount} tab${selectedCount === 1 ? "" : "s"}`;
+  const allVisibleSelected = items.length > 0 && items.every((i) => selectedIds.has(i.id));
+  const someVisibleSelected = !allVisibleSelected && items.some((i) => selectedIds.has(i.id));
 
   const assertResponseSuccess = (response: any, fallbackMessage: string) => {
     if (response?.success === false || response?.payload?.success === false) {
@@ -86,13 +89,16 @@ export const BulkActionsBar = ({ items, folders, spaces, currentFolderId }: Bulk
   };
 
   const handleCopy = async () => {
-    const urls = selectedItems.map((item) => item.url).join("\n");
-    if (!urls.trim()) {
+    const text = formatTabsForClipboard(
+      selectedItems.map((item) => ({ title: item.title, url: item.url })),
+      getClipboardFormat()
+    );
+    if (!text.trim()) {
       showErrorToast("No URLs available to copy.", { tempo: "quick" });
       return;
     }
     try {
-      await navigator.clipboard.writeText(urls);
+      await navigator.clipboard.writeText(text);
       setIsCopied(true);
       setTimeout(() => setIsCopied(false), 2000);
       showSuccessToast(`Copied ${selectedLabel}.`, { tempo: "quick" });
@@ -108,12 +114,12 @@ export const BulkActionsBar = ({ items, folders, spaces, currentFolderId }: Bulk
       success: `Deleted ${selectedLabel}.`,
       error: (err) => resolveToastErrorMessage(err, `Failed to delete ${selectedLabel}.`),
       action: async () => {
-        for (const item of selectedItems) {
+        for (const id of selectedItemIds) {
           const response = await chrome.runtime.sendMessage({
             service: "items",
             type: "delete",
             target: "offscreen",
-            payload: { id: item.id },
+            payload: { id },
           });
           assertResponseSuccess(response, "Failed to delete selected tab.");
         }
@@ -184,7 +190,6 @@ export const BulkActionsBar = ({ items, folders, spaces, currentFolderId }: Bulk
 
   const handleCreateNewFolder = async () => {
     const folderName = `${selectedCount} tabs - ${new Date().toLocaleDateString()}`;
-    const currentFolder = folders.find((folder) => folder.id === currentFolderId);
     if (selectedItemIds.length === 0) {
       showErrorToast("Select at least one tab to move.", { tempo: "quick" });
       return;
@@ -200,7 +205,7 @@ export const BulkActionsBar = ({ items, folders, spaces, currentFolderId }: Bulk
             service: "folders",
             type: "create",
             target: "offscreen",
-            payload: { name: folderName, userId: "user1", spaceId: currentFolder?.spaceId },
+            payload: { name: folderName, userId: "user1", spaceId: activeSpaceId },
           });
           assertResponseSuccess(createResponse, "Failed to create folder.");
           const newFolder = createResponse.payload as FolderDocType;
@@ -343,10 +348,8 @@ export const BulkActionsBar = ({ items, folders, spaces, currentFolderId }: Bulk
     }
   };
 
-  const otherFolders = folders.filter((f) => f.id !== currentFolderId);
-  const currentFolder = folders.find((folder) => folder.id === currentFolderId);
-  const currentSpaceId = currentFolder?.spaceId;
-  const movableSpaces = spaces.filter((space) => space.id !== currentSpaceId);
+  const otherFolders = folders;
+  const movableSpaces = spaces;
 
   return (
     <>
@@ -360,32 +363,41 @@ export const BulkActionsBar = ({ items, folders, spaces, currentFolderId }: Bulk
           "animate-in slide-in-from-bottom-4 fade-in-0 duration-300"
         )}
       >
-        {/* Selection indicator with toggle */}
-        <button
-          type="button"
-          onClick={() => toggleSelectAll(items)}
-          className={cn(
-            "flex items-center gap-2 px-3 py-1.5 rounded-xl",
-            "text-white/90 hover:bg-white/10 transition-colors",
-            "cursor-pointer"
-          )}
-        >
-          <div
+        {/* Selection indicator + select-all toggle (over the tabs in view) */}
+        {items.length > 0 ? (
+          <button
+            type="button"
+            onClick={() => toggleSelectAll(items)}
+            title={allVisibleSelected ? "Deselect all in view" : "Select all in view"}
             className={cn(
-              "w-5 h-5 rounded-md flex items-center justify-center",
-              "border-2 transition-colors",
-              allSelected
-                ? "bg-white border-white text-foreground-neutral"
-                : someSelected
-                ? "bg-white/50 border-white text-foreground-neutral"
-                : "border-white/40"
+              "flex shrink-0 items-center gap-2 px-3 py-1.5 rounded-xl",
+              "text-white/90 hover:bg-white/10 transition-colors cursor-pointer"
             )}
           >
-            {allSelected && <Check size={12} strokeWidth={3} />}
-            {someSelected && !allSelected && <Minus size={12} strokeWidth={3} />}
+            <div
+              className={cn(
+                "w-5 h-5 rounded-md flex items-center justify-center border-2 transition-colors",
+                allVisibleSelected
+                  ? "bg-white border-white text-foreground-neutral"
+                  : someVisibleSelected
+                  ? "bg-white/50 border-white text-foreground-neutral"
+                  : "border-white/40"
+              )}
+            >
+              {allVisibleSelected && <Check size={12} strokeWidth={3} />}
+              {someVisibleSelected && <Minus size={12} strokeWidth={3} />}
+            </div>
+            <span className="text-sm font-medium tabular-nums whitespace-nowrap">
+              {selectedCount} selected
+            </span>
+          </button>
+        ) : (
+          <div className="flex shrink-0 items-center gap-2 px-3 py-1.5 text-white/90">
+            <span className="text-sm font-medium tabular-nums whitespace-nowrap">
+              {selectedCount} selected
+            </span>
           </div>
-          <span className="text-sm font-medium tabular-nums">{selectedCount} selected</span>
-        </button>
+        )}
 
         <div className="w-px h-6 bg-white/20 mx-1" />
 
@@ -421,9 +433,6 @@ export const BulkActionsBar = ({ items, folders, spaces, currentFolderId }: Bulk
                   >
                     <FolderInput size={16} className="text-foreground-tertiary" />
                     <span className="flex-1 truncate">{folder.name}</span>
-                    <span className="text-xs text-foreground-tertiary">
-                      {items.filter((i) => i.folderId === folder.id).length}
-                    </span>
                   </DropdownMenuItem>
                 ))}
               </>
@@ -438,11 +447,9 @@ export const BulkActionsBar = ({ items, folders, spaces, currentFolderId }: Bulk
                   </DropdownMenuSubTrigger>
                   <DropdownMenuSubContent className="min-w-[220px]">
                     {movableSpaces.map((space) => {
-                      const isLocked = space.isPrivate && !space.access?.isUnlocked;
                       return (
                         <DropdownMenuItem
                           key={space.id}
-                          disabled={isLocked}
                           onSelect={() => {
                             void handleMoveToSpace(space.id);
                           }}
@@ -450,11 +457,6 @@ export const BulkActionsBar = ({ items, folders, spaces, currentFolderId }: Bulk
                         >
                           <FolderInput size={16} className="text-foreground-tertiary" />
                           <span className="flex-1 truncate">{space.name}</span>
-                          {isLocked && (
-                            <span className="text-[10px] text-foreground-tertiary uppercase tracking-[0.08em]">
-                              Locked
-                            </span>
-                          )}
                         </DropdownMenuItem>
                       );
                     })}
@@ -497,6 +499,20 @@ export const BulkActionsBar = ({ items, folders, spaces, currentFolderId }: Bulk
           {isCopied ? <Check size={16} /> : <Copy size={16} />}
           <span className="hidden sm:inline">{isCopied ? "Copied!" : "Copy"}</span>
         </Button>
+
+        {/* Share */}
+        {onShareSelectedItems && (
+          <Button
+            variant="ghost"
+            size="sm"
+            className="text-white/90 hover:text-white hover:bg-white/10 gap-1.5"
+            onClick={() => onShareSelectedItems(selectedItemIds)}
+            title="Share selected tabs as a permanent link"
+          >
+            <Share2 size={16} />
+            <span className="hidden sm:inline">Share</span>
+          </Button>
+        )}
 
         {/* Open dropdown */}
         <DropdownMenu open={isOpenMenuOpen} onOpenChange={setIsOpenMenuOpen}>
@@ -570,7 +586,7 @@ export const BulkActionsBar = ({ items, folders, spaces, currentFolderId }: Bulk
         title={`Delete ${selectedCount} item${selectedCount !== 1 ? "s" : ""}?`}
         description={`This will permanently remove ${selectedCount} tab${
           selectedCount !== 1 ? "s" : ""
-        } from this group. This action cannot be undone.`}
+        }. This action cannot be undone.`}
         confirmLabel="Delete"
         variant="danger"
         onConfirm={handleDelete}

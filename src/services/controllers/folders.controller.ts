@@ -3,6 +3,7 @@ import { FolderDocType } from "@src/schemas/folder_schema";
 import { ItemDocType } from "@src/schemas/item_schema";
 import { v4 as uuidv4 } from "uuid";
 import { databaseManager } from "@src/services/db-manager";
+import { appendUnorderedIds } from "@src/utils/ordered-ids";
 import { PRIVATE_SPACE_ID, PUBLIC_SPACE_ID } from "@src/common/spaces";
 import { spaceSessionService } from "@src/services/space-session.service";
 
@@ -29,6 +30,15 @@ export class FoldersController {
     const spaceId = this.resolveSpaceId(doc.get("spaceId") as string | undefined);
     this.assertSpaceUnlocked(spaceId);
     return doc;
+  }
+
+  async getById(payload: { id: string; skipLockCheck?: boolean }): Promise<FolderDocType | null> {
+    const db = await getDb();
+    const doc = payload.skipLockCheck
+      ? await db.folders.findOne(payload.id).exec()
+      : await this.getFolderWithAccess(db, payload.id);
+    if (!doc) return null;
+    return doc.toMutableJSON() as FolderDocType;
   }
 
   async create(payload: {
@@ -75,7 +85,7 @@ export class FoldersController {
     const db = await getDb();
     const doc = await this.getFolderWithAccess(db, payload.id);
     if (!doc) return { success: false };
-    await doc.patch({ isPinned: payload.value, updatedAt: Date.now() });
+    await doc.incrementalPatch({ isPinned: payload.value, updatedAt: Date.now() });
     try {
       chrome.runtime.sendMessage({ type: "DB_CHANGE", scope: "folders" });
     } catch {}
@@ -86,7 +96,7 @@ export class FoldersController {
     const db = await getDb();
     const doc = await this.getFolderWithAccess(db, payload.id);
     if (!doc) return { success: false };
-    await doc.patch({ isLocked: payload.value, updatedAt: Date.now() });
+    await doc.incrementalPatch({ isLocked: payload.value, updatedAt: Date.now() });
     try {
       chrome.runtime.sendMessage({ type: "DB_CHANGE", scope: "folders" });
     } catch {}
@@ -97,10 +107,7 @@ export class FoldersController {
     const db = await getDb();
     const doc = await this.getFolderWithAccess(db, payload.id);
     if (!doc) return { success: false };
-    await doc.patch({ isCollapsed: payload.value, updatedAt: Date.now() });
-    try {
-      chrome.runtime.sendMessage({ type: "DB_CHANGE", scope: "folders" });
-    } catch {}
+    await doc.incrementalPatch({ isCollapsed: payload.value, updatedAt: Date.now() });
     return { success: true };
   }
 
@@ -109,7 +116,7 @@ export class FoldersController {
     const doc = await this.getFolderWithAccess(db, payload.id);
     if (!doc) return { success: false };
     const name = payload.name.trim().slice(0, 80);
-    await doc.patch({ name, updatedAt: Date.now() });
+    await doc.incrementalPatch({ name, updatedAt: Date.now() });
     try {
       chrome.runtime.sendMessage({ type: "DB_CHANGE", scope: "folders" });
     } catch {}
@@ -147,7 +154,11 @@ export class FoldersController {
     return { success: true };
   }
 
-  async reorder(payload: { orderedIds: string[]; spaceId?: string }): Promise<{ success: boolean }> {
+  async reorder(payload: {
+    orderedIds: string[];
+    spaceId?: string;
+    parentId?: string | null;
+  }): Promise<{ success: boolean }> {
     const db = await getDb();
     if (payload.spaceId) {
       this.assertSpaceUnlocked(this.resolveSpaceId(payload.spaceId));
@@ -159,27 +170,198 @@ export class FoldersController {
       const spaceId = this.resolveSpaceId(doc.get("spaceId") as string | undefined);
       return spaceId !== PRIVATE_SPACE_ID || spaceSessionService.isUnlocked(PRIVATE_SPACE_ID);
     });
-    if (accessibleDocs.length === 0) return { success: true };
-    const allIds = accessibleDocs.map((d) => d.primary);
-    const provided = payload.orderedIds || [];
-    const remainder = allIds.filter((id) => !provided.includes(id));
-    const finalOrder = [...provided, ...remainder];
+    const isSibling = (doc: any): boolean => {
+      if (payload.parentId === undefined) return true;
+      const docParent = doc.get("parentId") || null;
+      const filterParent = (payload.parentId ?? null) || null;
+      return docParent === filterParent;
+    };
+    const siblings = accessibleDocs.filter(isSibling);
+    if (siblings.length === 0) return { success: true };
+    const allIds = siblings.map((d) => d.primary);
+    const provided = (payload.orderedIds || []).filter((id) => id && allIds.includes(id));
+    const finalOrder = appendUnorderedIds(provided, allIds);
     const now = Date.now();
 
+    const lookup = new Map(siblings.map((doc) => [doc.primary as string, doc]));
     for (let i = 0; i < finalOrder.length; i++) {
       const id = finalOrder[i];
-      const doc = await db.folders.findOne(id).exec();
+      const doc = lookup.get(id);
       if (!doc) continue;
-      const current = doc.toMutableJSON() as FolderDocType;
-      const nextOrder = i;
-      if (current.sortOrder !== nextOrder) {
-        await doc.patch({ sortOrder: nextOrder, updatedAt: now });
+      const currentOrder = (doc.get("sortOrder") as number | undefined) ?? 0;
+      if (currentOrder !== i) {
+        await doc.incrementalPatch({ sortOrder: i, updatedAt: now });
       }
     }
     try {
       chrome.runtime.sendMessage({ type: "DB_CHANGE", scope: "folders" });
     } catch {}
     return { success: true };
+  }
+
+  async moveToParent(payload: {
+    folderId: string;
+    parentId: string | null;
+  }): Promise<{ success: boolean; error?: string }> {
+    const db = await getDb();
+    const folderId = (payload.folderId || "").trim();
+    const parentId = payload.parentId ?? null;
+    if (!folderId) return { success: false, error: "FOLDER_ID_REQUIRED" };
+    if (folderId === parentId) {
+      return { success: false, error: "FOLDER_CANNOT_BE_OWN_DESCENDANT" };
+    }
+
+    const folderDoc = await this.getFolderWithAccess(db, folderId);
+    if (!folderDoc) return { success: false, error: "NOT_FOUND" };
+    const folder = folderDoc.toMutableJSON() as FolderDocType;
+    const spaceId = this.resolveSpaceId(folder.spaceId);
+
+    let parentSpaceId = spaceId;
+    let parentDoc: any | null = null;
+    if (parentId) {
+      parentDoc = await this.getFolderWithAccess(db, parentId);
+      if (!parentDoc) return { success: false, error: "PARENT_NOT_FOUND" };
+      const parentFolder = parentDoc.toMutableJSON() as FolderDocType;
+      parentSpaceId = this.resolveSpaceId(parentFolder.spaceId);
+      if (parentSpaceId !== spaceId) {
+        return { success: false, error: "CROSS_SPACE_NESTING_NOT_ALLOWED" };
+      }
+      const descendantIds = await this.collectDescendantIds(folderId, spaceId);
+      if (descendantIds.has(parentId)) {
+        return { success: false, error: "FOLDER_CANNOT_BE_OWN_DESCENDANT" };
+      }
+    }
+
+    if (folder.parentId === parentId) return { success: true };
+
+    const now = Date.now();
+    const patch: Partial<FolderDocType> = { updatedAt: now };
+    if (parentId) {
+      patch.parentId = parentId;
+      const siblings = await db.folders
+        .find({ selector: { parentId: { $eq: parentId }, spaceId: { $eq: spaceId } } })
+        .exec();
+      const maxOrder = siblings.reduce((max, doc) => {
+        const order = (doc.get("sortOrder") as number | undefined) ?? 0;
+        return Math.max(max, order);
+      }, 0);
+      patch.sortOrder = maxOrder + 1;
+    } else {
+      patch.parentId = null;
+      const topLevel = await db.folders
+        .find({ selector: { parentId: { $eq: null }, spaceId: { $eq: spaceId } } })
+        .exec();
+      const maxOrder = topLevel.reduce((max, doc) => {
+        const order = (doc.get("sortOrder") as number | undefined) ?? 0;
+        return Math.max(max, order);
+      }, 0);
+      patch.sortOrder = maxOrder + 1;
+    }
+
+    await folderDoc.incrementalPatch(patch);
+    try {
+      chrome.runtime.sendMessage({ type: "DB_CHANGE", scope: "folders" });
+    } catch {}
+    return { success: true };
+  }
+
+  /**
+   * Merge one tab group into another — the canonical "drop a tab group onto
+   * another tab group" behaviour (see docs/drag-and-drop.md):
+   *   - every tab in the source group moves into the target group (folderId +
+   *     spaceId updated, appended after the target's existing tabs),
+   *   - any sub-groups of the source are re-parented to the target so nothing
+   *     is orphaned,
+   *   - the now-empty source group is deleted.
+   * Merging is destructive (the source group disappears) so callers confirm
+   * first. Locked source groups are refused.
+   */
+  async mergeInto(payload: {
+    sourceFolderId: string;
+    targetFolderId: string;
+  }): Promise<{ success: boolean; movedItems: number; error?: string }> {
+    const db = await getDb();
+    const sourceId = (payload.sourceFolderId || "").trim();
+    const targetId = (payload.targetFolderId || "").trim();
+    if (!sourceId || !targetId || sourceId === targetId) {
+      return { success: false, movedItems: 0, error: "INVALID_MERGE" };
+    }
+    const sourceDoc = await this.getFolderWithAccess(db, sourceId);
+    const targetDoc = await this.getFolderWithAccess(db, targetId);
+    if (!sourceDoc || !targetDoc) return { success: false, movedItems: 0, error: "NOT_FOUND" };
+    if (sourceDoc.get("isLocked") === true) {
+      return { success: false, movedItems: 0, error: "LOCKED" };
+    }
+
+    const targetSpaceId = this.resolveSpaceId(targetDoc.get("spaceId") as string | undefined);
+    const now = Date.now();
+
+    const targetItems = await db.items
+      .find({ selector: { folderId: { $eq: targetId }, deletedAt: { $eq: 0 } } })
+      .exec();
+    let nextOrder =
+      targetItems.reduce(
+        (max, doc) => Math.max(max, (doc.get("chunkOrder") as number | undefined) ?? -1),
+        -1
+      ) + 1;
+
+    const sourceItems = await db.items
+      .find({ selector: { folderId: { $eq: sourceId }, deletedAt: { $eq: 0 } } })
+      .exec();
+    for (const doc of sourceItems) {
+      await doc.incrementalPatch({
+        folderId: targetId,
+        spaceId: targetSpaceId,
+        chunkOrder: nextOrder++,
+        updatedAt: now,
+      });
+    }
+    const movedItems = sourceItems.length;
+
+    // Re-parent any sub-groups of the source so they aren't orphaned.
+    const childFolders = await db.folders
+      .find({ selector: { parentId: { $eq: sourceId } } })
+      .exec();
+    for (const child of childFolders) {
+      await child.incrementalPatch({ parentId: targetId, updatedAt: now });
+    }
+
+    await sourceDoc.remove();
+
+    try {
+      chrome.runtime.sendMessage({ type: "DB_CHANGE", scope: "items" });
+    } catch {}
+    try {
+      chrome.runtime.sendMessage({ type: "DB_CHANGE", scope: "folders" });
+    } catch {}
+
+    return { success: true, movedItems };
+  }
+
+  private async collectDescendantIds(folderId: string, spaceId: string): Promise<Set<string>> {
+    const db = await getDb();
+    const all = await db.folders
+      .find({ selector: { spaceId: { $eq: spaceId } } })
+      .exec();
+    const childrenByParent = new Map<string, string[]>();
+    for (const doc of all) {
+      const parentId = (doc.get("parentId") as string | null | undefined) || null;
+      if (!parentId) continue;
+      const list = childrenByParent.get(parentId) || [];
+      list.push(doc.primary as string);
+      childrenByParent.set(parentId, list);
+    }
+    const visited = new Set<string>();
+    const stack = [folderId];
+    while (stack.length > 0) {
+      const id = stack.pop()!;
+      if (visited.has(id)) continue;
+      visited.add(id);
+      for (const childId of childrenByParent.get(id) || []) {
+        if (!visited.has(childId)) stack.push(childId);
+      }
+    }
+    return visited;
   }
 
   async moveToSpace(payload: {
@@ -204,7 +386,6 @@ export class FoldersController {
     if (targetSpaceDoc.get("isArchived") === true) {
       throw new Error("TARGET_SPACE_ARCHIVED");
     }
-    this.assertSpaceUnlocked(targetSpaceId);
 
     if ((folder.spaceId || PUBLIC_SPACE_ID) === targetSpaceId) {
       return { success: true, movedItems: 0 };
@@ -217,7 +398,7 @@ export class FoldersController {
       return Math.max(max, sortOrder);
     }, 0);
 
-    await folderDoc.patch({
+    await folderDoc.incrementalPatch({
       spaceId: targetSpaceId,
       sortOrder: maxSortOrder + 1,
       updatedAt: now,
@@ -276,7 +457,6 @@ export class FoldersController {
     if (targetSpaceDoc.get("isArchived") === true) {
       throw new Error("TARGET_SPACE_ARCHIVED");
     }
-    this.assertSpaceUnlocked(targetSpaceId);
 
     const now = Date.now();
     const targetFolders = await db.folders.find({ selector: { spaceId: { $eq: targetSpaceId } } }).exec();

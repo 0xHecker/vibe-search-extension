@@ -11,6 +11,24 @@ const TOAST_DURATION_BY_TEMPO: Record<ToastTempo, number> = {
 const resolveDuration = (tempo?: ToastTempo): number =>
   TOAST_DURATION_BY_TEMPO[tempo || "default"];
 
+const SUCCESS_STYLE = {
+  background: "var(--color-background-positive-faded)",
+  color: "var(--color-foreground-positive)",
+  borderColor: "var(--color-border-positive-faded)",
+} as const;
+
+const ERROR_STYLE = {
+  background: "var(--color-background-danger-faded)",
+  color: "var(--color-foreground-danger)",
+  borderColor: "var(--color-border-danger-faded)",
+} as const;
+
+const LOADING_STYLE = {
+  background: "var(--background-neutral)",
+  color: "var(--foreground-secondary)",
+  borderColor: "var(--border-neutral-faded)",
+} as const;
+
 export const resolveToastErrorMessage = (
   error: unknown,
   fallback = "Something went wrong."
@@ -21,7 +39,10 @@ export const resolveToastErrorMessage = (
 };
 
 export const showLoadingToast = (message: string, tempo: ToastTempo = "default") =>
-  toast.loading(message, { duration: resolveDuration(tempo) });
+  toast.loading(message, {
+    duration: resolveDuration(tempo),
+    style: LOADING_STYLE,
+  });
 
 export const showSuccessToast = (
   message: string,
@@ -30,6 +51,7 @@ export const showSuccessToast = (
   toast.success(message, {
     id: options?.id,
     duration: resolveDuration(options?.tempo),
+    style: SUCCESS_STYLE,
   });
 
 export const showErrorToast = (
@@ -39,6 +61,7 @@ export const showErrorToast = (
   toast.error(message, {
     id: options?.id,
     duration: resolveDuration(options?.tempo || "long"),
+    style: ERROR_STYLE,
   });
 
 export const withToast = async <T,>({

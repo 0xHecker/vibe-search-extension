@@ -1,10 +1,18 @@
 import { RxJsonSchema } from "rxdb";
-import { DEFAULT_PRIVATE_AUTO_LOCK_MS } from "@src/common/spaces";
+import {
+  DEFAULT_PRIVATE_AUTO_LOCK_MS,
+  SPACE_NOT_BINNED,
+} from "@src/common/spaces";
+
+// RxDB only permits single-type indexed fields. The empty string represents a
+// space without a group in storage; controllers expose it as null to callers.
+export const UNGROUPED_SPACE_GROUP_ID = "";
 
 export type SpaceDocType = {
   id: string;
   name: string;
   slug: string;
+  spaceGroupId: string;
   isPrivate: boolean;
   passwordSalt?: string;
   passwordHash?: string;
@@ -21,13 +29,15 @@ export type SpaceDocType = {
   autoLockMs: number;
   sortOrder: number;
   isArchived: boolean;
+  deletedAt: number;
+  purgeAt: number;
   createdAt: number;
   updatedAt: number;
 };
 
 export const spaceSchema: RxJsonSchema<SpaceDocType> = {
   title: "space schema",
-  version: 1,
+  version: 0,
   description: "Describes a space used to scope folders and items",
   primaryKey: "id",
   type: "object",
@@ -35,6 +45,7 @@ export const spaceSchema: RxJsonSchema<SpaceDocType> = {
     id: { type: "string", maxLength: 100 },
     name: { type: "string", maxLength: 80 },
     slug: { type: "string", maxLength: 120 },
+    spaceGroupId: { type: "string", default: UNGROUPED_SPACE_GROUP_ID, maxLength: 100 },
     isPrivate: { type: "boolean", default: false },
     passwordSalt: { type: "string" },
     passwordHash: { type: "string" },
@@ -63,6 +74,8 @@ export const spaceSchema: RxJsonSchema<SpaceDocType> = {
       default: 0,
     },
     isArchived: { type: "boolean", default: false },
+    deletedAt: { type: "integer", minimum: 0, maximum: Number.MAX_SAFE_INTEGER - 1, multipleOf: 1, default: SPACE_NOT_BINNED },
+    purgeAt: { type: "integer", minimum: 0, maximum: Number.MAX_SAFE_INTEGER - 1, multipleOf: 1, default: 0 },
     createdAt: {
       type: "integer",
       minimum: 0,
@@ -80,12 +93,15 @@ export const spaceSchema: RxJsonSchema<SpaceDocType> = {
     "id",
     "name",
     "slug",
+    "spaceGroupId",
     "isPrivate",
     "autoLockMs",
     "sortOrder",
     "isArchived",
+    "deletedAt",
+    "purgeAt",
     "createdAt",
     "updatedAt",
   ],
-  indexes: ["isPrivate", "sortOrder", "name", "isArchived", "slug"],
+  indexes: ["isPrivate", "sortOrder", "name", "isArchived", "slug", "spaceGroupId", "deletedAt", "purgeAt"],
 };

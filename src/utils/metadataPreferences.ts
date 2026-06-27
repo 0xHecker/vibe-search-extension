@@ -7,7 +7,7 @@ const stripWhitespace = (value: string): string => value.trim();
 export const DEFAULT_METADATA_PREFERENCES: Record<MetadataPreferenceKey, string[]> = {
   title: ["ogTitle", "twitterTitle", "title"],
   description: ["ogDescription", "twitterDescription", "description"],
-  image: ["ogImage", "twitterImage", "image"],
+  image: ["twitterImage", "ogImage", "image"],
 };
 
 const DOMAIN_METADATA_PREFERENCES: Record<string, DomainMetadataPreference> = {

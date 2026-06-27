@@ -51,6 +51,11 @@ const pendingModelFetches = new Map<
 
 const createId = (): string => `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
 
+// The OCR sandbox is a manifest sandbox page, so it runs in an opaque origin
+// ("null"). It cannot target the parent's chrome-extension:// origin, and the
+// parent cannot target this opaque origin either — so both sides post with "*"
+// and authenticate via event.source. Targeting a concrete origin silently drops
+// every message, which surfaced as a 30s "OCR sandbox did not initialize."
 const postToParent = (message: SandboxMessage, transfer: Transferable[] = []) => {
   window.parent.postMessage(message, "*", transfer);
 };
@@ -137,6 +142,7 @@ const runOcr = async (payload: Extract<ParentMessage, { type: "runOcr" }>["paylo
 };
 
 window.addEventListener("message", (event: MessageEvent<ParentMessage>) => {
+  if (event.source !== window.parent) return;
   const message = event.data;
   if (!message || message.target !== "vibe-search-ocr-parent") return;
 

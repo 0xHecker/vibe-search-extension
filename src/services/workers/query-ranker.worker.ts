@@ -10,6 +10,11 @@ import type {
   RankQueryWorkerResponse,
   RankQueryWorkerResult,
 } from "@src/search-core/contracts";
+import {
+  computeBaseRelevance,
+  shouldKeepHybridRankHit,
+  VECTOR_HIT_FLOOR,
+} from "@src/search-core/hybrid-ranking";
 
 const normalizeText = (input: string): string =>
   input
@@ -244,7 +249,6 @@ const fromCursor = (cursor: RankQueryCursor): RankedEntry => ({
 });
 
 const rank = (request: RankQueryWorkerRequest): RankQueryWorkerResult => {
-  const RRF_K = 60;
   const RECENCY_TIE_BREAK_WEIGHT = 0.45;
   const { payload } = request;
   const lexicalScores = new Map(payload.lexicalScores);
@@ -260,18 +264,22 @@ const rank = (request: RankQueryWorkerRequest): RankQueryWorkerResult => {
   const hasPositiveTextTerms = payload.flatPositiveTerms.length > 0;
   const hasLexicalScores = lexicalScores.size > 0;
   const needsTextEvaluation = payload.hasTextConstraint || (payload.useLexical && !hasLexicalScores);
-  const reciprocalRank = (rank?: number): number => (rank ? 1 / (RRF_K + rank) : 0);
-  const maxRrfScore = reciprocalRank(1) * 2;
-  const lexicalRankById = new Map<string, number>(
-    Array.from(lexicalScores.entries())
-      .sort((a, b) => b[1] - a[1])
-      .map(([id], index) => [id, index + 1])
-  );
-  const vectorRankByIndex = new Map<number, number>(
-    Array.from(vectorScoresByIndex.entries())
-      .sort((a, b) => b[1] - a[1])
-      .map(([index], rank) => [index, rank + 1])
-  );
+  // Ranks are only used to populate the debug payload. Computing them sorts the
+  // full lexical and vector score maps, so skip that work unless debug is on.
+  const lexicalRankById = payload.includeDebug
+    ? new Map<string, number>(
+        Array.from(lexicalScores.entries())
+          .sort((a, b) => b[1] - a[1])
+          .map(([id], index) => [id, index + 1])
+      )
+    : null;
+  const vectorRankByIndex = payload.includeDebug
+    ? new Map<number, number>(
+        Array.from(vectorScoresByIndex.entries())
+          .sort((a, b) => b[1] - a[1])
+          .map(([index], rank) => [index, rank + 1])
+      )
+    : null;
   const getVectorIndexes = (item: RankableItem): number[] => {
     const fallback =
       typeof item.vector_index === "number" && Number.isInteger(item.vector_index) && item.vector_index >= 0
@@ -285,18 +293,19 @@ const rank = (request: RankQueryWorkerRequest): RankQueryWorkerResult => {
   const getBestVectorHit = (item: RankableItem): { score: number; rank?: number; hasHit: boolean } => {
     let bestScore = 0;
     let bestRank: number | undefined;
-    let hasHit = false;
+    let found = false;
     for (const index of getVectorIndexes(item)) {
       if (!vectorScoresByIndex.has(index)) continue;
       const score = vectorScoresByIndex.get(index) || 0;
-      const rank = vectorRankByIndex.get(index);
-      if (!hasHit || score > bestScore) {
+      if (!found || score > bestScore) {
         bestScore = score;
-        bestRank = rank;
-        hasHit = true;
+        bestRank = vectorRankByIndex?.get(index);
+        found = true;
       }
     }
-    return { score: bestScore, rank: bestRank, hasHit };
+    // Treat near-orthogonal neighbours as misses so they neither rank on vector
+    // signal nor pass the hybrid keep filter on vector alone.
+    return { score: bestScore, rank: bestRank, hasHit: found && bestScore >= VECTOR_HIT_FLOOR };
   };
 
   const ranked: RankedEntry[] = payload.items.map((item) => {
@@ -332,28 +341,20 @@ const rank = (request: RankQueryWorkerRequest): RankQueryWorkerResult => {
     const vectorHit = getBestVectorHit(item);
     const vectorScore = vectorHit.score;
     const hasVectorHit = vectorHit.hasHit;
-    const lexicalRank = payload.useLexical ? lexicalRankById.get(item.id) : undefined;
+    const lexicalRank = payload.useLexical ? lexicalRankById?.get(item.id) : undefined;
     const vectorRank = payload.useVector ? vectorHit.rank : undefined;
 
-    const normalizedTextScore = payload.useLexical
-      ? lexicalScore > 0 && maxLexicalScore > 0
-        ? Math.min(1, lexicalScore / maxLexicalScore)
-        : Math.min(1, boolMatch.matchedTermCount / 4)
-      : 0;
-    const normalizedVectorScore = hasVectorHit ? (vectorScore + 1) / 2 : 0;
-    let baseRelevance = 0;
-    if (payload.useVector && payload.useLexical) {
-      const lexicalRrf = hasLexicalHit ? reciprocalRank(lexicalRank) : 0;
-      const vectorRrf = hasVectorHit ? reciprocalRank(vectorRank) : 0;
-      baseRelevance = maxRrfScore > 0 ? (lexicalRrf + vectorRrf) / maxRrfScore : 0;
-    } else if (payload.useVector) {
-      baseRelevance = normalizedVectorScore;
-    } else if (payload.useLexical) {
-      const termCoverage = hasPositiveTextTerms
-        ? Math.min(1, boolMatch.matchedTermCount / Math.max(1, payload.flatPositiveTerms.length))
-        : 0;
-      baseRelevance = normalizedTextScore + termCoverage * 0.18;
-    }
+    const baseRelevance = computeBaseRelevance({
+      useLexical: payload.useLexical,
+      useVector: payload.useVector,
+      hasLexicalHit,
+      hasVectorHit,
+      vectorScore,
+      lexicalScore,
+      maxLexicalScore,
+      matchedTermCount: boolMatch.matchedTermCount,
+      positiveTermCount: payload.flatPositiveTerms.length,
+    });
     const relevance =
       baseRelevance +
       recencyBoost(item.updatedAt || 0, item.createdAt || 0, now) * RECENCY_TIE_BREAK_WEIGHT;
@@ -391,9 +392,13 @@ const rank = (request: RankQueryWorkerRequest): RankQueryWorkerResult => {
       return entry.boolMatch.matches;
     });
   }
-  if (payload.useVector && !payload.useLexical) {
-    filtered = filtered.filter((entry) => entry.hasVectorHit);
-  }
+  filtered = filtered.filter((entry) =>
+    shouldKeepHybridRankHit(entry, {
+      useLexical: payload.useLexical,
+      useVector: payload.useVector,
+      hasPositiveTextTerms,
+    })
+  );
 
   let vectorHits = 0;
   let lexicalHits = 0;

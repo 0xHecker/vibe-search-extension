@@ -2,6 +2,7 @@ import { databaseManager } from "./db-manager";
 import { vectorStoreService } from "./vector-store.service";
 import { vectorPipelineCoordinator } from "./vector-pipeline-coordinator";
 import { vectorMaintenanceJournalService } from "./vector-maintenance-journal.service";
+import { isMetadataReadyForEmbedding } from "@src/search-core/embedding-state";
 
 const sendProcessStatus = (payload: {
   id: string;
@@ -124,7 +125,7 @@ class SyncService {
    * This is a safe, atomic operation that works on a temporary file and
    * replaces the old one only upon successful completion, preventing data loss.
    */
-  public async rebuildAndCompact() {
+  public async rebuildAndCompact(options?: { reembedMissing?: boolean }) {
     if (this.isSyncing) {
       console.log("Sync already in progress. Skipping.");
       sendProcessStatus({
@@ -187,31 +188,50 @@ class SyncService {
         // Step 2: Create a new temporary vector file
         await vectorStoreService.createNewVectorFile(tempFileName);
 
-        // Step 3: Separate dirty and clean items
-        const dirtyItems = activeItems.filter((item) => item.isDirty);
+        // Step 3: Separate dirty and clean items. A restore/import can be left
+        // without vectors until the user explicitly asks to create them; routine
+        // periodic compaction must not silently start that expensive work.
+        const getVectorIndexes = (item: (typeof activeItems)[number]): number[] => {
+          const primaryIndex =
+            Number.isInteger(item.vector_index) && typeof item.vector_index === "number" && item.vector_index >= 0
+              ? item.vector_index
+              : -1;
+          const indexes =
+            Array.isArray(item.vector_indexes) && item.vector_indexes.length > 0
+              ? item.vector_indexes
+              : primaryIndex >= 0
+                ? [primaryIndex]
+                : [];
+          return indexes.filter((index): index is number => Number.isInteger(index) && index >= 0);
+        };
+        const shouldReembed = (item: (typeof activeItems)[number]) =>
+          isMetadataReadyForEmbedding(item) &&
+          (item.isDirty ||
+            !item.isEmbedded ||
+            (options?.reembedMissing === true && getVectorIndexes(item).length === 0));
+        const dirtyItems = activeItems.filter(shouldReembed);
         const cleanItems = activeItems
-          .filter((item) => !item.isDirty)
+          .filter((item) => !shouldReembed(item))
           .flatMap((item) => {
-            const primaryIndex =
-              Number.isInteger(item.vector_index) && typeof item.vector_index === "number" && item.vector_index >= 0
-                ? item.vector_index
-                : -1;
-            const indexes =
-              Array.isArray(item.vector_indexes) && item.vector_indexes.length > 0
-                ? item.vector_indexes
-                : primaryIndex >= 0
-                  ? [primaryIndex]
-                  : [];
-            return indexes
-              .filter((index): index is number => Number.isInteger(index) && index >= 0)
-              .map((vector_index) => ({ id: item.id, vector_index }));
+            return getVectorIndexes(item).map((vector_index) => ({ id: item.id, vector_index }));
           });
 
         // Step 4: Re-embed dirty items and copy clean vectors
+        let lastReportedEmbedded = 0;
         const { newIndexMap } = await vectorStoreService.rebuildVectors(
           tempFileName,
           dirtyItems,
-          cleanItems
+          cleanItems,
+          ({ completedItems, totalItems }) => {
+            if (completedItems < totalItems && completedItems - lastReportedEmbedded < 100) return;
+            lastReportedEmbedded = completedItems;
+            sendProcessStatus({
+              id: "vector-sync",
+              label: "Vector store",
+              state: "processing",
+              detail: `Embedding ${completedItems.toLocaleString()} of ${totalItems.toLocaleString()} records...`,
+            });
+          }
         );
         await vectorMaintenanceJournalService.setPhase("prepared", {
           operationId,

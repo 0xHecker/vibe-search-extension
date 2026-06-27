@@ -1,0 +1,7 @@
+{
+  "$schema": "https://react.doctor/schema/config.json",
+  "ignore": {
+    "files": ["dist_chrome/**"],
+    "rules": ["deslop/unused-file"]
+  }
+}

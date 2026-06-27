@@ -80,7 +80,7 @@ export const SearchProcessStatus = ({
       ? "bg-background-danger"
       : processingCount > 0
         ? "bg-accent-secondary"
-        : "bg-background-success";
+        : "bg-background-positive";
 
   const openPopover = () => {
     if (closeTimerRef.current !== null) {
@@ -167,7 +167,7 @@ export const SearchProcessStatus = ({
                         status.state === "processing" &&
                           "border-accent-secondary/35 bg-accent-secondary/10 text-foreground-neutral",
                         status.state === "success" &&
-                          "border-background-success/30 bg-background-success/10 text-foreground-neutral"
+                          "border-background-positive/30 bg-background-positive/10 text-foreground-neutral"
                       )}
                     >
                       {stateLabel[status.state]}

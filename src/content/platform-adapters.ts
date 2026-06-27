@@ -165,9 +165,11 @@ const twitter: Adapter = (target) => {
 };
 
 const youtube: Adapter = (target, clickedUrl) => {
-  // Shorts: /shorts/ID
-  if (window.location.pathname.startsWith("/shorts/")) {
-    const videoId = window.location.pathname.split("/shorts/")[1]?.split(/[?#]/)[0];
+  const shortVideoId =
+    window.location.pathname.match(/\/shorts\/([^/?#]+)/)?.[1] ||
+    clickedUrl?.match(/\/shorts\/([^/?#]+)/)?.[1];
+  if (shortVideoId) {
+    const videoId = shortVideoId;
     const canonicalUrl = videoId ? `https://www.youtube.com/watch?v=${videoId}` : window.location.href;
     const titleEl = qs(document, "#title h2, ytd-reel-video-renderer h2");
     const channelEl = qs(document, "ytd-channel-name a, #channel-name a");
@@ -291,8 +293,9 @@ const linkedin: Adapter = (target) => {
 
 const medium: Adapter = (target) => {
   const article = closest(target, "article");
-  const canonicalUrl = getMeta("url") || window.location.href;
-  const title = getMeta("title") || text(qs(document, "h1"));
+  const articleLink = qs(article || document, 'a[href*="/@"], a[href*="/p/"]');
+  const canonicalUrl = resolveUrl(attr(articleLink, "href")) || getMeta("url") || window.location.href;
+  const title = text(articleLink) || getMeta("title") || text(qs(document, "h1"));
   const author = getMeta("author") || text(qs(document, 'a[rel="author"]')) || undefined;
   const description = getMeta("description");
   const thumbnailUrl = resolveUrl(getMeta("image"));
@@ -308,8 +311,10 @@ const medium: Adapter = (target) => {
 };
 
 const substack: Adapter = (target) => {
-  const canonicalUrl = getMeta("url") || window.location.href;
-  const title = getMeta("title") || text(qs(document, "h1.post-title"));
+  const article = closest(target, "article, .post-preview, [class*='post-preview']");
+  const articleLink = qs(article || document, 'a[href*="/p/"]');
+  const canonicalUrl = resolveUrl(attr(articleLink, "href")) || getMeta("url") || window.location.href;
+  const title = text(articleLink) || getMeta("title") || text(qs(document, "h1.post-title"));
   const author = getMeta("author") || text(qs(document, ".author-name")) || undefined;
   const description = getMeta("description");
   const thumbnailUrl = resolveUrl(getMeta("image"));

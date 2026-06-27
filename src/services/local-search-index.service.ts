@@ -17,9 +17,16 @@ type IndexedSearchDoc = {
 
 type SearchRequest = {
   query: string;
+  queries?: string[];
   limit: number;
   keyword?: boolean;
   fuzzy?: boolean;
+};
+
+type SearchVariant = {
+  query: string;
+  boost: number;
+  suggest: boolean;
 };
 
 type SearchStats = {
@@ -167,6 +174,11 @@ export class LocalSearchIndexService {
   }
 
   scheduleItemSync(changedItemIds?: string[]) {
+    // A full rebuild supersedes every queued per-item update. This is especially
+    // important for bulk imports, where holding thousands of IDs only creates
+    // duplicate work and a temporary memory spike.
+    if (this.dirty) return;
+
     if (changedItemIds && changedItemIds.length > 0) {
       for (const itemId of changedItemIds) {
         if (itemId) {
@@ -180,7 +192,6 @@ export class LocalSearchIndexService {
       return;
     }
 
-    if (this.dirty) return;
     if (this.incrementalTimer !== null) return;
     this.incrementalTimer = setTimeout(() => {
       this.incrementalTimer = null;
@@ -201,7 +212,9 @@ export class LocalSearchIndexService {
       tokenize: "forward",
       encoder: Charset.LatinAdvanced,
       resolution: 6,
-      cache: 6000,
+      // Cache recent query plans, not an unbounded browsing session. A few
+      // hundred covers normal type-ahead while keeping long-lived memory flat.
+      cache: 256,
       worker,
       document: {
         id: "id",
@@ -435,62 +448,58 @@ export class LocalSearchIndexService {
     query: string,
     keyword: boolean,
     fuzzy: boolean
-  ): Array<{ query: string; boost: number }> {
+  ): SearchVariant[] {
     const normalized = normalizeForIndex(query);
     if (!normalized) return [];
 
-    const byQuery = new Map<string, number>();
-    const addVariant = (variantQuery: string, boost: number) => {
+    const byQuery = new Map<string, { boost: number; suggest: boolean }>();
+    const addVariant = (variantQuery: string, boost: number, suggest: boolean) => {
       const clean = normalizeForIndex(variantQuery);
       if (!clean) return;
       const current = byQuery.get(clean);
-      if (current === undefined || boost > current) {
-        byQuery.set(clean, boost);
+      if (!current || boost > current.boost) {
+        byQuery.set(clean, { boost, suggest });
+        return;
       }
+      current.suggest = current.suggest && suggest;
     };
 
     if (keyword) {
-      addVariant(normalized, 1);
+      // Keyword mode must not quietly turn into fuzzy OR matching.
+      addVariant(normalized, 1, false);
     }
 
-    if (!fuzzy) {
-      return Array.from(byQuery.entries()).map(([variantQuery, boost]) => ({
-        query: variantQuery,
-        boost,
-      }));
-    }
+    if (fuzzy) {
+      addVariant(normalized, keyword ? 0.9 : 1, true);
 
-    const tokens = normalized.split(/\s+/).filter(Boolean);
-    const prefix = tokens
-      .map((token) => {
-        if (token.length <= 3) return token;
-        return token.slice(0, token.length - 1);
-      })
-      .join(" ")
-      .trim();
-    if (prefix && prefix !== normalized) {
-      addVariant(prefix, keyword ? 0.42 : 0.92);
-    }
+      const tokens = normalized.split(/\s+/).filter(Boolean);
+      const prefix = tokens
+        .map((token) => {
+          if (token.length <= 3) return token;
+          return token.slice(0, token.length - 1);
+        })
+        .join(" ")
+        .trim();
+      if (prefix && prefix !== normalized) {
+        addVariant(prefix, keyword ? 0.42 : 0.92, true);
+      }
 
-    const phonetic = toPhoneticQuery(normalized);
-    if (phonetic && phonetic !== normalized) {
-      addVariant(phonetic, keyword ? 0.36 : 0.78);
-    }
-
-    if (!keyword && byQuery.size === 0) {
-      // Fuzzy-only mode still needs a fallback for short/symbol-heavy input.
-      addVariant(normalized, 0.68);
+      const phonetic = toPhoneticQuery(normalized);
+      if (phonetic && phonetic !== normalized) {
+        addVariant(phonetic, keyword ? 0.36 : 0.78, true);
+      }
     }
 
     return Array.from(byQuery.entries())
-      .map(([variantQuery, boost]) => ({ query: variantQuery, boost }))
+      .map(([variantQuery, options]) => ({ query: variantQuery, ...options }))
       .sort((a, b) => b.boost - a.boost);
   }
 
   private accumulateScores(
     rawResults: unknown,
     scoreMap: Map<string, number>,
-    variantBoost: number
+    variantBoost: number,
+    includeOcrText: boolean
   ) {
     if (!Array.isArray(rawResults)) return;
 
@@ -499,6 +508,10 @@ export class LocalSearchIndexService {
         continue;
       }
       const typed = row as { field?: string; result?: unknown[] };
+      // OCR text is a keyword-only signal: only exact keyword variants may match
+      // it. Fuzzy variants (prefix + phonetic expansion) skip it, otherwise
+      // noisy image-extracted text pollutes fuzzy results.
+      if (!includeOcrText && typed.field === "ocrText") continue;
       const results = Array.isArray(typed.result) ? typed.result : [];
       const weight = FIELD_WEIGHTS[typed.field || ""] || 1;
       for (let index = 0; index < results.length; index += 1) {
@@ -510,25 +523,34 @@ export class LocalSearchIndexService {
     }
   }
 
-  async search({ query, limit, keyword, fuzzy }: SearchRequest): Promise<Map<string, number>> {
+  async search({ query, queries, limit, keyword, fuzzy }: SearchRequest): Promise<Map<string, number>> {
     await this.ensureReady();
     if (!this.index) return new Map();
 
     const safeLimit = clamp(limit, 20, 2500);
     const includeKeyword = keyword !== false;
     const includeFuzzy = fuzzy === true;
-    const variants = this.buildVariants(query, includeKeyword, includeFuzzy);
-    if (variants.length === 0) return new Map();
+    const queryInputs = Array.from(
+      new Set(
+        (queries?.length ? queries : [query])
+          .map((value) => normalizeForIndex(value))
+          .filter(Boolean)
+      )
+    ).slice(0, 12);
+    if (queryInputs.length === 0) return new Map();
     const scoreMap = new Map<string, number>();
 
-    for (const variant of variants) {
-      const results = await Promise.resolve(
-        (this.index as any).search(variant.query, {
-          limit: safeLimit * 3,
-          suggest: true,
-        })
-      );
-      this.accumulateScores(results, scoreMap, variant.boost);
+    for (const queryInput of queryInputs) {
+      const variants = this.buildVariants(queryInput, includeKeyword, includeFuzzy);
+      for (const variant of variants) {
+        const results = await Promise.resolve(
+          (this.index as any).search(variant.query, {
+            limit: safeLimit * 3,
+            suggest: variant.suggest,
+          })
+        );
+        this.accumulateScores(results, scoreMap, variant.boost, !variant.suggest);
+      }
     }
 
     return scoreMap;

@@ -7,9 +7,18 @@ import { itemsController } from "@src/services/controllers/items.controller";
 import { foldersController } from "@src/services/controllers/folders.controller";
 import { tagsController } from "@src/services/controllers/tags.controller";
 import { spacesController } from "@src/services/controllers/spaces.controller";
+import { spaceGroupsController } from "@src/services/controllers/space-groups.controller";
 import { vectorPipelineCoordinator } from "@src/services/vector-pipeline-coordinator";
 import { queryRankerService } from "@src/services/query-ranker.service";
+import { browserBookmarkImportService } from "@src/services/browser-bookmark-import";
+import { githubStarsImportService } from "@src/services/github-stars-import";
 import { ocrService, OCR_MODEL_VERSION } from "@src/services/ocr.service";
+import {
+  isEmbeddingStateOnlyItemChange,
+  isFolderCollapseOnlyChange,
+  isMetadataEnrichmentItemChange,
+  isSpaceGroupCollapseOnlyChange,
+} from "@src/services/item-change-classification";
 import type { ItemDocType } from "@src/schemas/item_schema";
 import { composeEmbeddingTexts, EMBEDDING_TEXT_VERSION } from "@src/search-core/embedding-text";
 
@@ -37,12 +46,16 @@ const sendProcessStatus = (payload: {
   } catch {}
 };
 
-type DbChangeScope = "items" | "folders" | "tags" | "spaces";
+type DbChangeScope = "items" | "folders" | "tags" | "spaces" | "space_groups";
+type ItemChangeKind = "content" | "metadata";
 
 const DB_CHANGE_FLUSH_MS = 160;
 let dbChangeFlushTimer: number | null = null;
 const pendingDbScopes = new Set<DbChangeScope>();
 const pendingItemIds = new Set<string>();
+let pendingItemChangeKind: ItemChangeKind | null = null;
+let dbChangeSuppressionDepth = 0;
+const deferredDbScopes = new Set<DbChangeScope>();
 
 const flushDbChanges = () => {
   dbChangeFlushTimer = null;
@@ -51,6 +64,8 @@ const flushDbChanges = () => {
 
   const changedItemIds = Array.from(pendingItemIds).slice(0, 4000);
   pendingItemIds.clear();
+  const itemChangeKind = pendingItemChangeKind || "content";
+  pendingItemChangeKind = null;
 
   for (const scope of scopes) {
     try {
@@ -58,6 +73,7 @@ const flushDbChanges = () => {
         type: "DB_CHANGE",
         scope,
         changedItemIds: scope === "items" ? changedItemIds : undefined,
+        itemChangeKind: scope === "items" ? itemChangeKind : undefined,
         isCoalesced: true,
       });
     } catch {}
@@ -86,12 +102,29 @@ const isTrustedForwarderSender = (sender: chrome.runtime.MessageSender): boolean
   }
 };
 
-const scheduleDbChange = (scope: DbChangeScope, changedItemIds?: string[]) => {
+const scheduleDbChange = (
+  scope: DbChangeScope,
+  changedItemIds?: string[],
+  itemChangeKind: ItemChangeKind = "content"
+) => {
+  // Bulk import writes can emit a collection event for every database batch.
+  // Defer those while the import runs and publish one final refresh instead.
+  if (dbChangeSuppressionDepth > 0) {
+    deferredDbScopes.add(scope);
+    return;
+  }
+
   pendingDbScopes.add(scope);
-  if (scope === "items" && changedItemIds && changedItemIds.length > 0) {
-    for (const itemId of changedItemIds) {
-      if (itemId) pendingItemIds.add(itemId);
+  if (scope === "items") {
+    if (changedItemIds && changedItemIds.length > 0) {
+      for (const itemId of changedItemIds) {
+        if (itemId) pendingItemIds.add(itemId);
+      }
     }
+    pendingItemChangeKind =
+      pendingItemChangeKind === "content" || itemChangeKind === "content"
+        ? "content"
+        : "metadata";
   }
 
   if (dbChangeFlushTimer !== null) return;
@@ -181,9 +214,58 @@ const ocrController = {
   },
 };
 
+const browserBookmarkImportController = {
+  async importTree(payload: Parameters<typeof browserBookmarkImportService.importTree>[0]) {
+    dbChangeSuppressionDepth += 1;
+    try {
+      return await browserBookmarkImportService.importTree(payload);
+    } finally {
+      dbChangeSuppressionDepth = Math.max(0, dbChangeSuppressionDepth - 1);
+      if (dbChangeSuppressionDepth === 0) {
+        const scopes = Array.from(deferredDbScopes);
+        deferredDbScopes.clear();
+        for (const scope of scopes) scheduleDbChange(scope);
+      }
+    }
+  },
+};
+
+const githubStarsImportController = {
+  async importStars(payload: Parameters<typeof githubStarsImportService.importStars>[0]) {
+    dbChangeSuppressionDepth += 1;
+    try {
+      return await githubStarsImportService.importStars(payload);
+    } finally {
+      dbChangeSuppressionDepth = Math.max(0, dbChangeSuppressionDepth - 1);
+      if (dbChangeSuppressionDepth === 0) {
+        const scopes = Array.from(deferredDbScopes);
+        deferredDbScopes.clear();
+        for (const scope of scopes) scheduleDbChange(scope);
+      }
+    }
+  },
+};
+
 // Register all the services that the offscreen document will manage.
 router.registerService("dbManager", databaseManager, {
-  methods: ["getAllFolders", "getImportTargets"],
+  methods: [
+    "getAllFolders",
+    "getImportTargets",
+    "buildExportSnapshot",
+    "importSharedSnapshot",
+    "buildLocalExtensionMigrationBundle",
+    "stageLocalExtensionMigrationBundle",
+    "restoreStagedLocalExtensionMigrationBundle",
+    "restoreLocalExtensionMigrationBundle",
+    "mergeBackupSnapshot",
+    "deleteAllData",
+  ],
+});
+router.registerService("browserBookmarks", browserBookmarkImportController, {
+  methods: ["importTree"],
+});
+router.registerService("githubStars", githubStarsImportController, {
+  methods: ["importStars"],
 });
 router.registerService("sync", syncService, {
   methods: ["rebuildAndCompact"],
@@ -191,20 +273,29 @@ router.registerService("sync", syncService, {
 router.registerService("items", itemsController, {
   methods: [
     "saveFetchedMetadata",
+    "getByIds",
     "markSearchIndexDirty",
     "queryLocal",
     "addToFolder",
     "addMany",
     "refetchMetadata",
     "moveToSpace",
+    "copyToSpace",
     "moveToFolder",
     "reorder",
     "delete",
+    "update",
+    "updateMedia",
+    "removeMedia",
+    "addMedia",
+    "replaceMedia",
+    "listItemsWithOpfsMedia",
   ],
 });
 router.registerService("folders", foldersController, {
   methods: [
     "create",
+    "getById",
     "setPinned",
     "setLocked",
     "setCollapsed",
@@ -213,10 +304,23 @@ router.registerService("folders", foldersController, {
     "reorder",
     "moveToSpace",
     "copyToSpace",
+    "moveToParent",
+    "mergeInto",
   ],
 });
 router.registerService("tags", tagsController, {
-  methods: ["getTagsForItem", "searchTags", "addTagToItem", "removeTagFromItem"],
+  methods: [
+    "getTagsForItem",
+    "searchTags",
+    "addTagToItem",
+    "removeTagFromItem",
+    "listAllTags",
+    "createTag",
+    "renameTag",
+    "deleteTag",
+    "setTagColor",
+    "setTagFavorite",
+  ],
 });
 router.registerService("spaces", spacesController, {
   methods: [
@@ -230,6 +334,24 @@ router.registerService("spaces", spacesController, {
     "lockSpace",
     "touchSpaceActivity",
     "getSpaceAccessState",
+    "moveToSpaceGroup",
+    "moveToBin",
+    "restoreFromBin",
+    "listBinSpaces",
+    "purgeExpired",
+    "deleteSpaceForever",
+    "reorderSpaces",
+  ],
+});
+router.registerService("spaceGroups", spaceGroupsController, {
+  methods: [
+    "listSpaceGroups",
+    "createSpaceGroup",
+    "renameSpaceGroup",
+    "setCollapsed",
+    "resolveDropSpace",
+    "deleteSpaceGroup",
+    "reorderSpaceGroups",
   ],
 });
 router.registerService("ocr", ocrController, {
@@ -241,7 +363,15 @@ router.listen();
 
 // --- Robust Embedding Queue ---
 const EMBEDDING_BATCH_SIZE = 20; // Process 20 items at a time for embeddings
+// A single worker request carries at most this many sentences (chunks). It caps
+// how long the embedding worker is busy per request so an interactive search
+// query (sent at higher priority) waits at most one short request, and keeps
+// each OPFS vector append small. The worker further micro-batches internally to
+// bound inference memory.
+const MAX_SENTENCES_PER_EMBED_REQUEST = 16;
 const EMBEDDING_SCHEMA_VERSION_STORAGE_KEY = "vibe.search.embeddingTextVersion";
+const EMBEDDING_STATE_REPAIR_VERSION_STORAGE_KEY = "vibe.search.embeddingStateRepairVersion";
+const EMBEDDING_STATE_REPAIR_VERSION = "v1";
 let isEmbeddingRunning = false;
 let embeddingScheduled = false;
 let embeddingCheckTimer: number | null = null;
@@ -290,6 +420,33 @@ const setStoredEmbeddingTextVersion = async (version: string): Promise<void> => 
   } catch {}
 };
 
+const getStoredEmbeddingStateRepairVersion = async (): Promise<string> => {
+  const storage = getExtensionStorageLocal();
+  if (storage) {
+    const values = await storage.get(EMBEDDING_STATE_REPAIR_VERSION_STORAGE_KEY);
+    const value = values[EMBEDDING_STATE_REPAIR_VERSION_STORAGE_KEY];
+    return typeof value === "string" ? value : "";
+  }
+
+  try {
+    return globalThis.localStorage?.getItem(EMBEDDING_STATE_REPAIR_VERSION_STORAGE_KEY) || "";
+  } catch {
+    return "";
+  }
+};
+
+const setStoredEmbeddingStateRepairVersion = async (version: string): Promise<void> => {
+  const storage = getExtensionStorageLocal();
+  if (storage) {
+    await storage.set({ [EMBEDDING_STATE_REPAIR_VERSION_STORAGE_KEY]: version });
+    return;
+  }
+
+  try {
+    globalThis.localStorage?.setItem(EMBEDDING_STATE_REPAIR_VERSION_STORAGE_KEY, version);
+  } catch {}
+};
+
 const ensureEmbeddingSchemaVersion = async () => {
   try {
     const currentVersion = await getStoredEmbeddingTextVersion();
@@ -329,6 +486,40 @@ const ensureEmbeddingSchemaVersion = async () => {
   }
 };
 
+const ensureEmbeddingStateRepair = async () => {
+  try {
+    const currentVersion = await getStoredEmbeddingStateRepairVersion();
+    if (currentVersion === EMBEDDING_STATE_REPAIR_VERSION) return;
+
+    sendProcessStatus({
+      id: "embedding-state",
+      label: "Embedding state",
+      state: "processing",
+      detail: "Repairing records that are missing vectors...",
+    });
+    const repairedCount = await databaseManager.repairItemsMissingVectors();
+    await setStoredEmbeddingStateRepairVersion(EMBEDDING_STATE_REPAIR_VERSION);
+    sendProcessStatus({
+      id: "embedding-state",
+      label: "Embedding state",
+      state: "success",
+      detail:
+        repairedCount > 0
+          ? `Queued ${repairedCount} records that were missing vectors.`
+          : "Embedding state is valid.",
+    });
+  } catch (error) {
+    console.error("[Offscreen] Failed embedding state repair:", error);
+    sendProcessStatus({
+      id: "embedding-state",
+      label: "Embedding state",
+      state: "error",
+      detail: error instanceof Error ? error.message : "Failed to repair embedding state.",
+      retryAction: "TRIGGER_EMBEDDING",
+    });
+  }
+};
+
 const maybeReportEmbeddingWait = () => {
   if (vectorPipelineCoordinator.getActiveOperation() === "compaction") {
     if (!embeddingWaitNotified) {
@@ -356,24 +547,36 @@ const runEmbeddingBatch = async (
     const entries = batch.flatMap((item) =>
       composeEmbeddingTexts(item).map((text) => ({ itemId: item.id, text }))
     );
-    const sentences = entries.map((entry) => entry.text);
-    const appendResult = await vectorStoreService.generateAndStoreEmbeddings({ sentences });
-    if (appendResult.appendedCount !== entries.length) {
-      throw new Error(
-        `Embedding append mismatch: expected ${entries.length}, got ${appendResult.appendedCount}`
-      );
-    }
 
+    // Embed in bounded sub-requests so a large OCR-heavy batch cannot lock the
+    // worker (or block an interactive query) for seconds, and so each OPFS
+    // vector append stays small. Vector indexes are contiguous because the
+    // coordinator holds the embedding lock across the whole batch.
     const vectorIndexesByItemId = new Map<string, number[]>();
-    entries.forEach((entry, idx) => {
-      const indexes = vectorIndexesByItemId.get(entry.itemId) || [];
-      indexes.push(appendResult.startIndex + idx);
-      vectorIndexesByItemId.set(entry.itemId, indexes);
-    });
+    let appendedTotal = 0;
+
+    for (let start = 0; start < entries.length; start += MAX_SENTENCES_PER_EMBED_REQUEST) {
+      const slice = entries.slice(start, start + MAX_SENTENCES_PER_EMBED_REQUEST);
+      const appendResult = await vectorStoreService.generateAndStoreEmbeddings({
+        sentences: slice.map((entry) => entry.text),
+        priority: "background",
+      });
+      if (appendResult.appendedCount !== slice.length) {
+        throw new Error(
+          `Embedding append mismatch: expected ${slice.length}, got ${appendResult.appendedCount}`
+        );
+      }
+      slice.forEach((entry, idx) => {
+        const indexes = vectorIndexesByItemId.get(entry.itemId) || [];
+        indexes.push(appendResult.startIndex + idx);
+        vectorIndexesByItemId.set(entry.itemId, indexes);
+      });
+      appendedTotal += appendResult.appendedCount;
+    }
 
     const updates = batch.map((item) => updateForItem(item, vectorIndexesByItemId.get(item.id) || []));
     await databaseManager.bulkUpdateItems(updates);
-    return appendResult.appendedCount;
+    return appendedTotal;
   });
 };
 
@@ -401,16 +604,14 @@ const processEmbeddingQueue = async () => {
   let processError: string | null = null;
   try {
     // Process new items (not yet embedded)
-    let totalNewProcessed = 0;
+    let totalNewItems = 0;
+    let totalNewVectors = 0;
     while (true) {
-      const itemsToEmbed = await databaseManager.getItemsToEmbed();
-      const batch = itemsToEmbed.slice(0, EMBEDDING_BATCH_SIZE);
+      const batch = await databaseManager.getItemsToEmbed({ limit: EMBEDDING_BATCH_SIZE });
 
       if (batch.length === 0) break;
 
-      console.log(
-        `[Offscreen] Embedding ${batch.length} new items (${itemsToEmbed.length} total pending)...`
-      );
+      console.log(`[Offscreen] Embedding ${batch.length} new items...`);
 
       try {
         const appendedCount = await runEmbeddingBatch(batch, (item, vectorIndexes) => ({
@@ -420,15 +621,16 @@ const processEmbeddingQueue = async () => {
           isEmbedded: true,
           isDirty: false,
         }));
-        totalNewProcessed += appendedCount;
+        totalNewItems += batch.length;
+        totalNewVectors += appendedCount;
 
         // Notify UI of progress
-        sendStatusUpdate(`Embedded ${totalNewProcessed} new items...`);
+        sendStatusUpdate(`Embedded ${totalNewItems} new items...`);
         sendProcessStatus({
           id: "embedding-queue",
           label: "Embedding queue",
           state: "processing",
-          detail: `Embedded ${totalNewProcessed} new items...`,
+          detail: `Embedded ${totalNewItems} records (${totalNewVectors} vectors)...`,
         });
       } catch (error) {
         console.error("[Offscreen] Error embedding new items batch:", error);
@@ -437,36 +639,35 @@ const processEmbeddingQueue = async () => {
       }
     }
 
-    if (totalNewProcessed > 0) {
-      console.log(`[Offscreen] Finished embedding ${totalNewProcessed} new items`);
+    if (totalNewItems > 0) {
+      console.log(`[Offscreen] Finished embedding ${totalNewItems} new items`);
     }
 
     // Process dirty items (need re-embedding)
-    const dirtyItems = await databaseManager.getDirtyItems();
-    if (dirtyItems.length > 0) {
-      console.log(`[Offscreen] Re-embedding ${dirtyItems.length} dirty items...`);
+    let totalDirtyItems = 0;
+    while (!processError) {
+      const batch = await databaseManager.getDirtyItems({ limit: EMBEDDING_BATCH_SIZE });
+      if (batch.length === 0) break;
 
-      // Process dirty items in batches too
-      for (let i = 0; i < dirtyItems.length; i += EMBEDDING_BATCH_SIZE) {
-        const batch = dirtyItems.slice(i, i + EMBEDDING_BATCH_SIZE);
-
-        try {
-          await runEmbeddingBatch(batch, (item, vectorIndexes) => ({
-            id: item.id,
-            vector_index: vectorIndexes[0] ?? -1,
-            vector_indexes: vectorIndexes,
-            isEmbedded: true,
-            isDirty: false,
-          }));
-        } catch (error) {
-          console.error("[Offscreen] Error re-embedding dirty items batch:", error);
-          processError =
-            error instanceof Error ? error.message : "Re-embedding failed for a dirty batch";
-          break;
-        }
+      try {
+        await runEmbeddingBatch(batch, (item, vectorIndexes) => ({
+          id: item.id,
+          vector_index: vectorIndexes[0] ?? -1,
+          vector_indexes: vectorIndexes,
+          isEmbedded: true,
+          isDirty: false,
+        }));
+        totalDirtyItems += batch.length;
+        sendProcessStatus({
+          id: "embedding-queue",
+          label: "Embedding queue",
+          state: "processing",
+          detail: `Re-embedded ${totalDirtyItems} records...`,
+        });
+      } catch (error) {
+        console.error("[Offscreen] Error re-embedding dirty items batch:", error);
+        processError = error instanceof Error ? error.message : "Re-embedding failed for a batch";
       }
-
-      console.log(`[Offscreen] Finished re-embedding ${dirtyItems.length} dirty items`);
     }
 
     if (processError) {
@@ -492,6 +693,12 @@ const processEmbeddingQueue = async () => {
     if (embeddingScheduled) {
       setTimeout(processEmbeddingQueue, 100);
     }
+
+    // Embedding blocks OCR (maybeReportOcrWait). Now that we're idle, re-check
+    // the OCR backlog so a just-saved screenshot gets read promptly instead of
+    // waiting on the 5s self-retry. OCR completion then re-triggers embedding,
+    // closing the screenshot → OCR → re-embed loop.
+    scheduleOcrIfNeeded();
   }
 };
 
@@ -517,8 +724,8 @@ const scheduleEmbeddingIfNeeded = () => {
     embeddingCheckTimer = null;
     try {
       const [newItems, dirtyItems] = await Promise.all([
-        databaseManager.getItemsToEmbed(),
-        databaseManager.getDirtyItems(),
+        databaseManager.getItemsToEmbed({ limit: 1 }),
+        databaseManager.getDirtyItems({ limit: 1 }),
       ]);
       if (newItems.length > 0 || dirtyItems.length > 0) {
         triggerEmbedding();
@@ -544,6 +751,72 @@ const maybeReportOcrWait = (): boolean => {
   }
   ocrWaitNotified = false;
   return false;
+};
+
+const activeOcrItemIds = new Set<string>();
+
+const processOcrItem = async (
+  item: ItemDocType,
+  force = false
+): Promise<ItemDocType["ocrStatus"]> => {
+  if (activeOcrItemIds.has(item.id)) return "processing";
+
+  const sourceHash = ocrService.getSourceHash(item);
+  if (
+    !force &&
+    item.ocrStatus === "done" &&
+    item.ocrModelVersion === OCR_MODEL_VERSION &&
+    item.ocrSourceHash === sourceHash
+  ) {
+    return "done";
+  }
+
+  activeOcrItemIds.add(item.id);
+  try {
+    await databaseManager.markItemOcrProcessing({
+      id: item.id,
+      modelVersion: OCR_MODEL_VERSION,
+      sourceHash,
+    });
+    const result = await ocrService.processItem(item);
+    await databaseManager.saveItemOcrResult({
+      id: item.id,
+      status: result.status,
+      modelVersion: OCR_MODEL_VERSION,
+      sourceHash: result.sourceHash,
+      text: result.text,
+      confidence: result.confidence,
+      lineCount: result.lineCount,
+      error: result.error,
+      media: result.media,
+    });
+    return result.status;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "OCR failed for an item";
+    await databaseManager.saveItemOcrResult({
+      id: item.id,
+      status: "error",
+      modelVersion: OCR_MODEL_VERSION,
+      sourceHash,
+      text: item.ocrText || "",
+      confidence: item.ocrConfidence,
+      lineCount: item.ocrLineCount || 0,
+      error: message,
+    });
+    throw error;
+  } finally {
+    activeOcrItemIds.delete(item.id);
+  }
+};
+
+const processOcrItemById = async (
+  itemId: string,
+  force = false
+): Promise<ItemDocType["ocrStatus"]> => {
+  const db = await getDb();
+  const doc = await db.items.findOne(itemId).exec();
+  if (!doc) throw new Error("OCR_ITEM_NOT_FOUND");
+  return processOcrItem(doc.toMutableJSON() as ItemDocType, force);
 };
 
 const processOcrQueue = async () => {
@@ -582,50 +855,15 @@ const processOcrQueue = async () => {
       if (items.length === 0) break;
 
       for (const item of items) {
-        const sourceHash = ocrService.getSourceHash(item);
-        if (
-          item.ocrStatus === "done" &&
-          item.ocrModelVersion === OCR_MODEL_VERSION &&
-          item.ocrSourceHash === sourceHash
-        ) {
-          continue;
-        }
-
         try {
-          await databaseManager.markItemOcrProcessing({
-            id: item.id,
-            modelVersion: OCR_MODEL_VERSION,
-            sourceHash,
-          });
-          const result = await ocrService.processItem(item);
-          await databaseManager.saveItemOcrResult({
-            id: item.id,
-            status: result.status,
-            modelVersion: OCR_MODEL_VERSION,
-            sourceHash: result.sourceHash,
-            text: result.text,
-            confidence: result.confidence,
-            lineCount: result.lineCount,
-            error: result.error,
-          });
-
-          if (result.status === "done") processed += 1;
-          else if (result.status === "skipped") skipped += 1;
+          const status = await processOcrItem(item);
+          if (status === "done") processed += 1;
+          else if (status === "skipped" || status === "processing") skipped += 1;
           else errored += 1;
         } catch (error) {
           errored += 1;
           const message = error instanceof Error ? error.message : "OCR failed for an item";
           processError = message;
-          await databaseManager.saveItemOcrResult({
-            id: item.id,
-            status: "error",
-            modelVersion: OCR_MODEL_VERSION,
-            sourceHash,
-            text: item.ocrText || "",
-            confidence: item.ocrConfidence,
-            lineCount: item.ocrLineCount || 0,
-            error: message,
-          });
         }
       }
 
@@ -708,6 +946,24 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       sendResponse({ success: false, error: "UNAUTHORIZED_FORWARDER" });
       return true;
     }
+
+    // Any OCR trigger re-verifies the model files are in Cache Storage and
+    // re-downloads them if it was cleared — recovery without an extension reload.
+    void ocrService.ensureModelsCached().catch((error) =>
+      console.warn("[Offscreen] OCR model cache check failed:", error)
+    );
+
+    const itemId = typeof message?.payload?.itemId === "string" ? message.payload.itemId : "";
+    const force = message?.payload?.force === true;
+    if (itemId) {
+      void processOcrItemById(itemId, force)
+        .then((status) => sendResponse({ success: true, payload: { status } }))
+        .catch((error) =>
+          sendResponse({ success: false, error: error instanceof Error ? error.message : String(error) })
+        );
+      return true;
+    }
+
     triggerOcr();
     sendResponse({ success: true });
     return true;
@@ -727,14 +983,24 @@ const initializeApp = async () => {
     const db = await getDb();
     await spacesController.ensureDefaults();
     await spacesController.maybeRepairFolderAndItemSpaceAssignments();
+    try {
+      const purge = await spacesController.purgeExpired();
+      if (purge.purgedSpaceIds.length > 0) {
+        console.log(
+          `[Offscreen] Purged ${purge.purgedSpaceIds.length} expired bin space(s).`
+        );
+      }
+    } catch (purgeError) {
+      console.error("[Offscreen] Bin purge failed:", purgeError);
+    }
     sendStatusUpdate("Database initialized.");
 
-    const items = await db.items.find().exec();
-    console.log(`[Offscreen] Found ${items.length} items in the database.`);
+    console.log("[Offscreen] Database ready.");
 
     // Recover interrupted vector maintenance before new embedding work begins.
     await syncService.recoverInterruptedMaintenance();
     await ensureEmbeddingSchemaVersion();
+    await ensureEmbeddingStateRepair();
 
     // Initial embedding process
     await processEmbeddingQueue();
@@ -743,19 +1009,31 @@ const initializeApp = async () => {
     // Subscribe to item changes and trigger embedding
     db.items.$.subscribe((changeEvent: any) => {
       const changedIds = collectItemIdsFromCollectionChange(changeEvent);
-      itemsController.scheduleSearchIndexSync(changedIds);
-      scheduleDbChange("items", changedIds);
+      if (!isEmbeddingStateOnlyItemChange(changeEvent)) {
+        itemsController.scheduleSearchIndexSync(changedIds);
+        scheduleDbChange(
+          "items",
+          changedIds,
+          isMetadataEnrichmentItemChange(changeEvent) ? "metadata" : "content"
+        );
+      }
       // Trigger embedding only when there is actual pending work.
       scheduleEmbeddingIfNeeded();
       scheduleOcrIfNeeded();
     });
 
-    db.folders.$.subscribe(() => {
+    db.folders.$.subscribe((changeEvent: any) => {
+      if (isFolderCollapseOnlyChange(changeEvent)) return;
       scheduleDbChange("folders");
     });
 
     db.spaces.$.subscribe(() => {
       scheduleDbChange("spaces");
+    });
+
+    db.space_groups.$.subscribe((changeEvent: any) => {
+      if (isSpaceGroupCollapseOnlyChange(changeEvent)) return;
+      scheduleDbChange("space_groups");
     });
 
     db.tags.$.subscribe((changeEvent: any) => {
@@ -784,6 +1062,18 @@ const initializeApp = async () => {
       state: "success",
       detail: "Offscreen services are ready.",
     });
+
+    // Bounded janitor for the 30-day space bin. Runs on init then every 6h.
+    // The interval lives for the offscreen document lifetime; no teardown hook
+    // since the document is destroyed wholesale when the browser unloads it.
+    const runBinPurge = async () => {
+      try {
+        await spacesController.purgeExpired();
+      } catch (runError) {
+        console.error("[Offscreen] Bin purge tick failed:", runError);
+      }
+    };
+    window.setInterval(() => void runBinPurge(), 6 * 60 * 60 * 1000);
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : "An unknown error occurred";
     console.error("[Offscreen] Error during initialization:", error);

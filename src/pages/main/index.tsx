@@ -1,10 +1,9 @@
 import React from "react";
 import ReactDOM from "react-dom/client";
+import { loadReactGrabInDevelopment } from "@src/lib/react-grab";
 import Main from "./Main";
 
-if (import.meta.env.DEV) {
-  void import("react-grab");
-}
+loadReactGrabInDevelopment();
 
 ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
   <React.StrictMode>

@@ -169,7 +169,9 @@ export type QueryField =
   | "scope"
   | "mode"
   | "limit"
-  | "page";
+  | "page"
+  | "minscore"
+  | "score";
 
 export type QueryPill = {
   id: string;
@@ -219,8 +221,8 @@ export type QueryFilters = {
   excludeDomains: string[];
   authors: string[];
   excludeAuthors: string[];
-  hasAny: Array<"image" | "video" | "media">;
-  excludeHasAny: Array<"image" | "video" | "media">;
+  hasAny: Array<"image" | "video" | "media" | "embed">;
+  excludeHasAny: Array<"image" | "video" | "media" | "embed">;
   favoritesOnly: boolean;
   dateFrom?: number;
   dateTo?: number;
@@ -241,6 +243,8 @@ export type QueryDirectives = {
   sortOrder?: QuerySortOrder;
   limit?: number;
   page?: number;
+  /** Vector similarity cutoff (0–1); results scoring below are dropped. */
+  minScore?: number;
 };
 
 export type QueryToken = {

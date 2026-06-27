@@ -1,14 +1,23 @@
 import { useEffect, useState, useCallback } from "react";
-import { X, Plus, Tag, Sparkles, ChevronsUpDown, Search } from "lucide-react";
-import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@components/ui/dialog";
+import { X, Plus, Tag, Sparkles, ChevronsUpDown, Search, Check } from "lucide-react";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+} from "@components/ui/dialog";
 import { Button } from "@components/ui/button";
 import { Popover, PopoverContent, PopoverTrigger } from "@components/ui/popover";
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@components/ui/tooltip";
 import { cn } from "@src/lib/utils";
 import { resolveToastErrorMessage, withToast } from "@src/utils/toast-feedback";
+import { TAG_COLORS, tagChipStyle, tagDotStyle } from "./tag-color";
 
 interface TagType {
   id: string;
   name: string;
+  color?: string | null;
 }
 
 export const TagEditorDialog = ({
@@ -56,9 +65,9 @@ export const TagEditorDialog = ({
     try {
       const res = await chrome.runtime.sendMessage({
         service: "tags",
-        type: "searchTags",
+        type: "listAllTags",
         target: "offscreen",
-        payload: { query: "", limit: 50 },
+        payload: {},
       });
       if (res?.success) {
         setAllTags(res.payload as TagType[]);
@@ -188,6 +197,23 @@ export const TagEditorDialog = ({
     }
   };
 
+  const applyTagColor = async (tagId: string, color: string) => {
+    setAllTags((prev) => prev.map((t) => (t.id === tagId ? { ...t, color } : t)));
+    const nextTags = tags.map((t) => (t.id === tagId ? { ...t, color } : t));
+    setTags(nextTags);
+    onTagsUpdate?.(nextTags);
+    try {
+      await chrome.runtime.sendMessage({
+        service: "tags",
+        type: "setTagColor",
+        target: "offscreen",
+        payload: { tagId, color },
+      });
+    } catch (e) {
+      console.error("Failed to set tag color", e);
+    }
+  };
+
   const handleKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === "ArrowDown") {
       e.preventDefault();
@@ -212,6 +238,12 @@ export const TagEditorDialog = ({
       <DialogContent
         className="sm:max-w-md p-0 gap-0 overflow-hidden bg-gradient-to-b from-background-neutral to-background-page-secondary"
         onOpenAutoFocus={(e) => e.preventDefault()}
+        onInteractOutside={(event) => {
+          const target = event.detail.originalEvent.target as HTMLElement | null;
+          if (target?.closest("[data-radix-popper-content-wrapper]")) {
+            event.preventDefault();
+          }
+        }}
       >
         {/* Header */}
         <DialogHeader className="px-5 pt-5 pb-4 border-b border-border-neutral-faded">
@@ -223,9 +255,9 @@ export const TagEditorDialog = ({
               <DialogTitle className="text-lg font-semibold text-foreground-neutral">
                 {isBulkMode ? `Edit tags for ${itemIds?.length} items` : "Edit tags"}
               </DialogTitle>
-              <p className="text-xs text-foreground-tertiary mt-0.5">
+              <DialogDescription className="text-xs text-foreground-tertiary mt-0.5">
                 Add tags to organize and find items faster
-              </p>
+              </DialogDescription>
             </div>
           </div>
         </DialogHeader>
@@ -308,7 +340,7 @@ export const TagEditorDialog = ({
                                   : "hover:bg-background-page-secondary"
                               )}
                             >
-                              <Tag size={14} className="text-foreground-tertiary shrink-0" />
+                              <span className="size-2.5 shrink-0 rounded-full" style={tagDotStyle(tag.color)} />
                               <span className="flex-1 truncate text-left">{tag.name}</span>
                             </button>
                           ))}
@@ -382,35 +414,64 @@ export const TagEditorDialog = ({
               </p>
             </div>
           ) : (
-            <div className="flex flex-wrap gap-2">
-              {tags.map((tag) => (
-                <div
-                  key={tag.id}
-                  className={cn(
-                    "group flex items-center gap-1.5 px-3 py-1.5 rounded-full",
-                    "bg-gradient-to-r from-violet-500/10 to-fuchsia-500/10",
-                    "border border-violet-500/20",
-                    "text-sm text-violet-700 font-medium",
-                    "transition-all duration-200 hover:shadow-sm hover:border-violet-500/40"
-                  )}
-                >
-                  <span>{tag.name}</span>
-                  <button
-                    type="button"
-                    onClick={() => removeTag(tag.id)}
+            <TooltipProvider delayDuration={300}>
+              <div className="flex flex-wrap gap-2">
+                {tags.map((tag) => (
+                  <div
+                    key={tag.id}
+                    style={tagChipStyle(tag.color)}
                     className={cn(
-                      "p-0.5 rounded-full -mr-1",
-                      "text-violet-400 hover:text-white hover:bg-violet-500",
-                      "transition-all duration-150",
-                      "opacity-60 group-hover:opacity-100"
+                      "group flex items-center gap-1.5 rounded-full border px-2.5 py-1.5 text-sm font-medium text-foreground-neutral transition-all duration-200 hover:shadow-sm",
+                      !tag.color && "border-border-neutral-faded bg-background-neutral"
                     )}
-                    disabled={isLoading}
                   >
-                    <X size={12} />
-                  </button>
-                </div>
-              ))}
-            </div>
+                    <Popover>
+                      <Tooltip>
+                        <TooltipTrigger asChild>
+                          <PopoverTrigger asChild>
+                            <button
+                              type="button"
+                              aria-label={`Set color for ${tag.name}`}
+                              className="size-2.5 shrink-0 rounded-full outline-none transition-transform hover:scale-125 focus-visible:ring-2 focus-visible:ring-border-neutral"
+                              style={tagDotStyle(tag.color)}
+                            />
+                          </PopoverTrigger>
+                        </TooltipTrigger>
+                        <TooltipContent>Set color</TooltipContent>
+                      </Tooltip>
+                      <PopoverContent align="start" className="w-auto p-2">
+                        <div className="grid grid-cols-4 gap-1.5">
+                          {TAG_COLORS.map((c) => (
+                            <button
+                              key={c}
+                              type="button"
+                              onClick={() => void applyTagColor(tag.id, c)}
+                              aria-label={`Color ${c}`}
+                              className="grid size-7 place-items-center rounded-full outline-none transition-transform hover:scale-110 focus-visible:ring-2 focus-visible:ring-border-neutral"
+                              style={{ backgroundColor: c }}
+                            >
+                              {tag.color === c && <Check size={14} className="text-white" />}
+                            </button>
+                          ))}
+                        </div>
+                      </PopoverContent>
+                    </Popover>
+                    <span className="truncate">{tag.name}</span>
+                    <button
+                      type="button"
+                      onClick={() => removeTag(tag.id)}
+                      className={cn(
+                        "-mr-1 rounded-full p-0.5 text-foreground-tertiary transition-all duration-150",
+                        "opacity-60 hover:bg-background-danger-faded hover:text-foreground-danger group-hover:opacity-100"
+                      )}
+                      disabled={isLoading}
+                    >
+                      <X size={12} />
+                    </button>
+                  </div>
+                ))}
+              </div>
+            </TooltipProvider>
           )}
         </div>
 

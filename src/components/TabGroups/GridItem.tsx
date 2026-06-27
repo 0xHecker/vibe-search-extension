@@ -1,5 +1,5 @@
 import { ItemDocType } from "@src/schemas/item_schema";
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, memo, type CSSProperties } from "react";
 import { ImportIcon } from "@icons/import";
 import { DotsVertical } from "@icons/dots-vertical";
 import { Button } from "../ui/button";
@@ -8,13 +8,18 @@ import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuSub,
+  DropdownMenuSubTrigger,
+  DropdownMenuSubContent,
   DropdownMenuTrigger,
 } from "../ui/dropdown-menu";
 import { Tooltip, TooltipTrigger, TooltipContent } from "../ui/tooltip";
-import { ConfirmDialog } from "../ui/confirm-dialog";
+import { ConfirmDialog } from "@components/ui/confirm-dialog";
 import { EyeOpen } from "@components/icons/eye-open";
 import { DeleteIcon } from "../icons/delete";
 import { cn } from "@src/lib/utils";
+import { tagChipStyle, tagDotStyle } from "./tag-color";
 import {
   ContextMenu,
   ContextMenuTrigger,
@@ -26,28 +31,54 @@ import {
   ContextMenuSubContent,
 } from "@components/ui/context-menu";
 import { TagEditorDialog } from "@components/TabGroups/TagEditorDialog";
+import { TabEditorSheet } from "@components/TabGroups/TabEditorSheet";
+import { MediaLightboxModal, type LightboxEntry, type LightboxMetadata } from "@components/TabGroups/MediaLightboxModal";
+import {
+  MorphingDialog,
+  MorphingDialogTrigger,
+} from "@components/ui/morphing-dialog";
+import { Star, Maximize2 } from "lucide-react";
 import { useSelection } from "./SelectionContext";
 import { WebsitePreview } from "./WebsitePreview";
 import { ItemMediaPreview } from "./ItemMediaPreview";
-import { useSortable } from "@dnd-kit/sortable";
-import { CSS } from "@dnd-kit/utilities";
+import { resolveOpfsMedia, revokeObjectUrl } from "@src/services/media-storage";
+import { useDraggable, useDroppable, type DraggableAttributes, type DraggableSyntheticListeners } from "@dnd-kit/core";
 import type { SpaceMoveOption } from "./TabGroups";
 import type { QueryRankDebugScore } from "@src/search-core/contracts";
 import { resolveToastErrorMessage, withToast } from "@src/utils/toast-feedback";
+import { getYouTubeVideoIdFromUrl, normalizeIframeEmbedUrl } from "@src/utils/media-embed";
+import { appendOcrTextToTextContent } from "@src/services/ocr-text";
 
-export const GridItem = ({
-  item,
-  spaces,
-  debugScore,
-  showDebugScore = false,
-  onCopy,
-}: {
+// Drag wiring supplied by the optional SortableGridItem wrapper. When absent,
+// the card renders fully static (no dnd-kit hooks) — the lightweight default.
+// dnd-kit is only paid for in Organize (drag) mode.
+export type GridItemSortable = {
+  setNodeRef?: (node: HTMLElement | null) => void;
+  setActivatorNodeRef?: (node: HTMLElement | null) => void;
+  attributes?: DraggableAttributes;
+  listeners?: DraggableSyntheticListeners;
+  style?: CSSProperties;
+  isDragging?: boolean;
+  isOver?: boolean;
+};
+
+export type GridItemProps = {
   item: ItemDocType;
   spaces: SpaceMoveOption[];
   debugScore?: QueryRankDebugScore;
   showDebugScore?: boolean;
   onCopy: (item: ItemDocType) => void;
-}) => {
+  sortable?: GridItemSortable;
+};
+
+export const GridItem = memo(({
+  item,
+  spaces,
+  debugScore,
+  showDebugScore = false,
+  onCopy,
+  sortable,
+}: GridItemProps) => {
   const textRef = useRef<HTMLParagraphElement>(null);
   const [isExpanded, setIsExpanded] = useState(false);
   const [isOverflowing, setIsOverflowing] = useState(false);
@@ -56,38 +87,43 @@ export const GridItem = ({
   const [deleteScope, setDeleteScope] = useState<"current" | "all">("current");
   const [isMenuOpen, setIsMenuOpen] = useState(false);
   const [isTagEditorOpen, setIsTagEditorOpen] = useState(false);
+  const [isEditorOpen, setIsEditorOpen] = useState(false);
   const [isPreviewOpen, setIsPreviewOpen] = useState(false);
-  const [tags, setTags] = useState<{ id: string; name: string }[]>([]);
+  const [lightboxEntries, setLightboxEntries] = useState<LightboxEntry[]>([]);
+  const [isFavorite, setIsFavorite] = useState(item.isFavorite);
+  const [isUpdatingFavorite, setIsUpdatingFavorite] = useState(false);
+  const [tags, setTags] = useState<{ id: string; name: string; color?: string | null }[]>([]);
   const [isRefreshing, setIsRefreshing] = useState(false);
 
-  const { isSelectionMode, isSelected, toggleItem, selectItem, selectedIds } = useSelection();
+  const { isSelectionMode, isSelected, toggleItem, selectItem } = useSelection();
   const itemIsSelected = isSelected(item.id);
   const isLoading = !item.isMetaFetched || isRefreshing;
-  const { attributes, listeners, setNodeRef, transform, transition, isDragging, isOver } =
-    useSortable({
-      id: item.id,
-      data: {
-        type: "item",
-        item,
-        folderId: item.folderId,
-        selectedIds: isSelectionMode ? Array.from(selectedIds) : [item.id],
-      },
-    });
-  const style = {
-    transform: CSS.Transform.toString(transform),
-    transition,
-  };
+  const description = useMemo(
+    () => appendOcrTextToTextContent(item.textContent, item.ocrText),
+    [item.textContent, item.ocrText]
+  );
+  const hasOcrImage = (item.media || []).some((m) => m?.type === "image") || !!item.displayImageUrl;
+  // Drag wiring is present only in Organize mode (via SortableGridItem). In the
+  // default static mode these are all undefined/no-ops, so the card carries no
+  // dnd-kit hooks at all and clicks/links/buttons behave normally.
+  const setNodeRef = sortable?.setNodeRef;
+  const attributes = sortable?.attributes;
+  const listeners = sortable?.listeners;
+  const style = sortable?.style;
+  const isDragging = sortable?.isDragging ?? false;
+  const isOver = sortable?.isOver ?? false;
+  const isDraggable = !!sortable;
 
   const handleMenuOpenChange = (open: boolean) => {
     setIsMenuOpen(open);
   };
 
   const handleSelect = () => {
-    selectItem(item.id);
+    selectItem(item);
   };
 
   const handleToggleSelect = () => {
-    toggleItem(item.id);
+    toggleItem(item);
   };
 
   const renderMenu = () => (
@@ -118,10 +154,48 @@ export const GridItem = ({
         </DropdownMenuItem>
         <DropdownMenuItem onSelect={() => setIsTagEditorOpen(true)}>Edit tags</DropdownMenuItem>
         <DropdownMenuItem onSelect={handleRefreshMetadata}>Refresh metadata</DropdownMenuItem>
+        {hasOcrImage && (
+          <DropdownMenuItem onSelect={handleRerunOcr}>Re-run OCR</DropdownMenuItem>
+        )}
         <DropdownMenuItem onSelect={() => setIsPreviewOpen(true)}>
           View in side panel
         </DropdownMenuItem>
-        <DropdownMenuItem disabled>Edit</DropdownMenuItem>
+        {moveSpaceOptions.length > 0 && <DropdownMenuSeparator />}
+        {moveSpaceOptions.length > 0 && (
+          <DropdownMenuSub>
+            <DropdownMenuSubTrigger>Move to space</DropdownMenuSubTrigger>
+            <DropdownMenuSubContent>
+              {moveSpaceOptions.map((space) => (
+                <DropdownMenuItem
+                  key={space.id}
+                  onSelect={() => {
+                    void handleMoveToSpace(space.id);
+                  }}
+                >
+                  {space.name}
+                </DropdownMenuItem>
+              ))}
+            </DropdownMenuSubContent>
+          </DropdownMenuSub>
+        )}
+        {moveSpaceOptions.length > 0 && (
+          <DropdownMenuSub>
+            <DropdownMenuSubTrigger>Copy to space</DropdownMenuSubTrigger>
+            <DropdownMenuSubContent>
+              {moveSpaceOptions.map((space) => (
+                <DropdownMenuItem
+                  key={space.id}
+                  onSelect={() => {
+                    void handleCopyToSpace(space.id);
+                  }}
+                >
+                  {space.name}
+                </DropdownMenuItem>
+              ))}
+            </DropdownMenuSubContent>
+          </DropdownMenuSub>
+        )}
+        <DropdownMenuItem onSelect={() => setIsEditorOpen(true)}>Edit</DropdownMenuItem>
         <DropdownMenuItem
           variant="destructive"
           onSelect={() => {
@@ -157,7 +231,13 @@ export const GridItem = ({
 
   useLayoutEffect(() => {
     recomputeHeights();
-  }, [recomputeHeights, item.textContent]);
+  }, [description, recomputeHeights]);
+
+  useEffect(() => {
+    if (!isUpdatingFavorite) {
+      setIsFavorite(item.isFavorite);
+    }
+  }, [item.isFavorite, isUpdatingFavorite]);
 
   useEffect(() => {
     const el = textRef.current;
@@ -173,19 +253,96 @@ export const GridItem = ({
     setIsExpanded(false);
   }, [item.id]);
 
-  useEffect(() => {
-    (async () => {
-      try {
-        const res = await chrome.runtime.sendMessage({
-          service: "tags",
-          type: "getTagsForItem",
-          target: "offscreen",
-          payload: { itemId: item.id },
-        });
-        if (res?.success) setTags(res.payload as any);
-      } catch {}
-    })();
-  }, [item.id]);
+  const handleOpenLightbox = useCallback(async (): Promise<boolean> => {
+    const entries: LightboxEntry[] = [];
+    const seen = new Set<string>();
+    const isYouTube =
+      item.source === "youtube" ||
+      !!getYouTubeVideoIdFromUrl(item.url) ||
+      (item.media || []).some((m) =>
+        [m.embedUrl, m.originalUrl, m.pageUrl, m.thumbnailUrl]
+          .filter(Boolean)
+          .some((url) => !!url && !!getYouTubeVideoIdFromUrl(url))
+      );
+    const add = (e: LightboxEntry) => {
+      if (seen.has(e.src)) return;
+      seen.add(e.src);
+      entries.push(e);
+    };
+    for (const m of item.media || []) {
+      let src: string | null = null;
+      let embedType: LightboxEntry["embedType"];
+      if (m.type === "video" && m.embedUrl) {
+        src = normalizeIframeEmbedUrl(m.embedUrl);
+        if (src) embedType = m.embedType || "iframe";
+      }
+      if (m.opfsPath) src = await resolveOpfsMedia(m.opfsPath);
+      if (!src) src = m.s3Url || m.originalUrl;
+      if (!src) continue;
+      const isVertical = (() => {
+        if (m.width && m.height && m.height > m.width) return true;
+        if (item.source === "tiktok") return true;
+        const checkUrls = [item.url, m.originalUrl, m.pageUrl].filter(Boolean) as string[];
+        for (const u of checkUrls) {
+          const lower = u.toLowerCase();
+          if (lower.includes("/shorts/")) return true;
+          if (lower.includes("/reel/") || lower.includes("/reels/")) return true;
+          if (lower.includes("tiktok.com")) return true;
+        }
+        return false;
+      })();
+      add({
+        type: m.type,
+        src,
+        embedType,
+        thumbnailSrc: m.thumbnailUrl,
+        width: m.width,
+        height: m.height,
+        altText: m.altText,
+        isGif: src.toLowerCase().endsWith(".gif"),
+        isVertical,
+        ocr: m.ocr,
+      });
+    }
+    if (
+      item.displayImageUrl &&
+      !seen.has(item.displayImageUrl)
+    ) {
+      entries.push({
+        type: "image",
+        src: item.displayImageUrl,
+        altText: "Legacy display image",
+        isGif: item.displayImageUrl.toLowerCase().endsWith(".gif"),
+      });
+    }
+    if (isYouTube) {
+      entries.sort((a, b) => {
+        const aEmbedVideo = a.type === "video" && a.embedType === "iframe";
+        const bEmbedVideo = b.type === "video" && b.embedType === "iframe";
+        if (aEmbedVideo === bEmbedVideo) return 0;
+        return aEmbedVideo ? -1 : 1;
+      });
+    }
+    if (entries.length > 0) {
+      setLightboxEntries(entries);
+      return true;
+    }
+    return false;
+  }, [item.displayImageUrl, item.media, item.source, item.url]);
+
+  const lightboxMetadata: LightboxMetadata | undefined = useMemo(() => {
+    if (!item) return undefined;
+    let hostname: string | undefined;
+    try { hostname = new URL(item.url).hostname; } catch { hostname = item.url; }
+    return {
+      title: item.title,
+      hostname,
+      url: item.url,
+      iconUrl: item.iconUrl,
+      source: item.source,
+      date: new Intl.DateTimeFormat(undefined, { day: "numeric", month: "short", year: "numeric" }).format(new Date(item.createdAt)),
+    };
+  }, [item]);
 
   const displayHeight = useMemo(() => {
     if (!heights.expanded) return undefined;
@@ -196,6 +353,31 @@ export const GridItem = ({
   const toggleExpansion = () => {
     if (!isOverflowing) return;
     setIsExpanded((prev) => !prev);
+  };
+
+  const handleToggleFavorite = async () => {
+    if (isUpdatingFavorite) return;
+    const next = !isFavorite;
+    setIsFavorite(next);
+    setIsUpdatingFavorite(true);
+    try {
+      const res = await chrome.runtime.sendMessage({
+        service: "items",
+        type: "update",
+        target: "offscreen",
+        payload: { id: item.id, isFavorite: next },
+      });
+      if (res?.success === false || res?.payload?.success === false) {
+        throw new Error(
+          res?.error || res?.payload?.error || "Failed to update favorite."
+        );
+      }
+    } catch (error) {
+      console.error("Failed to toggle favorite", error);
+      setIsFavorite(!next);
+    } finally {
+      setIsUpdatingFavorite(false);
+    }
   };
 
   const handleRefreshMetadata = async () => {
@@ -218,6 +400,22 @@ export const GridItem = ({
       console.error("Failed to refresh metadata", error);
       setIsRefreshing(false);
     }
+  };
+
+  const handleRerunOcr = async () => {
+    await withToast({
+      loading: "Re-running OCR…",
+      success: "OCR re-run started.",
+      error: (err) => resolveToastErrorMessage(err, "Failed to re-run OCR."),
+      action: async () => {
+        const res = await chrome.runtime.sendMessage({
+          target: "background",
+          type: "TRIGGER_OCR",
+          payload: { itemId: item.id, force: true },
+        });
+        if (res?.success === false) throw new Error(res?.error || "Failed to re-run OCR.");
+      },
+    });
   };
 
   const handleMoveToSpace = async (targetSpaceId: string) => {
@@ -248,9 +446,38 @@ export const GridItem = ({
     }
   };
 
+  const handleCopyToSpace = async (targetSpaceId: string) => {
+    try {
+      await withToast({
+        loading: "Copying tab to selected space...",
+        success: "Tab copied to selected space.",
+        error: (err) => resolveToastErrorMessage(err, "Failed to copy tab to selected space."),
+        action: async () => {
+          const response = await chrome.runtime.sendMessage({
+            service: "items",
+            type: "copyToSpace",
+            target: "offscreen",
+            payload: {
+              targetSpaceId,
+              itemIds: [item.id],
+            },
+          });
+          if (response?.success === false || response?.payload?.success === false) {
+            throw new Error(
+              response?.error || response?.payload?.error || "Failed to copy tab to selected space."
+            );
+          }
+        },
+      });
+    } catch (error) {
+      console.error("Failed to copy tab to selected space", error);
+    }
+  };
+
   const moveSpaceOptions = spaces.filter((space) => space.id !== item.spaceId);
 
   return (
+    <MorphingDialog>
     <ContextMenu>
       <ContextMenuTrigger asChild>
         <div
@@ -260,13 +487,15 @@ export const GridItem = ({
             "group/card max-w-[350px] rounded-semi shadow-card relative transition-all duration-200",
             isLoading && "opacity-80",
             itemIsSelected ? "bg-violet-500/10 ring-2 ring-violet-500/40" : "bg-platinum",
-            isDragging && "ring-2 ring-accent/50 shadow-2xl shadow-black/20 scale-[1.01]",
+            isDraggable && "cursor-grab active:cursor-grabbing",
+            isDragging && "opacity-40",
             isOver &&
               !isDragging &&
-              "ring-1 ring-accent/40 shadow-md shadow-black/10 bg-background-neutral"
+              "outline-dashed outline-2 outline-offset-2 outline-accent/40"
           )}
           data-observe="item"
           data-url={item.url}
+          data-item-id={item.id}
           {...attributes}
           {...listeners}
         >
@@ -313,6 +542,16 @@ export const GridItem = ({
           >
             <Button
               variant={"ghost"}
+              className="size-5 p-1 text-foreground-tertiary transition-colors duration-300 hover:bg-transparent hover:text-accent"
+              aria-label={isFavorite ? "Remove from favorites" : "Add to favorites"}
+              aria-pressed={isFavorite}
+              onClick={handleToggleFavorite}
+              disabled={isUpdatingFavorite}
+            >
+              <Star size={20} className={cn(isFavorite && "fill-current")} />
+            </Button>
+            <Button
+              variant={"ghost"}
               className="size-5 p-1"
               aria-label="Preview tab"
               onClick={() => setIsPreviewOpen(true)}
@@ -321,7 +560,7 @@ export const GridItem = ({
             </Button>
             <Button
               variant={"ghost"}
-              className="size-5 p-1"
+              className="size-5 p-1 text-foreground-tertiary transition-colors duration-300 hover:bg-transparent hover:text-foreground-danger"
               aria-label="Delete tab"
               onClick={() => {
                 setDeleteScope("current");
@@ -333,7 +572,43 @@ export const GridItem = ({
           </div>
 
           <div className="flex flex-col gap-1 p-3 rounded-semi overflow-hidden bg-background-neutral">
-            <ItemMediaPreview item={item} />
+            <MorphingDialogTrigger
+              onOpen={handleOpenLightbox}
+              className="relative group/media-preview rounded-sm-semi"
+            >
+              <ItemMediaPreview item={item} />
+              {/* Subtle expand button — visual affordance; click bubbles to the
+                  trigger which runs onOpen (prep) then opens the morph dialog. */}
+              {(item.media?.length || 0) > 0 || item.displayImageUrl ? (
+                <button
+                  type="button"
+                  aria-label="Expand media"
+                  title="Expand"
+                  className={cn(
+                    "absolute top-2 right-2 z-10 w-7 h-7 rounded-full",
+                    "flex items-center justify-center",
+                    "bg-background-neutral/85 backdrop-blur-sm",
+                    "border border-border-neutral-faded/60",
+                    "text-foreground-secondary hover:text-foreground-primary hover:bg-background-neutral",
+                    "opacity-0 group-hover/media-preview:opacity-100",
+                    "transition-all duration-200 active:scale-[0.92] cursor-pointer"
+                  )}
+                >
+                  <Maximize2 size={13} />
+                </button>
+              ) : null}
+              {/* Media count pill — only when multiple media, hover-revealed */}
+              {(item.media?.length || 0) > 1 && (
+                <span className={cn(
+                  "absolute bottom-2 right-2 z-10 px-2 py-0.5 rounded-full",
+                  "bg-background-neutral/90 backdrop-blur-sm",
+                  "text-[10px] font-medium text-foreground-secondary tabular-nums",
+                  "opacity-0 group-hover/media-preview:opacity-100 transition-opacity duration-200 pointer-events-none"
+                )}>
+                  {item.media?.length} media
+                </span>
+              )}
+            </MorphingDialogTrigger>
             <div className="flex flex-col gap-2">
               <div className="flex flex-col gap-1">
                 <h3
@@ -364,7 +639,7 @@ export const GridItem = ({
                     className="font-sans text-xs text-foreground-secondary leading-relaxed transition-[max-height] duration-500 ease-out overflow-hidden"
                     style={{ maxHeight: displayHeight }}
                   >
-                    {item.textContent}
+                    {description}
                   </p>
                   {!isExpanded && isOverflowing && (
                     <div className="pointer-events-none absolute inset-x-0 bottom-0 h-10 bg-gradient-to-b from-transparent via-background-neutral/60 to-background-neutral" />
@@ -456,13 +731,29 @@ export const GridItem = ({
               </div>
             </div>
           </div>
-          {tags.length > 0 && (
+          {(isFavorite || tags.length > 0) && (
             <div className="flex flex-row flex-wrap gap-1 rounded-semi px-2 py-1">
+              {isFavorite && (
+                <div
+                  className={cn(
+                    "inline-flex items-center gap-1 rounded-md w-fit px-2 py-0.5",
+                    "bg-accent-faded text-accent text-xs font-medium"
+                  )}
+                  title="Favorite"
+                >
+                  <Star size={11} className="fill-current" />
+                </div>
+              )}
               {tags.map((t) => (
                 <div
                   key={t.id}
-                  className="rounded-md w-fit px-2 bg-gray-10 hover:bg-gray-40 transition-all cursor-pointer text-xs text-foreground-secondary"
+                  style={tagChipStyle(t.color)}
+                  className={cn(
+                    "flex w-fit items-center gap-1 rounded-md border px-2 text-xs text-foreground-secondary transition-all",
+                    t.color ? "" : "border-transparent bg-gray-10 hover:bg-gray-40"
+                  )}
                 >
+                  <span className="size-1.5 shrink-0 rounded-full" style={tagDotStyle(t.color)} />
                   {t.name}
                 </div>
               ))}
@@ -487,6 +778,9 @@ export const GridItem = ({
         </ContextMenuItem>
         <ContextMenuItem onSelect={() => setIsTagEditorOpen(true)}>Edit tags</ContextMenuItem>
         <ContextMenuItem onSelect={handleRefreshMetadata}>Refresh metadata</ContextMenuItem>
+        {hasOcrImage && (
+          <ContextMenuItem onSelect={handleRerunOcr}>Re-run OCR</ContextMenuItem>
+        )}
         <ContextMenuItem onSelect={() => setIsPreviewOpen(true)}>
           View in side panel
         </ContextMenuItem>
@@ -496,24 +790,21 @@ export const GridItem = ({
             <ContextMenuSubTrigger>Move to space</ContextMenuSubTrigger>
             <ContextMenuSubContent>
               {moveSpaceOptions.map((space) => {
-                const isLocked = space.isPrivate && !space.access?.isUnlocked;
                 return (
                   <ContextMenuItem
                     key={space.id}
-                    disabled={isLocked}
                     onSelect={() => {
                       void handleMoveToSpace(space.id);
                     }}
                   >
                     {space.name}
-                    {isLocked ? " (Locked)" : ""}
                   </ContextMenuItem>
                 );
               })}
             </ContextMenuSubContent>
           </ContextMenuSub>
         )}
-        <ContextMenuItem disabled>Edit</ContextMenuItem>
+        <ContextMenuItem onSelect={() => setIsEditorOpen(true)}>Edit</ContextMenuItem>
         <ContextMenuSeparator />
         <ContextMenuItem
           onSelect={() => {
@@ -534,56 +825,113 @@ export const GridItem = ({
           Delete from All Tab Groups
         </ContextMenuItem>
       </ContextMenuContent>
-      <ConfirmDialog
-        open={isDeleteDialogOpen}
-        onOpenChange={setIsDeleteDialogOpen}
-        title={
-          deleteScope === "all" ? "Delete this tab everywhere?" : "Delete from this tab group?"
-        }
-        description={
-          deleteScope === "all"
-            ? `This will delete "${item.title}" from every tab group. This action cannot be undone.`
-            : `This will remove "${item.title}" from this tab group. You can't undo this action.`
-        }
-        confirmLabel={deleteScope === "all" ? "Delete from all groups" : "Delete tab"}
-        variant="danger"
-        onConfirm={async () => {
-          await withToast({
-            loading: "Deleting tab...",
-            success:
-              deleteScope === "all" ? "Tab deleted from all groups." : "Tab deleted from group.",
-            error: (err) => resolveToastErrorMessage(err, "Failed to delete tab."),
-            action: async () => {
-              const response = await chrome.runtime.sendMessage({
-                service: "items",
-                type: "delete",
-                target: "offscreen",
-                payload: { id: item.id, scope: deleteScope },
-              });
+      {isDeleteDialogOpen && (
+        <ConfirmDialog
+          open={isDeleteDialogOpen}
+          onOpenChange={setIsDeleteDialogOpen}
+          title={
+            deleteScope === "all" ? "Delete this tab everywhere?" : "Delete from this tab group?"
+          }
+          description={
+            deleteScope === "all"
+              ? `This will delete "${item.title}" from every tab group. This action cannot be undone.`
+              : `This will remove "${item.title}" from this tab group. You can't undo this action.`
+          }
+          confirmLabel={deleteScope === "all" ? "Delete from all groups" : "Delete tab"}
+          variant="danger"
+          onConfirm={async () => {
+            await withToast({
+              loading: "Deleting tab...",
+              success:
+                deleteScope === "all" ? "Tab deleted from all groups." : "Tab deleted from group.",
+              error: (err) => resolveToastErrorMessage(err, "Failed to delete tab."),
+              action: async () => {
+                const response = await chrome.runtime.sendMessage({
+                  service: "items",
+                  type: "delete",
+                  target: "offscreen",
+                  payload: { id: item.id, scope: deleteScope },
+                });
 
-              if (response?.success === false || response?.payload?.success === false) {
-                throw new Error(
-                  response?.error ||
-                    response?.payload?.error ||
-                    "Failed to delete tab. Please try again."
-                );
-              }
-            },
-          });
+                if (response?.success === false || response?.payload?.success === false) {
+                  throw new Error(
+                    response?.error ||
+                      response?.payload?.error ||
+                      "Failed to delete tab. Please try again."
+                  );
+                }
+              },
+            });
+          }}
+        />
+      )}
+      {isTagEditorOpen && (
+        <TagEditorDialog
+          itemId={item.id}
+          open={isTagEditorOpen}
+          onOpenChange={setIsTagEditorOpen}
+          onTagsUpdate={setTags}
+        />
+      )}
+      <TabEditorSheet
+        item={item}
+        open={isEditorOpen}
+        onOpenChange={setIsEditorOpen}
+      />
+      {isPreviewOpen && (
+        <WebsitePreview
+          url={item.url}
+          title={item.title}
+          open={isPreviewOpen}
+          onOpenChange={setIsPreviewOpen}
+          item={item}
+        />
+      )}
+      <MediaLightboxModal
+        entries={lightboxEntries}
+        metadata={lightboxMetadata}
+        onClose={() => {
+          lightboxEntries.forEach((entry) => revokeObjectUrl(entry.src));
+          setLightboxEntries([]);
         }}
       />
-      <TagEditorDialog
-        itemId={item.id}
-        open={isTagEditorOpen}
-        onOpenChange={setIsTagEditorOpen}
-        onTagsUpdate={setTags}
-      />
-      <WebsitePreview
-        url={item.url}
-        title={item.title}
-        open={isPreviewOpen}
-        onOpenChange={setIsPreviewOpen}
-      />
     </ContextMenu>
+    </MorphingDialog>
+  );
+});
+
+// Wraps GridItem with lightweight drag wiring. We use useDraggable + useDroppable
+// (not useSortable) and deliberately do NOT translate cards on every move — with
+// react-plock's masonry layout and heavy cards that was slow and made columns
+// jump. The source card just dims, the hovered card shows a dashed drop
+// indicator, and the move/reorder is committed on drop.
+export const SortableGridItem = (props: GridItemProps) => {
+  const { isSelectionMode, selectedIds } = useSelection();
+  const data = {
+    type: "item" as const,
+    item: props.item,
+    folderId: props.item.folderId,
+    selectedIds: isSelectionMode ? Array.from(selectedIds) : [props.item.id],
+  };
+  const { attributes, listeners, setNodeRef: setDragRef, isDragging } = useDraggable({
+    id: props.item.id,
+    data,
+  });
+  const { setNodeRef: setDropRef, isOver } = useDroppable({ id: props.item.id, data });
+  const setNodeRef = (node: HTMLElement | null) => {
+    setDragRef(node);
+    setDropRef(node);
+  };
+  return (
+    <GridItem
+      {...props}
+      sortable={{
+        setNodeRef,
+        attributes,
+        listeners,
+        isDragging,
+        isOver,
+      }}
+    />
   );
 };

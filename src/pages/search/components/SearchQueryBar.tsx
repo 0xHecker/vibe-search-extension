@@ -47,6 +47,8 @@ type SearchQueryBarProps = {
   catalogs: QueryAssistCatalogs;
   placeholder?: string;
   availableFilters?: string[];
+  onDeleteRecentQuery?: (query: string) => void;
+  onClearRecentQueries?: () => void;
 };
 
 const fallbackAnalysis: QueryAnalysis = {
@@ -225,6 +227,8 @@ export const SearchQueryBar = ({
   catalogs,
   placeholder = "Search anything\u2026",
   availableFilters = [],
+  onDeleteRecentQuery,
+  onClearRecentQueries,
 }: SearchQueryBarProps) => {
   const initial = useMemo(() => splitQuery(committedValue, catalogs), []);
   const [tokens, setTokens] = useState<string[]>(initial.tokens);
@@ -237,6 +241,20 @@ export const SearchQueryBar = ({
   const [focused, setFocused] = useState(false);
 
   const inputRef = useRef<HTMLInputElement | null>(null);
+
+  // Press "/" anywhere (outside inputs) to jump to the search bar.
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key !== "/" || event.metaKey || event.ctrlKey || event.altKey) return;
+      const target = event.target as HTMLElement | null;
+      const tag = target?.tagName;
+      if (tag === "INPUT" || tag === "TEXTAREA" || target?.isContentEditable) return;
+      event.preventDefault();
+      inputRef.current?.focus();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
   const workerRef = useRef<Worker | null>(null);
   const requestIdRef = useRef(0);
   const lastCommittedValueRef = useRef(committedValue);
@@ -739,54 +757,84 @@ export const SearchQueryBar = ({
                           aria-label={group.group}
                           className="pb-1 last:pb-0"
                         >
-                          <div className="px-2.5 pb-1 pt-2 text-[10px] font-semibold uppercase tracking-[0.08em] text-foreground-tertiary">
-                            {group.group}
+                          <div className="flex items-center justify-between px-2.5 pb-1 pt-2">
+                            <span className="text-[10px] font-semibold uppercase tracking-[0.08em] text-foreground-tertiary">
+                              {group.group}
+                            </span>
+                            {group.group === "Recent" && onClearRecentQueries && (
+                              <button
+                                type="button"
+                                onMouseDown={(e) => e.preventDefault()}
+                                onClick={onClearRecentQueries}
+                                className="rounded px-1 text-[10px] font-medium text-foreground-tertiary transition-colors hover:text-foreground-danger focus-visible:text-foreground-danger focus-visible:outline-none"
+                              >
+                                Clear all
+                              </button>
+                            )}
                           </div>
                           <div className="space-y-0.5">
                             {group.items.map((item) => {
                               const index = indexById.get(item.id) ?? -1;
                               const active = index === activeIndex;
+                              const isRecent = item.category === "Recent" && !!onDeleteRecentQuery;
                               return (
-                                <button
-                                  key={item.id}
-                                  type="button"
-                                  id={`vs-sugg-${index}`}
-                                  role="option"
-                                  aria-selected={active}
-                                  onClick={() => applySuggestion(item)}
-                                  onMouseMove={() => {
-                                    if (activeIndex !== index) setActiveIndex(index);
-                                  }}
-                                  className={cn(
-                                    "flex w-full items-center gap-3 rounded-md px-2.5 py-2.5 text-left transition-colors duration-100",
-                                    active
-                                      ? "bg-background-highlight"
-                                      : "hover:bg-background-highlight/50"
-                                  )}
-                                >
-                                  <GroupIcon
-                                    size={16}
+                                <div key={item.id} className={cn("relative", isRecent && "group/recent")}>
+                                  <button
+                                    type="button"
+                                    id={`vs-sugg-${index}`}
+                                    role="option"
+                                    aria-selected={active}
+                                    onClick={() => applySuggestion(item)}
+                                    onMouseMove={() => {
+                                      if (activeIndex !== index) setActiveIndex(index);
+                                    }}
                                     className={cn(
-                                      "shrink-0 transition-colors",
-                                      active ? "text-foreground-secondary" : "text-foreground-icon"
+                                      "flex w-full items-center gap-3 rounded-md px-2.5 py-2.5 text-left transition-colors duration-100",
+                                      isRecent && "pr-9",
+                                      active
+                                        ? "bg-background-highlight"
+                                        : "hover:bg-background-highlight/50"
                                     )}
-                                  />
-                                  <div className="min-w-0 flex-1">
-                                    <div className="truncate text-sm font-medium text-foreground-neutral">
-                                      {item.label}
-                                    </div>
-                                    {item.description && (
-                                      <div className="truncate text-xs text-foreground-secondary">
-                                        {item.description}
+                                  >
+                                    <GroupIcon
+                                      size={16}
+                                      className={cn(
+                                        "shrink-0 transition-colors",
+                                        active ? "text-foreground-secondary" : "text-foreground-icon"
+                                      )}
+                                    />
+                                    <div className="min-w-0 flex-1">
+                                      <div className="truncate text-sm font-medium text-foreground-neutral">
+                                        {item.label}
                                       </div>
+                                      {item.description && (
+                                        <div className="truncate text-xs text-foreground-secondary">
+                                          {item.description}
+                                        </div>
+                                      )}
+                                    </div>
+                                    {active && !isRecent && (
+                                      <Kbd className="shrink-0">
+                                        <CornerDownLeft size={11} />
+                                      </Kbd>
                                     )}
-                                  </div>
-                                  {active && (
-                                    <Kbd className="shrink-0">
-                                      <CornerDownLeft size={11} />
-                                    </Kbd>
+                                  </button>
+                                  {isRecent && (
+                                    <button
+                                      type="button"
+                                      aria-label={`Remove "${item.label}" from recent searches`}
+                                      title="Remove from history"
+                                      onMouseDown={(e) => e.preventDefault()}
+                                      onClick={(e) => {
+                                        e.stopPropagation();
+                                        onDeleteRecentQuery?.(item.insertText || item.label);
+                                      }}
+                                      className="absolute right-1.5 top-1/2 grid size-6 -translate-y-1/2 place-items-center rounded text-foreground-tertiary opacity-0 transition-[opacity,color] hover:bg-background-neutral-faded hover:text-foreground-danger focus-visible:opacity-100 focus-visible:outline-none group-hover/recent:opacity-100"
+                                    >
+                                      <X size={13} />
+                                    </button>
                                   )}
-                                </button>
+                                </div>
                               );
                             })}
                           </div>

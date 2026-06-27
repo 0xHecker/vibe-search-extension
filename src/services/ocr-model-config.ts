@@ -2,7 +2,11 @@ export const OCR_MODEL_VERSION = "pp-ocrv6-small-hf-2026-06-12";
 
 export const METADATA_WORKER_BASE_URL = "https://metadata-worker.watermelons.workers.dev";
 export const OCR_MODEL_BASE_URL = `${METADATA_WORKER_BASE_URL}/ocr-model`;
-export const LEGACY_METADATA_WORKER_BASE_URL = "https://meta.vibesearch.app";
+// The retired custom domain (meta.vibesearch.app) no longer resolves. Models are
+// served from the metadata worker's stable workers.dev origin, so the "fallback"
+// host points there too — a transient primary failure now retries the live
+// origin instead of a dead domain.
+export const LEGACY_METADATA_WORKER_BASE_URL = METADATA_WORKER_BASE_URL;
 export const LEGACY_OCR_MODEL_BASE_URL = `${LEGACY_METADATA_WORKER_BASE_URL}/ocr-model`;
 export const OCR_IMAGE_PROXY_URL = `${METADATA_WORKER_BASE_URL}/ocr-image`;
 export const OCR_MODEL_CACHE = "vibe-search-ocr-models-v1";
@@ -35,15 +39,6 @@ export const getOcrModelUrl = (model: OcrModelRole): string =>
 export const getLegacyOcrModelUrl = (model: OcrModelRole): string =>
   `${LEGACY_OCR_MODEL_BASE_URL}/${OCR_MODEL_ASSETS[model].publicId}`;
 
-const isOcrModelRoute = (url: URL, baseUrl: string): boolean => {
-  try {
-    const base = new URL(baseUrl);
-    return url.origin === base.origin && url.pathname.startsWith(`${base.pathname}/`);
-  } catch {
-    return false;
-  }
-};
-
 export const resolveOcrModelRoleFromUrl = (value: string): OcrModelRole | null => {
   try {
     const url = new URL(value);
@@ -54,21 +49,5 @@ export const resolveOcrModelRoleFromUrl = (value: string): OcrModelRole | null =
     return found ? (found[0] as OcrModelRole) : null;
   } catch {
     return null;
-  }
-};
-
-export const isDeprecatedOcrModelCacheUrl = (value: string): boolean => {
-  try {
-    if (resolveOcrModelRoleFromUrl(value)) return false;
-    const url = new URL(value);
-    if (isOcrModelRoute(url, OCR_MODEL_BASE_URL) || isOcrModelRoute(url, LEGACY_OCR_MODEL_BASE_URL)) {
-      return true;
-    }
-    return (
-      (url.hostname === "bucket.vibesearch.app" || url.hostname === "preview-bucket.vibesearch.app") &&
-      url.pathname.startsWith("/ocr-models/")
-    );
-  } catch {
-    return false;
   }
 };

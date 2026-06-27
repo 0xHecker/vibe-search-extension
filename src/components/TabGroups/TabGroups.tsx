@@ -1,20 +1,16 @@
 import { TabGroup } from "@components/TabGroups/TabGroup";
 import { FolderDocType } from "@src/schemas/folder_schema";
 import { ItemDocType } from "@src/schemas/item_schema";
+import { groupItemsByFolder } from "./group-items-by-folder";
 import { TooltipProvider } from "../ui/tooltip";
 import { memo, useEffect, useMemo, useRef, useState } from "react";
 import { ViewToggle } from "./ViewToggle";
-import {
-  DndContext,
-  DragOverlay,
-  PointerSensor,
-  closestCorners,
-  useSensor,
-  useSensors,
-  type DragEndEvent,
-  type DragStartEvent,
-} from "@dnd-kit/core";
+import { cn } from "@src/lib/utils";
+import { GripVertical } from "lucide-react";
+import type { DragEndEvent } from "@dnd-kit/core";
 import { SortableContext, arrayMove, verticalListSortingStrategy } from "@dnd-kit/sortable";
+import { useOrganizeDnd } from "@src/components/dnd/OrganizeDndProvider";
+import { ConfirmDialog } from "../ui/confirm-dialog";
 import type { QueryRankDebugScore } from "@src/search-core/contracts";
 
 export type SpaceMoveOption = {
@@ -33,6 +29,8 @@ interface TabGroupsProps {
   preserveInputOrder?: boolean;
   debugScoresByItemId?: Record<string, QueryRankDebugScore>;
   showDebugScores?: boolean;
+  onShareSelectedItems?: (itemIds: string[]) => void;
+  onShareFolder?: (folderId: string) => void;
 }
 
 const VIEW_STORAGE_KEY = "vibe-search-view-mode";
@@ -44,22 +42,23 @@ const TabGroupsComponent = ({
   preserveInputOrder = false,
   debugScoresByItemId,
   showDebugScores = false,
+  onShareSelectedItems,
+  onShareFolder,
 }: TabGroupsProps) => {
   const containerRef = useRef<HTMLDivElement>(null);
   const [sentForFetch, setSentForFetch] = useState(new Set<string>());
+  // Drag mode is off by default: rows render statically (no dnd-kit per item).
+  // Turning it on swaps rows for their sortable variant so reordering works.
+  const [dragMode, setDragMode] = useState(false);
   const [itemsState, setItemsState] = useState<ItemDocType[]>(items);
   const [foldersState, setFoldersState] = useState<FolderDocType[]>(folders);
-  const [activeDrag, setActiveDrag] = useState<
-    | { type: "item"; ids: string[]; item: ItemDocType; sourceFolderId: string }
-    | { type: "folder"; folder: FolderDocType }
-    | null
+  const [mergePrompt, setMergePrompt] = useState<
+    { sourceId: string; targetId: string; sourceName: string; targetName: string; count: number } | null
   >(null);
 
-  const sensors = useSensors(
-    useSensor(PointerSensor, {
-      activationConstraint: { distance: 6 },
-    })
-  );
+  // Drop logic is registered into the shared page-level OrganizeDnd context
+  // (one DndContext for the whole page) rather than a context owned here.
+  const { registerResolver, requestConfirmation } = useOrganizeDnd();
 
   // Initialize from localStorage
   const [viewMode, setViewMode] = useState<"list" | "grid">(() => {
@@ -67,7 +66,7 @@ const TabGroupsComponent = ({
       const stored = localStorage.getItem(VIEW_STORAGE_KEY);
       if (stored === "grid" || stored === "list") return stored;
     } catch {}
-    return "list";
+    return "grid";
   });
 
   // Persist view mode to localStorage
@@ -80,6 +79,30 @@ const TabGroupsComponent = ({
   useEffect(() => {
     setItemsState(items);
   }, [items]);
+
+  // Keyboard shortcut: press "O" (no modifiers) to toggle Organize mode.
+  // Ignored while typing in inputs/textareas/contenteditable so it never
+  // hijacks search or rename fields. Modifier combos pass through to the
+  // browser (e.g. Cmd+O), avoiding conflicts with native shortcuts.
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.metaKey || event.ctrlKey || event.altKey) return;
+      if (event.key !== "o" && event.key !== "O") return;
+      const el = document.activeElement as HTMLElement | null;
+      if (
+        el &&
+        (el.tagName === "INPUT" ||
+          el.tagName === "TEXTAREA" ||
+          el.isContentEditable)
+      ) {
+        return;
+      }
+      event.preventDefault();
+      setDragMode((value) => !value);
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, []);
 
   const itemsNeedingMeta = useMemo(() => {
     return new Set(items.filter((i) => !i.isMetaFetched).map((i) => i.url));
@@ -113,17 +136,29 @@ const TabGroupsComponent = ({
     });
   };
 
-  // Use ref to track sent URLs to avoid effect re-runs causing observer churn
+  // Memoized per-folder items so TabGroup props stay referentially stable
+  // and memo'd TabGroup/FlatItem/GridItem don't re-render on unrelated parent updates.
+  const itemsByFolder = useMemo(() => {
+    return groupItemsByFolder(orderedFolders, itemsState, preserveInputOrder);
+  }, [orderedFolders, itemsState, preserveInputOrder]);
+
+  // Ref to track sent URLs to avoid effect re-runs causing observer churn
   const sentForFetchRef = useRef(sentForFetch);
   sentForFetchRef.current = sentForFetch;
 
+  // Ref so the observer callback always reads the latest needing-meta set
+  // without forcing the effect to re-run on every metadata fetch.
+  const itemsNeedingMetaRef = useRef(itemsNeedingMeta);
+  itemsNeedingMetaRef.current = itemsNeedingMeta;
+
   useEffect(() => {
     const root = containerRef.current || null;
-    if (itemsNeedingMeta.size === 0) return;
+    if (itemsNeedingMetaRef.current.size === 0) return;
 
     const observer = new IntersectionObserver(
       (entries) => {
         const newlyVisible: string[] = [];
+        const needing = itemsNeedingMetaRef.current;
         for (const entry of entries) {
           const url = (entry.target as HTMLElement).dataset["url"];
           if (!url) continue;
@@ -131,7 +166,7 @@ const TabGroupsComponent = ({
           // Check if the item needs metadata and hasn't been sent for fetching yet.
           if (
             entry.isIntersecting &&
-            itemsNeedingMeta.has(url) &&
+            needing.has(url) &&
             !sentForFetchRef.current.has(url)
           ) {
             newlyVisible.push(url);
@@ -164,11 +199,37 @@ const TabGroupsComponent = ({
       { root: root, rootMargin: "600px 0px", threshold: 0.01 }
     );
 
-    const nodes = (root || document).querySelectorAll<HTMLElement>('[data-observe="item"]');
-    nodes.forEach((n) => observer.observe(n));
+    const observeItemNodes = (root: Element | Document) => {
+      const nodes = root.querySelectorAll<HTMLElement>('[data-observe="item"]');
+      nodes.forEach((n) => observer.observe(n));
+    };
 
-    return () => observer.disconnect();
-  }, [itemsNeedingMeta]); // Removed sentForFetch from deps to prevent observer churn
+    observeItemNodes(root || document);
+
+    // Watch for item nodes added after mount (e.g. when a collapsed folder expands
+    // and its subtree mounts). Re-observing an already-observed node is a no-op.
+    const mutationObserver = new MutationObserver((mutations) => {
+      for (const mutation of mutations) {
+        for (const node of mutation.addedNodes) {
+          if (!(node instanceof HTMLElement)) continue;
+          if (node.dataset["observe"] === "item") {
+            observer.observe(node);
+          }
+          const nested = node.querySelectorAll<HTMLElement>('[data-observe="item"]');
+          nested.forEach((n) => observer.observe(n));
+        }
+      }
+    });
+    mutationObserver.observe(root || document.body, { childList: true, subtree: true });
+
+    return () => {
+      observer.disconnect();
+      mutationObserver.disconnect();
+    };
+    // Only tear down when the item count changes (mount/unmount of whole items),
+    // not on every metadata fetch — that was the source of the observer churn.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [items.length]);
 
   const handleFolderReorder = async (activeId: string, overId: string) => {
     let nextIds: string[] = [];
@@ -274,26 +335,6 @@ const TabGroupsComponent = ({
     ]);
   };
 
-  const handleDragStart = (event: DragStartEvent) => {
-    const data = event.active.data.current as any;
-    if (data?.type === "folder") {
-      setActiveDrag({ type: "folder", folder: data.folder as FolderDocType });
-      return;
-    }
-    if (data?.type === "item") {
-      const selectedIds: string[] =
-        data?.selectedIds && Array.isArray(data.selectedIds) && data.selectedIds.length > 0
-          ? Array.from(new Set(data.selectedIds))
-          : [data.item.id];
-      setActiveDrag({
-        type: "item",
-        ids: selectedIds,
-        item: data.item as ItemDocType,
-        sourceFolderId: data.folderId as string,
-      });
-    }
-  };
-
   const resolveTargetFolder = (over: DragEndEvent["over"]) => {
     if (!over) return null;
     const overData = over.data.current as any;
@@ -303,61 +344,121 @@ const TabGroupsComponent = ({
     return null;
   };
 
-  const handleDragEnd = (event: DragEndEvent) => {
-    const { active, over } = event;
-    if (!over) {
-      setActiveDrag(null);
-      return;
+  const mergeFolders = async (sourceId: string, targetId: string) => {
+    // Optimistic: reassign the source's items to the target and drop the source.
+    // The canonical merge (folders.mergeInto) then persists it server-side and
+    // a DB_CHANGE reconciles. Same rule everywhere — see docs/drag-and-drop.md.
+    setItemsState((prev) =>
+      prev.map((item) =>
+        item.folderId === sourceId ? { ...item, folderId: targetId } : item
+      )
+    );
+    setFoldersState((prev) => prev.filter((f) => f.id !== sourceId));
+    try {
+      await chrome.runtime.sendMessage({
+        service: "folders",
+        type: "mergeInto",
+        target: "offscreen",
+        payload: { sourceFolderId: sourceId, targetFolderId: targetId },
+      });
+    } catch (e) {
+      console.error("Failed to merge tab groups", e);
     }
+  };
+
+  const promptFolderMerge = (sourceId: string, targetId: string) => {
+    const source = foldersState.find((f) => f.id === sourceId);
+    const target = foldersState.find((f) => f.id === targetId);
+    if (!source || !target) return;
+    const count = itemsState.filter((i) => i.folderId === sourceId).length;
+    setMergePrompt({
+      sourceId,
+      targetId,
+      sourceName: source.name,
+      targetName: target.name,
+      count,
+    });
+  };
+
+  const resolveMainAreaDrop = (event: DragEndEvent): boolean => {
+    const { active, over } = event;
+    if (!over) return false;
     const activeData = active.data.current as any;
     const overData = over.data.current as any;
 
-    if (activeData?.type === "folder" && overData?.type === "folder") {
-      handleFolderReorder(active.id as string, over.id as string);
-      setActiveDrag(null);
-      return;
+    if (activeData?.type === "folder") {
+      const targetFolderId =
+        overData?.type === "folder"
+          ? (over.id as string)
+          : overData?.type === "folder-drop"
+            ? (overData.folderId as string)
+            : null;
+      if (targetFolderId === (active.id as string)) return true;
+      if (!targetFolderId) return false;
+      // Center band of the target = MERGE (with confirm); otherwise reorder.
+      const overRect = over.rect;
+      const activeRect = active.rect.current.translated;
+      let relative = 0.5;
+      if (activeRect && overRect.height > 0) {
+        const activeCenterY = activeRect.top + activeRect.height / 2;
+        relative = (activeCenterY - overRect.top) / overRect.height;
+      }
+      if (relative > 0.3 && relative < 0.7) {
+        promptFolderMerge(active.id as string, targetFolderId);
+      } else {
+        handleFolderReorder(active.id as string, targetFolderId);
+      }
+      return true;
     }
 
     if (activeData?.type === "item") {
       const targetFolderId = resolveTargetFolder(over);
       const sourceFolderId = activeData.folderId as string;
-      if (!targetFolderId) {
-        setActiveDrag(null);
-        return;
-      }
+      // Not a main-area target — let another surface's resolver (e.g. the
+      // sidebar) try to handle this drop.
+      if (!targetFolderId) return false;
       const idsToMove =
-        activeDrag?.type === "item" && activeDrag.ids.length > 0
-          ? activeDrag.ids
-          : [activeData.item.id];
+        Array.isArray(activeData.selectedIds) && activeData.selectedIds.length > 0
+          ? Array.from(new Set<string>(activeData.selectedIds))
+          : [activeData.item.id as string];
 
       if (targetFolderId === sourceFolderId && overData?.type === "item") {
         reorderWithinFolder(sourceFolderId, active.id as string, over.id as string);
       } else {
-        moveItems(
-          idsToMove,
-          sourceFolderId,
-          targetFolderId,
-          overData?.type === "item" ? (over.id as string) : undefined
-        );
+        const overItemId = overData?.type === "item" ? (over.id as string) : undefined;
+        const runMove = () => moveItems(idsToMove, sourceFolderId, targetFolderId, overItemId);
+        if (idsToMove.length > 20) {
+          requestConfirmation({
+            title: `Move ${idsToMove.length} tabs?`,
+            description: `This moves ${idsToMove.length} tabs into the target tab group.`,
+            confirmLabel: "Move",
+            variant: "warning",
+            onConfirm: runMove,
+          });
+        } else {
+          runMove();
+        }
       }
+      return true;
     }
-    setActiveDrag(null);
+    return false;
   };
 
-  const handleDragCancel = () => setActiveDrag(null);
+  // Keep the latest drop logic in a ref so the registration effect subscribes
+  // exactly once (and never churns as items/folders state changes mid-session).
+  const resolveMainAreaDropRef = useRef(resolveMainAreaDrop);
+  resolveMainAreaDropRef.current = resolveMainAreaDrop;
+
+  useEffect(() => {
+    return registerResolver((event) => resolveMainAreaDropRef.current(event));
+  }, [registerResolver]);
 
   return (
     <TooltipProvider>
-      <DndContext
-        sensors={sensors}
-        collisionDetection={closestCorners}
-        onDragStart={handleDragStart}
-        onDragEnd={handleDragEnd}
-        onDragCancel={handleDragCancel}
-      >
         <div ref={containerRef} className="w-full h-fit max-w-[1090px] mx-auto mt-14 pb-14">
-          {/* Master view toggle at top right */}
-          <div className="flex justify-end mb-4 px-4">
+          {/* View toggle (top-right). The Organize/drag toggle is a floating
+              control pinned at bottom-left (rendered below) with an "O" shortcut. */}
+          <div className="flex items-center justify-end gap-2 mb-4 px-4">
             <ViewToggle view={viewMode} onViewChange={setViewMode} />
           </div>
 
@@ -367,7 +468,7 @@ const TabGroupsComponent = ({
           >
             <div className="flex flex-col gap-4">
               {orderedFolders.map((folder) => {
-                const folderItems = orderedItemsForFolder(folder.id);
+                const folderItems = itemsByFolder.get(folder.id) || [];
                 return (
                   <TabGroup
                     key={folder.id}
@@ -378,6 +479,9 @@ const TabGroupsComponent = ({
                     viewMode={viewMode}
                     debugScoresByItemId={debugScoresByItemId}
                     showDebugScores={showDebugScores}
+                    onShareSelectedItems={onShareSelectedItems}
+                    onShareFolder={onShareFolder}
+                    dragMode={dragMode}
                   />
                 );
               })}
@@ -385,30 +489,51 @@ const TabGroupsComponent = ({
           </SortableContext>
         </div>
 
-        <DragOverlay dropAnimation={null}>
-          {activeDrag?.type === "item" && activeDrag.item ? (
-            <div className="min-w-[260px] max-w-[360px] rounded-xl bg-background-neutral shadow-2xl shadow-black/20 border border-border-neutral-faded p-3">
-              <p className="text-sm font-semibold text-foreground-neutral line-clamp-2">
-                {activeDrag.ids.length > 1
-                  ? `${activeDrag.ids.length} tabs selected`
-                  : activeDrag.item.title}
-              </p>
-              <p className="text-xs text-foreground-secondary line-clamp-1 mt-1">
-                {activeDrag.item.url}
-              </p>
-            </div>
-          ) : activeDrag?.type === "folder" ? (
-            <div className="min-w-[320px] rounded-xl bg-background-neutral shadow-2xl shadow-black/25 border border-border-neutral-faded px-4 py-3">
-              <div className="text-lg font-semibold text-foreground-neutral">
-                {activeDrag.folder.name}
-              </div>
-              <div className="text-xs text-foreground-secondary">
-                {activeDrag.folder.isPinned ? "Pinned group" : "Tab group"}
-              </div>
-            </div>
-          ) : null}
-        </DragOverlay>
-      </DndContext>
+        {/* Floating Organize toggle — pinned bottom-left, with an "O" shortcut.
+            Governs drag/reorder for both list and grid (and, later, cross-surface
+            moves). Kept out of the content flow so it's always reachable. */}
+        <button
+          type="button"
+          onClick={() => setDragMode((value) => !value)}
+          aria-pressed={dragMode}
+          title={dragMode ? "Exit Organize mode (O)" : "Organize — drag to reorder & move (O)"}
+          className={cn(
+            "fixed bottom-5 left-[4.25rem] z-40 inline-flex h-10 items-center gap-2 rounded-full border px-4 text-sm font-medium shadow-lg shadow-black/10 backdrop-blur transition-[background-color,color,box-shadow] duration-200 cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-border-neutral/80 focus-visible:ring-offset-1",
+            dragMode
+              ? "border-accent/40 bg-accent-faded text-accent"
+              : "border-border-neutral-faded bg-background-neutral/95 text-foreground-secondary hover:bg-background-neutral hover:text-foreground-neutral"
+          )}
+        >
+          <GripVertical size={16} />
+          {dragMode ? "Done" : "Organize"}
+        </button>
+
+        <ConfirmDialog
+          open={!!mergePrompt}
+          onOpenChange={(open) => {
+            if (!open) setMergePrompt(null);
+          }}
+          title={
+            mergePrompt
+              ? `Merge "${mergePrompt.sourceName}" into "${mergePrompt.targetName}"?`
+              : ""
+          }
+          description={
+            mergePrompt
+              ? `This moves ${mergePrompt.count} tab${
+                  mergePrompt.count === 1 ? "" : "s"
+                } into "${mergePrompt.targetName}" and removes "${mergePrompt.sourceName}". This can't be undone.`
+              : ""
+          }
+          confirmLabel="Merge"
+          variant="danger"
+          onConfirm={async () => {
+            if (!mergePrompt) return;
+            const { sourceId, targetId } = mergePrompt;
+            setMergePrompt(null);
+            await mergeFolders(sourceId, targetId);
+          }}
+        />
     </TooltipProvider>
   );
 };

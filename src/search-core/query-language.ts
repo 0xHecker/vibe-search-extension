@@ -16,6 +16,7 @@ import type {
   QueryToken,
 } from "./contracts";
 import type { ItemDocType } from "@src/schemas/item_schema";
+import { MAX_GRID_QUERY_LIMIT } from "@src/search-core/pagination";
 
 const FIELD_SET: Set<QueryField> = new Set([
   "space",
@@ -54,7 +55,7 @@ const SOURCE_SET: Set<ItemDocType["source"]> = new Set([
   "article",
 ]);
 
-const MEDIA_FILTERS: Array<"image" | "video" | "media"> = ["image", "video", "media"];
+const MEDIA_FILTERS: Array<"image" | "video" | "media" | "embed"> = ["image", "video", "embed", "media"];
 
 const DEFAULT_FILTERS = (): QueryFilters => ({
   spaceIds: [],
@@ -355,7 +356,7 @@ const addPill = (
   pills.push({
     id: `${field}:${start}:${end}`,
     kind:
-      field === "sort" || field === "mode" || field === "scope" || field === "limit" || field === "page"
+      field === "sort" || field === "mode" || field === "scope" || field === "limit" || field === "page" || field === "minscore" || field === "score"
         ? "directive"
         : "filter",
     field,
@@ -490,7 +491,7 @@ const parseTokenIntoState = (
   }
 
   if (field === "has") {
-    const value = trimQuotes(rawValue).toLowerCase() as "image" | "video" | "media";
+    const value = trimQuotes(rawValue).toLowerCase() as "image" | "video" | "media" | "embed";
     if (MEDIA_FILTERS.includes(value)) {
       if (isNegated) {
         filters.excludeHasAny.push(value);
@@ -602,7 +603,7 @@ const parseTokenIntoState = (
   if (field === "limit") {
     const value = Number.parseInt(trimQuotes(rawValue), 10);
     if (Number.isFinite(value) && value > 0) {
-      directives.limit = Math.min(500, value);
+      directives.limit = Math.min(MAX_GRID_QUERY_LIMIT, value);
       addPill(pills, field, token, String(directives.limit), false);
       return { consumed: 1, structured: true };
     }
@@ -613,6 +614,16 @@ const parseTokenIntoState = (
     if (Number.isFinite(value) && value > 0) {
       directives.page = value;
       addPill(pills, field, token, String(value), false);
+      return { consumed: 1, structured: true };
+    }
+  }
+
+  if (field === "minscore" || field === "score") {
+    const value = Number.parseFloat(trimQuotes(rawValue));
+    if (Number.isFinite(value)) {
+      const clamped = Math.max(0, Math.min(1, value));
+      directives.minScore = clamped;
+      addPill(pills, field, token, String(clamped), false);
       return { consumed: 1, structured: true };
     }
   }

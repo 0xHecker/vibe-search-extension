@@ -1,6 +1,6 @@
 import { RxJsonSchema } from "rxdb";
 
-export const deletedItemSchemaLiteral = {
+const deletedItemSchemaLiteral = {
   title: "Deleted Item Schema",
   version: 0,
   type: "object",

@@ -7,6 +7,8 @@
     "utils",
     "vite.config.base.ts",
     "vite.config.chrome.ts",
+    "manifest.base.json",
+    "manifest.chrome.json",
     "manifest.json",
     "manifest.dev.json"
   ],
@@ -14,5 +16,5 @@
   "ignore": [
     "src/**/*.spec.ts"
   ],
-  "exec": "vite build --config vite.config.chrome.ts --mode development"
+  "exec": "bunx vite build --config vite.config.chrome.ts --mode development"
 }

@@ -7,6 +7,8 @@
     "utils",
     "vite.config.base.ts",
     "vite.config.firefox.ts",
+    "manifest.base.json",
+    "manifest.firefox.json",
     "manifest.json",
     "manifest.dev.json"
   ],
@@ -14,5 +16,5 @@
   "ignore": [
     "src/**/*.spec.ts"
   ],
-  "exec": "vite build --config vite.config.firefox.ts --mode development"
+  "exec": "bunx vite build --config vite.config.firefox.ts --mode development"
 }

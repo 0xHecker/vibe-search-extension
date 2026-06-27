@@ -1,5 +1,18 @@
 import { RxJsonSchema } from "rxdb";
 
+export type MediaOcrMetadata = {
+  status: "pending" | "processing" | "done" | "error" | "skipped";
+  text?: string;
+  confidence?: number | null;
+  lineCount?: number;
+  modelVersion?: string;
+  sourceHash?: string;
+  error?: string;
+  extractedAt?: number;
+  language?: string;
+  engine?: string;
+};
+
 export type ItemDocType = {
   id: string;
   userId: string | null;
@@ -38,6 +51,9 @@ export type ItemDocType = {
     storageType: "hotlink" | "opfs" | "s3";
     opfsPath?: string;
     s3Url?: string;
+    embedUrl?: string;
+    embedType?: "iframe";
+    thumbnailUrl?: string;
     expiresAt?: number;
     altText?: string;
     titleText?: string;
@@ -49,6 +65,7 @@ export type ItemDocType = {
     width?: number;
     height?: number;
     capturedAt?: number;
+    ocr?: MediaOcrMetadata;
   }[];
   iconUrl?: string;
   displayImageUrl?: string;
@@ -67,7 +84,7 @@ export type ItemDocType = {
 
 export const itemSchema: RxJsonSchema<ItemDocType> = {
   title: "item schema",
-  version: 8,
+  version: 0,
   description: "Describes a single saved item (bookmark, note, social media post)",
   primaryKey: "id",
   type: "object",
@@ -138,6 +155,9 @@ export const itemSchema: RxJsonSchema<ItemDocType> = {
           },
           opfsPath: { type: "string" },
           s3Url: { type: "string" },
+          embedUrl: { type: "string" },
+          embedType: { type: "string", enum: ["iframe"] },
+          thumbnailUrl: { type: "string" },
           expiresAt: { type: "number" },
           altText: { type: "string" },
           titleText: { type: "string" },
@@ -149,6 +169,34 @@ export const itemSchema: RxJsonSchema<ItemDocType> = {
           width: { type: "number" },
           height: { type: "number" },
           capturedAt: { type: "number" },
+          ocr: {
+            type: "object",
+            properties: {
+              status: {
+                type: "string",
+                enum: ["pending", "processing", "done", "error", "skipped"],
+              },
+              text: { type: "string" },
+              confidence: { type: ["number", "null"], minimum: 0, maximum: 1 },
+              lineCount: {
+                type: "integer",
+                minimum: 0,
+                maximum: Number.MAX_SAFE_INTEGER - 1,
+                multipleOf: 1,
+              },
+              modelVersion: { type: "string", maxLength: 100 },
+              sourceHash: { type: "string", maxLength: 100 },
+              error: { type: "string" },
+              extractedAt: {
+                type: "integer",
+                minimum: 0,
+                maximum: Number.MAX_SAFE_INTEGER - 1,
+                multipleOf: 1,
+              },
+              language: { type: "string" },
+              engine: { type: "string" },
+            },
+          },
         },
       },
     },

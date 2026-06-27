@@ -29,6 +29,10 @@ type EmbeddingAppendResult = {
   appendedCount: number;
   totalCount: number;
 };
+type RebuildProgress = {
+  completedItems: number;
+  totalItems: number;
+};
 
 type CopyCleanVectorsWorkerPayload = {
   sourceFile: string;
@@ -194,6 +198,7 @@ class VectorStoreService {
   private isInitialized = false;
   private lockPromise: Promise<void> = Promise.resolve();
   private readonly COPY_CHUNK_SIZE_BYTES = 2 * 1024 * 1024;
+  private readonly REBUILD_EMBEDDING_ITEM_BATCH_SIZE = 20;
   private readonly QUERY_EMBEDDING_CACHE_LIMIT = 64;
   private queryEmbeddingCache = new Map<string, Float32Array>();
 
@@ -564,7 +569,10 @@ class VectorStoreService {
     const key = this.getQueryEmbeddingCacheKey(normalizedQuery);
     const cached = this.readCachedQueryEmbedding(key);
     if (cached) return cached;
-    const generated = await embeddingService.generateEmbeddings({ sentences: [normalizedQuery] });
+    const generated = await embeddingService.generateEmbeddings({
+      sentences: [normalizedQuery],
+      priority: "interactive",
+    });
     const snapshot = new Float32Array(generated);
     this.cacheQueryEmbedding(key, snapshot);
     return snapshot;
@@ -606,6 +614,7 @@ class VectorStoreService {
 
   public generateAndStoreEmbeddings = async (payload: {
     sentences: string[];
+    priority?: "interactive" | "background";
   }): Promise<EmbeddingAppendResult> => {
     await this.initialize();
     const embeddings = await embeddingService.generateEmbeddings(payload);
@@ -626,7 +635,8 @@ class VectorStoreService {
         "id" | "title" | "textContent" | "ocrText" | "url" | "source" | "authorUsername" | "media"
       >
     >,
-    cleanItems: { id: string; vector_index: number }[]
+    cleanItems: { id: string; vector_index: number }[],
+    onProgress?: (progress: RebuildProgress) => void
   ): Promise<{ newIndexMap: VectorIndexMapEntry[] }> => {
     return this.withLock(async () => {
       const newIndexMap: VectorIndexMapEntry[] = [];
@@ -635,19 +645,36 @@ class VectorStoreService {
 
       // Re-embed dirty items
       if (dirtyItems.length > 0) {
-        const entries = dirtyItems.flatMap((item) =>
-          composeEmbeddingTexts(item).map((text) => ({ id: item.id, text }))
-        );
-        const sentences = entries.map((entry) => entry.text);
-        const embeddings = await embeddingService.generateEmbeddings({ sentences });
         const destOpfs = new OpfsHandler();
         await destOpfs.open(destFile);
-        const destOffset = this.HEADER_SIZE + newVectorCount * vectorSizeBytes;
-        await destOpfs.write(this.toArrayBuffer(embeddings), destOffset);
-        destOpfs.close();
-        for (let i = 0; i < entries.length; i++) {
-          newIndexMap.push({ id: entries[i].id, vector_index: newVectorCount });
-          newVectorCount++;
+        try {
+          for (let start = 0; start < dirtyItems.length; start += this.REBUILD_EMBEDDING_ITEM_BATCH_SIZE) {
+            const itemBatch = dirtyItems.slice(start, start + this.REBUILD_EMBEDDING_ITEM_BATCH_SIZE);
+            const entries = itemBatch.flatMap((item) =>
+              composeEmbeddingTexts(item).map((text) => ({ id: item.id, text }))
+            );
+            if (entries.length > 0) {
+              const embeddings = await embeddingService.generateEmbeddings({
+                sentences: entries.map((entry) => entry.text),
+                priority: "background",
+              });
+              const destOffset = this.HEADER_SIZE + newVectorCount * vectorSizeBytes;
+              await destOpfs.write(this.toArrayBuffer(embeddings), destOffset);
+              for (const entry of entries) {
+                newIndexMap.push({ id: entry.id, vector_index: newVectorCount });
+                newVectorCount += 1;
+              }
+            }
+            onProgress?.({
+              completedItems: Math.min(start + itemBatch.length, dirtyItems.length),
+              totalItems: dirtyItems.length,
+            });
+            if (start + itemBatch.length < dirtyItems.length) {
+              await new Promise<void>((resolve) => window.setTimeout(resolve, 0));
+            }
+          }
+        } finally {
+          destOpfs.close();
         }
       }
 

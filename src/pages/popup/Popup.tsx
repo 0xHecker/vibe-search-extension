@@ -3,7 +3,7 @@ import { v4 as uuidv4 } from "uuid";
 import { Button } from "@src/components/ui/button";
 import { Input } from "@src/components/ui/input";
 import { Checkbox } from "@src/components/ui/checkbox";
-import { ArrowRight, Bookmark, Globe } from "lucide-react";
+import { ArrowRight, Bookmark, Globe, Camera, Crop, FileText, Zap } from "lucide-react";
 import { 
   SiInstagram, 
   SiX, 
@@ -756,6 +756,7 @@ const SaveTabsPopup = () => {
     reviewBeforeSave: false,
   });
   const [draftCount, setDraftCount] = React.useState(0);
+  const [pastedUrl, setPastedUrl] = React.useState("");
 
   const openSearchPage = () => {
     chrome.tabs.create({
@@ -908,6 +909,47 @@ const SaveTabsPopup = () => {
     }
   };
 
+  const quickSavePage = async () => {
+    try {
+      await chrome.runtime.sendMessage({ target: "background", type: "QUICK_SAVE_PAGE" });
+    } catch {}
+    window.close();
+  };
+
+  const quickScreenshot = async (mode: "visible" | "region") => {
+    try {
+      await chrome.runtime.sendMessage({ target: "background", type: "QUICK_SCREENSHOT", payload: { mode } });
+    } catch {}
+    window.close();
+  };
+
+  const quickExtract = async () => {
+    try {
+      await chrome.runtime.sendMessage({ target: "background", type: "QUICK_EXTRACT_PAGE" });
+    } catch {}
+    window.close();
+  };
+
+  const savePastedUrl = async () => {
+    const trimmed = pastedUrl.trim();
+    if (!trimmed) return;
+    try {
+      await chrome.runtime.sendMessage({ target: "background", type: "SAVE_PASTED_URL", payload: { url: trimmed } });
+    } catch {}
+    window.close();
+  };
+
+  const quickActions: Array<{
+    label: string;
+    icon: React.ReactNode;
+    onClick: () => void;
+  }> = [
+    { label: "Quick save", icon: <Zap size={15} />, onClick: () => void quickSavePage() },
+    { label: "Screenshot", icon: <Camera size={15} />, onClick: () => void quickScreenshot("visible") },
+    { label: "Region", icon: <Crop size={15} />, onClick: () => void quickScreenshot("region") },
+    { label: "Extract text", icon: <FileText size={15} />, onClick: () => void quickExtract() },
+  ];
+
   return (
     <div className="w-[340px] bg-background-page p-3.5">
       <div className="mb-3 flex items-center justify-between px-0.5">
@@ -978,6 +1020,42 @@ const SaveTabsPopup = () => {
         </Button>
 
         {status && <p className="mt-2 text-center text-xs text-foreground-secondary">{status}</p>}
+      </div>
+
+      <div className="mt-3 grid grid-cols-2 gap-2">
+        {quickActions.map((action) => (
+          <button
+            key={action.label}
+            type="button"
+            onClick={action.onClick}
+            className="flex items-center gap-2 rounded-lg border border-border-neutral-faded bg-background-neutral px-3 py-2.5 text-xs font-medium text-foreground-secondary transition-colors hover:bg-background-neutral-faded hover:text-foreground-neutral active:scale-[0.98]"
+          >
+            <span className="text-foreground-tertiary">{action.icon}</span>
+            {action.label}
+          </button>
+        ))}
+      </div>
+
+      <div className="mt-3 flex items-center gap-2">
+        <input
+          type="url"
+          value={pastedUrl}
+          onChange={(e) => setPastedUrl(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") void savePastedUrl();
+          }}
+          placeholder="Paste a link…"
+          className="h-9 min-w-0 flex-1 rounded-lg border border-border-neutral-faded bg-background-neutral px-3 text-xs text-foreground-neutral placeholder:text-foreground-tertiary focus:border-border-accent focus:outline-none focus:ring-1 focus:ring-border-accent"
+        />
+        <Button
+          variant="secondary"
+          size="sm"
+          className="h-9 shrink-0 px-3 text-xs"
+          onClick={() => void savePastedUrl()}
+          disabled={!pastedUrl.trim()}
+        >
+          Save
+        </Button>
       </div>
 
       <div className="mt-3 flex items-center justify-between gap-2 rounded-xl bg-background-neutral-faded px-3 py-2.5">

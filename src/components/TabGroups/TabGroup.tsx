@@ -1,4 +1,5 @@
-import { useState, useRef, useEffect, useMemo } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { formatTabsForClipboard, getClipboardFormat } from "@src/pages/search/components/settings/clipboard-format";
 import { CopyIcon } from "@icons/copy";
 import { Checkmark } from "@icons/checkmark";
 import { OpenArrowIcon } from "@icons/open-arrow";
@@ -25,8 +26,8 @@ import { FolderDocType } from "@src/schemas/folder_schema";
 import { ItemDocType } from "@src/schemas/item_schema";
 import { ExpandingButton } from "@components/TabGroups/ExpandingButton";
 import { AddTabButton } from "@components/TabGroups/AddTabButton";
-import { FlatItem } from "@components/TabGroups/FlatItem";
-import { GridItem } from "./GridItem";
+import { FlatItem, SortableFlatItem } from "@components/TabGroups/FlatItem";
+import { GridItem, SortableGridItem } from "./GridItem";
 import { Masonry } from "react-plock";
 import {
   openUrlsInCurrentWindow,
@@ -37,16 +38,10 @@ import { ConfirmDialog } from "@components/ui/confirm-dialog";
 import { OpenInCurrent } from "@icons/open-in-current";
 import { OpenInTabgroup } from "@icons/open-in-tabgroup";
 import { OpenInWindow } from "@icons/open-in-window";
-import { RefreshCw, FolderInput, FolderPlus } from "lucide-react";
-import { SelectionProvider, useSelection } from "./SelectionContext";
-import { BulkActionsBar } from "./BulkActionsBar";
+import { RefreshCw, FolderInput, FolderPlus, Share2, Check, Minus } from "lucide-react";
+import { useSelection } from "./SelectionContext";
 import { useDroppable } from "@dnd-kit/core";
-import {
-  SortableContext,
-  rectSortingStrategy,
-  useSortable,
-  verticalListSortingStrategy,
-} from "@dnd-kit/sortable";
+import { useSortable } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
 import type { SpaceMoveOption } from "./TabGroups";
 import type { QueryRankDebugScore } from "@src/search-core/contracts";
@@ -57,6 +52,8 @@ import {
   withToast,
 } from "@src/utils/toast-feedback";
 
+const TAB_PAGE_SIZE = 100;
+
 interface TabGroupProps {
   folder: FolderDocType;
   items: ItemDocType[];
@@ -65,18 +62,23 @@ interface TabGroupProps {
   viewMode: "list" | "grid";
   debugScoresByItemId?: Record<string, QueryRankDebugScore>;
   showDebugScores?: boolean;
+  onShareSelectedItems?: (itemIds: string[]) => void;
+  onShareFolder?: (folderId: string) => void;
+  dragMode?: boolean;
 }
 
 const TabGroupContent = ({
   folder,
   items,
-  allFolders,
   spaces,
   viewMode,
   debugScoresByItemId,
   showDebugScores = false,
+  onShareFolder,
+  dragMode = false,
 }: TabGroupProps) => {
   const [isCollapsed, setIsCollapsed] = useState(folder.isCollapsed ?? false);
+  const [isContentRendered, setIsContentRendered] = useState(!isCollapsed);
   const [isEditingTitle, setIsEditingTitle] = useState(false);
   const [title, setTitle] = useState(folder.name);
   const [copiedItemId, setCopiedItemId] = useState<string | null>(null);
@@ -87,13 +89,18 @@ const TabGroupContent = ({
   const [isLocked, setIsLocked] = useState(folder.isLocked ?? false);
   const [isOpenMenu, setIsOpenMenu] = useState(false);
   const [isDeleteDialogOpen, setIsDeleteDialogOpen] = useState(false);
+  // Large tab groups paginate (TAB_PAGE_SIZE per page) so we never mount
+  // hundreds of heavy item cards at once — keeps rendering snappy.
+  const [page, setPage] = useState(0);
   const inputRef = useRef<HTMLInputElement>(null);
   const moveSpaceOptions = useMemo(
     () => spaces.filter((space) => space.id !== folder.spaceId),
     [folder.spaceId, spaces]
   );
 
-  const { isSelectionMode } = useSelection();
+  const { isSelectionMode, selectedIds, toggleSelectAll } = useSelection();
+  const groupAllSelected = items.length > 0 && items.every((i) => selectedIds.has(i.id));
+  const groupSomeSelected = !groupAllSelected && items.some((i) => selectedIds.has(i.id));
   const {
     attributes,
     listeners,
@@ -132,13 +139,16 @@ const TabGroupContent = ({
   }, [isEditingTitle]);
 
   const handleCopyFolderUrls = async () => {
-    const urls = items.map((item) => item.url).join("\n");
-    if (!urls.trim()) {
+    const text = formatTabsForClipboard(
+      items.map((item) => ({ title: item.title, url: item.url })),
+      getClipboardFormat()
+    );
+    if (!text.trim()) {
       showErrorToast("No URLs available to copy.", { tempo: "quick" });
       return;
     }
     try {
-      await navigator.clipboard.writeText(urls);
+      await navigator.clipboard.writeText(text);
       setCopiedFolderId(folder.id);
       setTimeout(() => setCopiedFolderId(null), 5000);
       showSuccessToast("Tab group URLs copied.", { tempo: "quick" });
@@ -239,6 +249,17 @@ const TabGroupContent = ({
     setIsCollapsed(folder.isCollapsed ?? false);
   }, [folder.name, folder.isCollapsed]);
 
+  // Keep subtree mounted long enough for the collapse transition to finish,
+  // then unmount to release hundreds of child components/observers when collapsed.
+  useEffect(() => {
+    if (!isCollapsed) {
+      setIsContentRendered(true);
+      return;
+    }
+    const timer = window.setTimeout(() => setIsContentRendered(false), 320);
+    return () => window.clearTimeout(timer);
+  }, [isCollapsed]);
+
   useEffect(() => {
     if (!isUpdatingPinned) {
       setIsPinned(folder.isPinned ?? false);
@@ -271,6 +292,11 @@ const TabGroupContent = ({
       setIsCollapsed(!next);
     }
   };
+
+  const handleItemCopy = useCallback((itemToCopy: ItemDocType) => {
+    setCopiedItemId(itemToCopy.id);
+    window.setTimeout(() => setCopiedItemId(null), 5000);
+  }, []);
 
   const maybeDeleteFolderAfterOpen = async () => {
     if (isLocked) return;
@@ -445,15 +471,51 @@ const TabGroupContent = ({
     }
   };
 
+  const pageCount = Math.max(1, Math.ceil(items.length / TAB_PAGE_SIZE));
+  useEffect(() => {
+    setPage((p) => (p > pageCount - 1 ? pageCount - 1 : p));
+  }, [pageCount]);
+  const safePage = Math.min(page, pageCount - 1);
+  const isPaginated = items.length > TAB_PAGE_SIZE;
+  const pagedItems = isPaginated
+    ? items.slice(safePage * TAB_PAGE_SIZE, safePage * TAB_PAGE_SIZE + TAB_PAGE_SIZE)
+    : items;
+
+  const renderPaginationBar = () => (
+    <div className="flex items-center justify-center gap-3">
+      <Button
+        type="button"
+        variant="outline"
+        size="sm"
+        disabled={safePage === 0}
+        onClick={() => setPage(Math.max(0, safePage - 1))}
+      >
+        Previous
+      </Button>
+      <span className="text-xs text-foreground-secondary tabular-nums">
+        {safePage * TAB_PAGE_SIZE + 1}&ndash;{Math.min(items.length, (safePage + 1) * TAB_PAGE_SIZE)} of {items.length}
+      </span>
+      <Button
+        type="button"
+        variant="outline"
+        size="sm"
+        disabled={safePage >= pageCount - 1}
+        onClick={() => setPage(Math.min(pageCount - 1, safePage + 1))}
+      >
+        Next
+      </Button>
+    </div>
+  );
+
   return (
     <>
       <div
         ref={combinedRef}
         style={sortableStyle}
         className={cn(
-          "group/tabgroup flex relative flex-col rounded-xl transition-shadow duration-200",
-          isDragging ? "shadow-2xl shadow-black/20 ring-2 ring-accent/50 scale-[1.01]" : "",
-          isOver ? "outline-2 outline-accent/70 outline-offset-4" : ""
+          "group/tabgroup flex relative flex-col rounded-xl transition-[box-shadow,opacity] duration-200",
+          isDragging ? "opacity-50" : "",
+          isOver ? "outline-dashed outline-2 outline-accent/40 outline-offset-4" : ""
         )}
       >
         {/* Pin/Lock controls */}
@@ -524,6 +586,31 @@ const TabGroupContent = ({
               )}
             />
           </Button>
+
+          {/* Select all tabs in this group */}
+          {items.length > 0 && (
+            <button
+              type="button"
+              onClick={() => toggleSelectAll(items)}
+              aria-label={groupAllSelected ? "Deselect all tabs in group" : "Select all tabs in group"}
+              title={groupAllSelected ? "Deselect all in group" : "Select all in group"}
+              className={cn(
+                "ml-2 grid size-5 shrink-0 place-items-center rounded-md border transition-all duration-150 cursor-pointer",
+                groupAllSelected
+                  ? "border-accent bg-accent text-background-neutral"
+                  : groupSomeSelected
+                    ? "border-accent bg-accent/40 text-background-neutral"
+                    : "border-border-neutral-faded text-foreground-tertiary hover:border-foreground-tertiary",
+                isSelectionMode ? "opacity-100" : "opacity-0 group-hover/tabgroup:opacity-100"
+              )}
+            >
+              {groupAllSelected ? (
+                <Check size={12} strokeWidth={3} />
+              ) : groupSomeSelected ? (
+                <Minus size={12} strokeWidth={3} />
+              ) : null}
+            </button>
+          )}
 
           {isEditingTitle ? (
             <Input
@@ -618,6 +705,15 @@ const TabGroupContent = ({
                   <RefreshCw />
                   <span>Refresh all metadata</span>
                 </DropdownMenuItem>
+                {onShareFolder && (
+                  <>
+                    <DropdownMenuSeparator />
+                    <DropdownMenuItem onClick={() => onShareFolder(folder.id)}>
+                      <Share2 />
+                      <span>Share tab group…</span>
+                    </DropdownMenuItem>
+                  </>
+                )}
                 {moveSpaceOptions.length > 0 && <DropdownMenuSeparator />}
                 {moveSpaceOptions.length > 0 && (
                   <DropdownMenuSub>
@@ -627,17 +723,14 @@ const TabGroupContent = ({
                     </DropdownMenuSubTrigger>
                     <DropdownMenuSubContent className="min-w-[220px]">
                       {moveSpaceOptions.map((space) => {
-                        const isLocked = space.isPrivate && !space.access?.isUnlocked;
                         return (
                           <DropdownMenuItem
                             key={`move-${space.id}`}
-                            disabled={isLocked}
                             onClick={() => {
                               void handleMoveFolderToSpace(space.id);
                             }}
                           >
                             {space.name}
-                            {isLocked ? " (Locked)" : ""}
                           </DropdownMenuItem>
                         );
                       })}
@@ -652,17 +745,14 @@ const TabGroupContent = ({
                     </DropdownMenuSubTrigger>
                     <DropdownMenuSubContent className="min-w-[220px]">
                       {moveSpaceOptions.map((space) => {
-                        const isLocked = space.isPrivate && !space.access?.isUnlocked;
                         return (
                           <DropdownMenuItem
                             key={`copy-${space.id}`}
-                            disabled={isLocked}
                             onClick={() => {
                               void handleCopyFolderToSpace(space.id);
                             }}
                           >
                             {space.name}
-                            {isLocked ? " (Locked)" : ""}
                           </DropdownMenuItem>
                         );
                       })}
@@ -691,73 +781,86 @@ const TabGroupContent = ({
           </div>
         </div>
 
-        {/* Content */}
+        {/* Content — grid 0fr/1fr trick for smooth animated collapse.
+            Inner subtree unmounts after the transition so collapsed groups
+            don't keep hundreds of item components/observers alive. */}
         <div
           className={cn(
-            "transition-[max-height,opacity] ease-in-out duration-300 overflow-hidden",
-            isCollapsed ? "max-h-0 opacity-0" : "opacity-100"
+            "grid transition-[grid-template-rows,opacity] ease-in-out duration-300",
+            isCollapsed ? "grid-rows-[0fr] opacity-0" : "grid-rows-[1fr] opacity-100"
           )}
         >
-          <div className="flex flex-col gap-2 bg-background-page-secondary w-full h-fit mx-auto rounded-semi shadow-sm shadow-foreground-muted/60 pt-2 px-4 pb-4">
-            {/* Toolbar */}
-            <div className="flex flex-row gap-2">
-              <ExpandingButton
-                icon={<SearchThickIcon size={16} />}
-                placeholder="Search in this tab group"
-              />
-              <AddTabButton folderId={folder.id} />
-            </div>
+          <div className="overflow-hidden min-h-0">
+            {isContentRendered && (
+              <div className="flex flex-col gap-2 bg-background-page-secondary w-full mx-auto rounded-semi shadow-sm shadow-foreground-muted/60 pt-2 px-4 pb-4">
+                {/* Toolbar */}
+                <div className="flex flex-row gap-2">
+                  <ExpandingButton
+                    icon={<SearchThickIcon size={16} />}
+                    placeholder="Search in this tab group"
+                  />
+                  <AddTabButton folderId={folder.id} />
+                </div>
 
-            {/* Items */}
-            <SortableContext
-              items={items.map((item) => item.id)}
-              strategy={viewMode === "list" ? verticalListSortingStrategy : rectSortingStrategy}
-            >
-              <div className="flex flex-col gap-2">
-                {viewMode === "list" ? (
-                  items.map((item) => (
-                    <FlatItem
-                      key={item.id}
-                      item={item}
-                      spaces={spaces}
-                      debugScore={showDebugScores ? debugScoresByItemId?.[item.id] : undefined}
-                      showDebugScore={showDebugScores}
-                      onCopy={(itemToCopy) => {
-                        setCopiedItemId(itemToCopy.id);
-                        setTimeout(() => setCopiedItemId(null), 5000);
-                      }}
-                    />
-                  ))
-                ) : (
-                  <Masonry
-                    items={items}
-                    config={{
-                      columns: [2, 3, 4],
-                      gap: [16, 16, 16],
-                      media: [640, 768, 1024],
-                    }}
-                    render={(item) => (
-                      <GridItem
-                        key={item.id}
-                        item={item}
-                        spaces={spaces}
-                        debugScore={showDebugScores ? debugScoresByItemId?.[item.id] : undefined}
-                        showDebugScore={showDebugScores}
-                        onCopy={(itemToCopy) => {
-                          setCopiedItemId(itemToCopy.id);
-                          setTimeout(() => setCopiedItemId(null), 5000);
+                {isPaginated && (
+                  <div className="border-b border-border-neutral-faded/60 pb-3">
+                    {renderPaginationBar()}
+                  </div>
+                )}
+
+                {/* Items */}
+                <div className="flex flex-col gap-2">
+                    {viewMode === "list" ? (
+                      pagedItems.map((item) => {
+                        const Row = dragMode ? SortableFlatItem : FlatItem;
+                        return (
+                          <Row
+                            key={item.id}
+                            item={item}
+                            spaces={spaces}
+                            debugScore={showDebugScores ? debugScoresByItemId?.[item.id] : undefined}
+                            showDebugScore={showDebugScores}
+                            onCopy={handleItemCopy}
+                          />
+                        );
+                      })
+                    ) : (
+                      <Masonry
+                        items={pagedItems}
+                        config={{
+                          columns: [2, 3, 4],
+                          gap: [16, 16, 16],
+                          media: [640, 768, 1024],
+                        }}
+                        render={(item) => {
+                          const Card = dragMode ? SortableGridItem : GridItem;
+                          return (
+                            <Card
+                              key={item.id}
+                              item={item}
+                              spaces={spaces}
+                              debugScore={showDebugScores ? debugScoresByItemId?.[item.id] : undefined}
+                              showDebugScore={showDebugScores}
+                              onCopy={handleItemCopy}
+                            />
+                          );
                         }}
                       />
                     )}
-                  />
-                )}
+                  </div>
+                  {items.length === 0 && (
+                    <div className="mt-2 rounded-lg border border-dashed border-border-neutral/70 bg-background-neutral p-4 text-center text-sm text-foreground-secondary">
+                      Drag tabs here to start this group.
+                    </div>
+                  )}
+
+                  {isPaginated && (
+                    <div className="mt-3 border-t border-border-neutral-faded/60 pt-3">
+                      {renderPaginationBar()}
+                    </div>
+                  )}
               </div>
-              {items.length === 0 && (
-                <div className="mt-2 rounded-lg border border-dashed border-border-neutral/70 bg-background-neutral p-4 text-center text-sm text-foreground-secondary">
-                  Drag tabs here to start this group.
-                </div>
-              )}
-            </SortableContext>
+            )}
           </div>
         </div>
 
@@ -777,19 +880,11 @@ const TabGroupContent = ({
           onConfirm={handleDeleteGroup}
         />
       </div>
-
-      {/* Bulk actions bar */}
-      <BulkActionsBar
-        items={items}
-        folders={allFolders}
-        spaces={spaces}
-        currentFolderId={folder.id}
-      />
     </>
   );
 };
 
-export const TabGroup = ({
+export const TabGroup = memo(({
   folder,
   items,
   allFolders,
@@ -797,18 +892,22 @@ export const TabGroup = ({
   viewMode,
   debugScoresByItemId,
   showDebugScores = false,
+  onShareSelectedItems,
+  onShareFolder,
+  dragMode = false,
 }: TabGroupProps) => {
   return (
-    <SelectionProvider>
-      <TabGroupContent
-        folder={folder}
-        items={items}
-        allFolders={allFolders}
-        spaces={spaces}
-        viewMode={viewMode}
-        debugScoresByItemId={debugScoresByItemId}
-        showDebugScores={showDebugScores}
-      />
-    </SelectionProvider>
+    <TabGroupContent
+      folder={folder}
+      items={items}
+      allFolders={allFolders}
+      spaces={spaces}
+      viewMode={viewMode}
+      debugScoresByItemId={debugScoresByItemId}
+      showDebugScores={showDebugScores}
+      onShareSelectedItems={onShareSelectedItems}
+      onShareFolder={onShareFolder}
+      dragMode={dragMode}
+    />
   );
-};
+});

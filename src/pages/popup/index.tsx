@@ -1,11 +1,10 @@
 import React from "react";
 import ReactDOM from "react-dom/client";
+import { loadReactGrabInDevelopment } from "@src/lib/react-grab";
 import Popup from "./Popup";
 import "@assets/styles/tailwind.css";
 
-if (import.meta.env.DEV) {
-  void import("react-grab");
-}
+loadReactGrabInDevelopment();
 
 ReactDOM.createRoot(document.getElementById("__root") as HTMLElement).render(
   <React.StrictMode>

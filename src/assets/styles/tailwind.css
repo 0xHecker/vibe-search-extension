@@ -9,6 +9,24 @@
   --shadow-modal-dark: 0px 20px 35px rgba(15, 23, 42, 0.4);
 }
 
+/* Brief accent ring when an item is revealed-in-space from search results. */
+@keyframes searchRevealFlash {
+  0% { box-shadow: 0 0 0 3px var(--color-accent, #6366f1); }
+  65% { box-shadow: 0 0 0 3px var(--color-accent, #6366f1); }
+  100% { box-shadow: 0 0 0 0 rgba(0, 0, 0, 0); }
+}
+.search-reveal-flash {
+  border-radius: 12px;
+  animation: searchRevealFlash 1.25s ease-out 1;
+}
+@media (prefers-reduced-motion: reduce) {
+  .search-reveal-flash {
+    animation: none;
+    box-shadow: 0 0 0 3px var(--color-accent, #6366f1);
+    border-radius: 12px;
+  }
+}
+
 @theme {
   --animate-spin-slow: spin 20s linear infinite;
 
@@ -116,7 +134,7 @@
 
   --shadow-uniform-sm: var(--custom-shadow-uniform-sm);
 
-  --font-sans: "Neutral Sans", ui-sans-serif, system-ui, sans-serif, "Apple Color Emoji",
+  --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif, "Apple Color Emoji",
     "Segoe UI Emoji", "Segoe UI Symbol", "Noto Color Emoji";
   --font-sans-bold: "Inter", ui-sans-serif, system-ui, sans-serif, "Apple Color Emoji",
     "Segoe UI Emoji", "Segoe UI Symbol", "Noto Color Emoji";
@@ -261,4 +279,77 @@
   .scrollbar-thin::-webkit-scrollbar-thumb:hover {
     background-color: var(--color-gray-200);
   }
+
+  .scrollbar-subtle {
+    scrollbar-width: thin;
+    scrollbar-color: var(--color-gray-40) transparent;
+  }
+  .scrollbar-subtle:hover {
+    scrollbar-color: var(--color-gray-100) transparent;
+  }
+  .scrollbar-subtle::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+  }
+  .scrollbar-subtle::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  .scrollbar-subtle::-webkit-scrollbar-thumb {
+    background-color: var(--color-gray-40);
+    border-radius: 9999px;
+  }
+  .scrollbar-subtle:hover::-webkit-scrollbar-thumb {
+    background-color: var(--color-gray-100);
+  }
+  .scrollbar-subtle:hover::-webkit-scrollbar-thumb:hover {
+    background-color: var(--color-gray-200);
+  }
+}
+
+/* Sonner toast close button: move to right end, centered inside the toast */
+.vibe-toaster [data-sonner-toast] {
+  --toast-close-button-start: unset;
+  --toast-close-button-end: 6px;
+  --toast-close-button-transform: translate(0, -50%);
+}
+
+.vibe-toaster [data-sonner-toast] [data-close-button] {
+  top: 50%;
+  left: auto;
+  right: 6px;
+  height: 22px;
+  width: 22px;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--foreground-secondary);
+  transform: translate(0, -50%);
+  opacity: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: opacity 0.15s ease, background 0.15s ease, color 0.15s ease;
+}
+
+.vibe-toaster [data-sonner-toast] [data-close-button] svg {
+  display: block;
+}
+
+.vibe-toaster [data-sonner-toast]:hover [data-close-button],
+.vibe-toaster [data-sonner-toast] [data-close-button]:focus-visible {
+  opacity: 1;
+}
+
+.vibe-toaster [data-sonner-toast] [data-close-button]:hover {
+  background: var(--background-highlight-faded);
+  color: var(--foreground-neutral);
+}
+
+.vibe-toaster [data-sonner-toast] [data-close-button]:focus-visible {
+  box-shadow: 0 0 0 2px var(--border-neutral);
+}
+
+/* Make room for the inline close button at the end */
+.vibe-toaster [data-sonner-toast] [data-content] {
+  padding-right: 18px;
 }

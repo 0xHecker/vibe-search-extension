@@ -71,3 +71,40 @@ export function crxI18n(options: {
     },
   };
 }
+
+// Ship onnxruntime-web's wasm assets same-origin (chrome-extension://<id>/ort/).
+// The embedding worker pins device "wasm", so only the asyncify build is loaded.
+// Without same-origin assets, transformers.js fetches the ORT factory from the
+// jsdelivr CDN and wraps it in a blob: URL, which the MV3 extension CSP
+// (script-src 'self') blocks — breaking model init in the offscreen worker.
+export function copyOrtWasm(): PluginOption {
+  const ORT_FILES = [
+    "ort-wasm-simd-threaded.asyncify.mjs",
+    "ort-wasm-simd-threaded.asyncify.wasm",
+  ];
+  let outDir = "";
+  return {
+    name: "copy-ort-wasm",
+    apply: "build",
+    configResolved(config) {
+      outDir = config.build.outDir;
+    },
+    writeBundle() {
+      const srcDir = resolve(__dirname, "node_modules/onnxruntime-web/dist");
+      const destDir = resolve(outDir, "ort");
+      fs.mkdirSync(destDir, { recursive: true });
+      for (const file of ORT_FILES) {
+        const from = resolve(srcDir, file);
+        if (!fs.existsSync(from)) {
+          this.warn(`[copy-ort-wasm] missing source file: ${from}`);
+          continue;
+        }
+        fs.copyFileSync(from, resolve(destDir, file));
+      }
+      // Do not prune the ORT wasm files Vite emits into /assets. The OCR
+      // sandbox's bundled onnxruntime code contains concrete hashed references
+      // to those files; deleting any of them can surface as "no available
+      // backend / wasm fetch failed" when PaddleOCR initializes.
+    },
+  };
+}

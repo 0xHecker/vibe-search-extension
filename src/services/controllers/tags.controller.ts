@@ -270,6 +270,119 @@ export class TagsController {
     const tags = await this.getTagsForItem({ itemId: payload.itemId });
     return { tags };
   }
+
+  private notifyTagsChanged(): void {
+    try {
+      chrome.runtime.sendMessage({ type: "DB_CHANGE", scope: "items" });
+    } catch {}
+  }
+
+  /** All tags with a live (non-deleted) tab count, for the Tags manager. */
+  async listAllTags(): Promise<Array<TagDocType & { tabCount: number }>> {
+    const db = await getDb();
+    const tagDocs = await db.tags.find({ selector: {} }).exec();
+    const tags = tagDocs.map((doc: any) => doc.toMutableJSON() as TagDocType);
+    if (tags.length === 0) return [];
+
+    const joins = await db.item_tags.find({ selector: {} }).exec();
+    const itemIdsByTag = new Map<string, Set<string>>();
+    const allItemIds = new Set<string>();
+    for (const join of joins) {
+      const tagId = join.get("tagId") as string;
+      const itemId = join.get("itemId") as string;
+      if (!tagId || !itemId) continue;
+      allItemIds.add(itemId);
+      if (!itemIdsByTag.has(tagId)) itemIdsByTag.set(tagId, new Set());
+      itemIdsByTag.get(tagId)!.add(itemId);
+    }
+
+    const liveItemIds = new Set<string>();
+    const ids = Array.from(allItemIds);
+    const chunkSize = 600;
+    for (let i = 0; i < ids.length; i += chunkSize) {
+      const docs = await db.items
+        .find({ selector: { id: { $in: ids.slice(i, i + chunkSize) }, deletedAt: { $eq: 0 } } })
+        .exec();
+      for (const doc of docs) liveItemIds.add(doc.get("id") as string);
+    }
+
+    return tags.map((tag) => {
+      const set = itemIdsByTag.get(tag.id);
+      let tabCount = 0;
+      if (set) for (const id of set) if (liveItemIds.has(id)) tabCount += 1;
+      return { ...tag, tabCount };
+    });
+  }
+
+  async createTag(payload: {
+    name: string;
+    color?: string | null;
+    userId?: string;
+  }): Promise<TagDocType | null> {
+    const db = await getDb();
+    const name = this.normalizeName(payload.name);
+    if (!name) return null;
+    const userId = payload.userId || "user1";
+    const existing = await db.tags
+      .findOne({ selector: { name: { $eq: name }, userId: { $eq: userId } } })
+      .exec();
+    if (existing) return existing.toMutableJSON();
+    const now = Date.now();
+    const newTag: TagDocType = {
+      id: uuidv4(),
+      name,
+      userId,
+      isDirty: true,
+      serverVersion: 0,
+      createdAt: now,
+      updatedAt: now,
+      color: payload.color ?? null,
+      isFavorite: false,
+    };
+    await db.tags.insert(newTag as any);
+    this.notifyTagsChanged();
+    return newTag;
+  }
+
+  async renameTag(payload: { tagId: string; name: string }): Promise<{ success: boolean }> {
+    const db = await getDb();
+    const name = this.normalizeName(payload.name);
+    if (!name) return { success: false };
+    const doc = await db.tags.findOne(payload.tagId).exec();
+    if (!doc) return { success: false };
+    await doc.incrementalPatch({ name, updatedAt: Date.now(), isDirty: true });
+    this.notifyTagsChanged();
+    return { success: true };
+  }
+
+  async deleteTag(payload: { tagId: string }): Promise<{ success: boolean }> {
+    const db = await getDb();
+    const doc = await db.tags.findOne(payload.tagId).exec();
+    if (!doc) return { success: false };
+    const joins = await db.item_tags.find({ selector: { tagId: { $eq: payload.tagId } } }).exec();
+    for (const join of joins) await join.remove();
+    await doc.remove();
+    this.notifyTagsChanged();
+    return { success: true };
+  }
+
+  async setTagColor(payload: { tagId: string; color: string | null }): Promise<{ success: boolean }> {
+    const db = await getDb();
+    const doc = await db.tags.findOne(payload.tagId).exec();
+    if (!doc) return { success: false };
+    await doc.incrementalPatch({ color: payload.color ?? null, updatedAt: Date.now(), isDirty: true });
+    this.notifyTagsChanged();
+    return { success: true };
+  }
+
+  async setTagFavorite(payload: { tagId: string; isFavorite: boolean }): Promise<{ success: boolean }> {
+    const db = await getDb();
+    const doc = await db.tags.findOne(payload.tagId).exec();
+    if (!doc) return { success: false };
+    await doc.incrementalPatch({ isFavorite: !!payload.isFavorite, updatedAt: Date.now(), isDirty: true });
+    this.notifyTagsChanged();
+    return { success: true };
+  }
 }
 
 export const tagsController = new TagsController();

@@ -1,5 +1,6 @@
 import type { OcrResultItem } from "@paddleocr/paddleocr-js";
 import type { ItemDocType } from "@src/schemas/item_schema";
+import { readOpfsFile } from "@src/services/media-storage";
 import {
   METADATA_WORKER_BASE_URL,
   OCR_IMAGE_PROXY_URL,
@@ -8,7 +9,6 @@ import {
   OCR_MODEL_VERSION,
   getLegacyOcrModelUrl,
   getOcrModelUrl,
-  isDeprecatedOcrModelCacheUrl,
   resolveOcrModelRoleFromUrl,
 } from "@src/services/ocr-model-config";
 
@@ -19,13 +19,27 @@ const MIN_IMAGE_SIDE = 24;
 const MAX_IMAGES_PER_ITEM = 3;
 const MIN_LINE_SCORE = 0.45;
 const MAX_OCR_TEXT_CHARS = 12000;
+const ENABLE_DEV_OCR_CACHE_CLEANUP = import.meta.env.DEV;
 
 type ImageCandidate = {
   url: string;
-  source: "display" | "s3" | "original";
+  source: "display" | "s3" | "original" | "opfs";
   width?: number;
   height?: number;
   capturedAt?: number;
+};
+
+export type ItemOcrMediaResult = {
+  url: string;
+  source: ImageCandidate["source"];
+  status: "done" | "skipped" | "error";
+  text: string;
+  confidence?: number;
+  lineCount: number;
+  sourceHash: string;
+  width?: number;
+  height?: number;
+  error?: string;
 };
 
 type ImageOcrResult = {
@@ -59,6 +73,7 @@ export type ItemOcrResult = {
   lineCount: number;
   sourceHash: string;
   error?: string;
+  media?: ItemOcrMediaResult[];
 };
 
 const normalizeWhitespace = (input: string): string =>
@@ -116,6 +131,58 @@ const blobFromCanvas = (canvas: HTMLCanvasElement, type: string): Promise<Blob> 
     );
   });
 
+const cleanupDevModelCaches: ((cache: Cache) => Promise<void>) | null = ENABLE_DEV_OCR_CACHE_CLEANUP
+  ? (() => {
+      let cleanupPromise: Promise<void> | null = null;
+      return async (cache: Cache): Promise<void> => {
+        if (!cleanupPromise) {
+          cleanupPromise = (async () => {
+            const normalize = (value: string) => value.toLowerCase().replace(/[^a-z0-9]+/g, "");
+            const currentCacheName = normalize(OCR_MODEL_CACHE);
+            const isOwnedStaleCache = (cacheName: string) => {
+              const normalizedName = normalize(cacheName);
+              return (
+                normalizedName !== currentCacheName &&
+                normalizedName.includes("vibesearch") &&
+                normalizedName.includes("ocr")
+              );
+            };
+            const isStaleModelRequest = (request: Request) => {
+              try {
+                if (resolveOcrModelRoleFromUrl(request.url)) return false;
+                const url = new URL(request.url);
+                return (
+                  url.pathname.includes("ocr-model") &&
+                  (url.hostname.endsWith("vibesearch.app") ||
+                    url.hostname.endsWith("workers.dev") ||
+                    url.hostname === location.hostname)
+                );
+              } catch {
+                return false;
+              }
+            };
+
+            const cacheNames = await caches.keys();
+            await Promise.all(
+              cacheNames
+                .filter(isOwnedStaleCache)
+                .map((cacheName) => caches.delete(cacheName).catch(() => false))
+            );
+            const requests = await cache.keys();
+            await Promise.all(
+              requests.filter(isStaleModelRequest).map((request) => cache.delete(request).catch(() => false))
+            );
+          })()
+            .catch((error) => {
+              console.warn("[OCR] Failed to clean dev OCR model caches.", error);
+            })
+            .then(() => undefined);
+        }
+        await cleanupPromise;
+      };
+    })()
+  : null;
+
 class OcrSandboxClient {
   private frame: HTMLIFrameElement | null = null;
   private readyPromise: Promise<void> | null = null;
@@ -161,6 +228,10 @@ class OcrSandboxClient {
     if (!target) {
       throw new Error("OCR sandbox is not available.");
     }
+    // The sandbox page has an opaque origin (manifest sandbox page), so its
+    // origin cannot be matched. Post with "*" and trust event.source on the way
+    // back. Targeting a concrete origin silently drops every message, so the
+    // sandbox never receives runOcr and init times out after 30s.
     target.postMessage(message, "*", transfer);
   }
 
@@ -285,26 +356,9 @@ class OcrSandboxClient {
 
 class OcrService {
   private sandbox: OcrSandboxClient | null = null;
-  private modelCacheCleanupPromise: Promise<void> | null = null;
   private consecutiveInitFailures = 0;
   private initCircuitOpenUntil = 0;
   private readonly INIT_CIRCUIT_OPEN_MS = 60_000;
-
-  private async cleanupDeprecatedModelCacheKeys(cache: Cache): Promise<void> {
-    if (!this.modelCacheCleanupPromise) {
-      this.modelCacheCleanupPromise = cache
-        .keys()
-        .then((requests) =>
-          Promise.all(
-            requests
-              .filter((request) => isDeprecatedOcrModelCacheUrl(request.url))
-              .map((request) => cache.delete(request).catch(() => false))
-          )
-        )
-        .then(() => undefined);
-    }
-    await this.modelCacheCleanupPromise;
-  }
 
   private async fetchWithModelCache(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
     const request = new Request(input, init);
@@ -318,7 +372,9 @@ class OcrService {
     }
 
     const cache = await caches.open(OCR_MODEL_CACHE);
-    await this.cleanupDeprecatedModelCacheKeys(cache);
+    if (cleanupDevModelCaches) {
+      await cleanupDevModelCaches(cache);
+    }
     const cacheKey = getOcrModelUrl(modelRole);
     const cached = await cache.match(cacheKey);
     if (cached) {
@@ -327,9 +383,39 @@ class OcrService {
 
     const response = await this.fetchModelWithFallback(request, modelRole);
     if (response.ok) {
-      await cache.put(cacheKey, response.clone());
+      return this.storeModelResponse(cache, cacheKey, response, modelRole);
     }
     return response;
+  }
+
+  private async storeModelResponse(
+    cache: Cache,
+    cacheKey: string,
+    response: Response,
+    modelRole: "det" | "rec"
+  ): Promise<Response> {
+    const buffer = await response.arrayBuffer();
+    const headers = new Headers(response.headers);
+    if (!headers.has("content-type")) {
+      headers.set("content-type", "application/x-tar");
+    }
+    const init: ResponseInit = {
+      status: response.status,
+      statusText: response.statusText,
+      headers,
+    };
+
+    try {
+      await cache.put(cacheKey, new Response(buffer.slice(0), init));
+    } catch (error) {
+      throw new Error(
+        `OCR ${modelRole} model downloaded but could not be saved to Cache Storage: ${
+          error instanceof Error ? error.message : String(error)
+        }`
+      );
+    }
+
+    return new Response(buffer, init);
   }
 
   private async fetchModelWithFallback(request: Request, modelRole: "det" | "rec"): Promise<Response> {
@@ -345,6 +431,36 @@ class OcrService {
     return fetch(getLegacyOcrModelUrl(modelRole), { credentials: "omit" });
   }
 
+  private async prefetchModelAssets(): Promise<void> {
+    for (const modelRole of ["det", "rec"] as const) {
+      const response = await this.fetchWithModelCache(getOcrModelUrl(modelRole));
+      if (!response.ok) {
+        throw new Error(`OCR ${modelRole} model warmup failed: HTTP ${response.status}`);
+      }
+    }
+
+    if (typeof caches !== "undefined") {
+      const cache = await caches.open(OCR_MODEL_CACHE);
+      for (const modelRole of ["det", "rec"] as const) {
+        const cached = await cache.match(getOcrModelUrl(modelRole));
+        if (!cached) {
+          throw new Error(`OCR ${modelRole} model warmup finished but cache entry is missing.`);
+        }
+      }
+    }
+  }
+
+  /**
+   * Ensure both OCR model files are present in Cache Storage, downloading any
+   * that are missing. Cheap to call repeatedly (a cache hit is a no-op) and
+   * independent of the sandbox, so wiping Cache Storage and re-triggering OCR
+   * re-downloads the models without an extension reload.
+   */
+  public async ensureModelsCached(): Promise<void> {
+    if (typeof caches === "undefined") return;
+    await this.prefetchModelAssets();
+  }
+
   private async initialize(): Promise<OcrSandboxClient> {
     if (this.sandbox) return this.sandbox;
     if (Date.now() < this.initCircuitOpenUntil) {
@@ -355,6 +471,7 @@ class OcrService {
       const sandbox = new OcrSandboxClient(this.fetchWithModelCache.bind(this));
       this.sandbox = sandbox;
       await sandbox.prepare();
+      await this.prefetchModelAssets();
       this.consecutiveInitFailures = 0;
       this.initCircuitOpenUntil = 0;
       return sandbox;
@@ -380,12 +497,20 @@ class OcrService {
   public getImageCandidates(item: ItemDocType): ImageCandidate[] {
     const byUrl = new Map<string, ImageCandidate>();
     const add = (candidate: ImageCandidate | null) => {
-      if (!candidate?.url || !isHttpUrl(candidate.url)) return;
+      if (!candidate?.url) return;
+      if (candidate.source !== "opfs" && !isHttpUrl(candidate.url)) return;
       if (!byUrl.has(candidate.url)) byUrl.set(candidate.url, candidate);
     };
 
-    add(item.displayImageUrl ? { url: item.displayImageUrl, source: "display" } : null);
-    for (const entry of item.media || []) {
+    const imageMedia = (item.media || []).filter((entry) => entry?.type === "image");
+    const storedMedia = imageMedia.filter(
+      (entry) => entry.storageType === "opfs" || entry.storageType === "s3"
+    );
+    const fetchedMedia = imageMedia.filter(
+      (entry) => entry.storageType !== "opfs" && entry.storageType !== "s3"
+    );
+
+    for (const entry of [...storedMedia, ...fetchedMedia]) {
       if (entry?.type !== "image") continue;
       const meta = {
         width: entry.width,
@@ -394,7 +519,9 @@ class OcrService {
       };
       add(entry.s3Url ? { url: entry.s3Url, source: "s3", ...meta } : null);
       add(entry.originalUrl ? { url: entry.originalUrl, source: "original", ...meta } : null);
+      add(entry.opfsPath ? { url: entry.opfsPath, source: "opfs", ...meta } : null);
     }
+    add(item.displayImageUrl ? { url: item.displayImageUrl, source: "display" } : null);
 
     return Array.from(byUrl.values()).slice(0, MAX_IMAGES_PER_ITEM);
   }
@@ -426,6 +553,14 @@ class OcrService {
   }
 
   private async fetchImageBlob(candidate: ImageCandidate): Promise<Blob> {
+    if (candidate.source === "opfs") {
+      const file = await readOpfsFile(candidate.url);
+      if (!file) throw new Error("OPFS_IMAGE_NOT_FOUND");
+      if (file.size > MAX_IMAGE_BYTES) throw new Error("IMAGE_TOO_LARGE");
+      if (file.type === "image/svg+xml") throw new Error("UNSUPPORTED_IMAGE_TYPE");
+      return file;
+    }
+
     const fetchDirect = async () => {
       const response = await fetch(candidate.url, { credentials: "omit" });
       return this.responseToImageBlob(response);
@@ -554,17 +689,64 @@ class OcrService {
     sourceHash: string
   ): Promise<ItemOcrResult> {
     if (candidates.length === 0) {
-      return { status: "skipped", text: "", lineCount: 0, sourceHash, error: "No OCR image found." };
+      return {
+        status: "skipped",
+        text: "",
+        lineCount: 0,
+        sourceHash,
+        error: "No OCR image found.",
+        media: [],
+      };
     }
 
     const allLines: Array<{ text: string; score: number }> = [];
     const errors: string[] = [];
+    const mediaResults: ItemOcrMediaResult[] = [];
     for (const candidate of candidates) {
+      const candidateSourceHash = this.getSourceHashForCandidates([candidate]);
       try {
         const result = await this.runImage(candidate);
-        allLines.push(...result.lines);
+        const candidateSeen = new Set<string>();
+        const candidateLines = result.lines.filter((line) => {
+          const key = line.text.toLowerCase();
+          if (candidateSeen.has(key)) return false;
+          candidateSeen.add(key);
+          return true;
+        });
+        const candidateText = normalizeWhitespace(candidateLines.map((line) => line.text).join("\n")).slice(
+          0,
+          MAX_OCR_TEXT_CHARS
+        );
+        const candidateConfidence =
+          candidateLines.length > 0
+            ? candidateLines.reduce((sum, line) => sum + line.score, 0) / candidateLines.length
+            : undefined;
+        mediaResults.push({
+          url: candidate.url,
+          source: candidate.source,
+          status: candidateLines.length > 0 ? "done" : "skipped",
+          text: candidateText,
+          confidence: candidateConfidence,
+          lineCount: candidateLines.length,
+          sourceHash: candidateSourceHash,
+          width: result.width,
+          height: result.height,
+          error: candidateLines.length > 0 ? undefined : "No readable text found in image.",
+        });
+        allLines.push(...candidateLines);
       } catch (error) {
-        errors.push(error instanceof Error ? error.message : String(error));
+        const message = error instanceof Error ? error.message : String(error);
+        const permanent = ["IMAGE_TOO_LARGE", "IMAGE_TOO_SMALL", "UNSUPPORTED_IMAGE_TYPE"].includes(message);
+        errors.push(message);
+        mediaResults.push({
+          url: candidate.url,
+          source: candidate.source,
+          status: permanent ? "skipped" : "error",
+          text: "",
+          lineCount: 0,
+          sourceHash: candidateSourceHash,
+          error: message,
+        });
       }
     }
 
@@ -586,6 +768,7 @@ class OcrService {
         lineCount: 0,
         sourceHash,
         error: errors.slice(0, 3).join("; "),
+        media: mediaResults,
       };
     }
 
@@ -605,6 +788,7 @@ class OcrService {
       lineCount: lines.length,
       sourceHash,
       error: errors.length > 0 ? errors.slice(0, 3).join("; ") : undefined,
+      media: mediaResults,
     };
   }
 }

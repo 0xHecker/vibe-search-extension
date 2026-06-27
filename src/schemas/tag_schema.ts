@@ -8,11 +8,13 @@ export type TagDocType = {
   serverVersion: number;
   createdAt: number;
   updatedAt: number;
+  color?: string | null;
+  isFavorite?: boolean;
 };
 
 export const tagSchema: RxJsonSchema<TagDocType> = {
   title: "tag schema",
-  version: 0,
+  version: 1,
   description: "Describes a single tag",
   primaryKey: "id",
   type: "object",
@@ -36,6 +38,8 @@ export const tagSchema: RxJsonSchema<TagDocType> = {
       maximum: Number.MAX_SAFE_INTEGER - 1,
       multipleOf: 1,
     },
+    color: { type: ["string", "null"], default: null, maxLength: 32 },
+    isFavorite: { type: "boolean", default: false },
   },
   required: ["id", "name", "createdAt", "updatedAt", "isDirty", "userId"],
   indexes: ["name", "isDirty", "userId"],

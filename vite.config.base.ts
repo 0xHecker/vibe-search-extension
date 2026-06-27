@@ -17,7 +17,7 @@ export default defineConfig({
     crxI18n({ localize, src: "./src/locales" }),
   ],
   optimizeDeps: {
-    include: ["@xenova/transformers", "@paddleocr/paddleocr-js"],
+    include: ["@huggingface/transformers", "@paddleocr/paddleocr-js"],
   },
   publicDir: resolve(__dirname, "public"),
   resolve: {

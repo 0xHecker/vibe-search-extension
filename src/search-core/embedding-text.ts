@@ -5,14 +5,20 @@ type EmbeddingTextSource = Pick<
   "title" | "textContent" | "ocrText" | "url" | "source" | "authorUsername" | "media"
 >;
 
-export const EMBEDDING_TEXT_VERSION = "v5-ocr-chunks";
+export const EMBEDDING_TEXT_VERSION = "v7-mdbr-leaf-ir-media-text";
 
 const MAX_CONTENT_CHARS = 2200;
 const MAX_OCR_CHARS = 12000;
+const MAX_MEDIA_TEXT_CHARS = 6000;
 const MAX_QUERY_CHARS = 320;
-const EMBEDDING_MODEL_MAX_TOKENS = 1000;
+// mdbr-leaf-ir is a BERT model with a hard 512-token context; the tokenizer
+// truncates anything longer, so each composed chunk stays comfortably under it.
+const EMBEDDING_MODEL_MAX_TOKENS = 512;
 const EMBEDDING_CHUNK_TOKEN_BUDGET = Math.floor(EMBEDDING_MODEL_MAX_TOKENS * 0.25);
-const MIN_BODY_CHUNK_TOKEN_BUDGET = 512;
+// Body chunk size in "token-like" units (words + punctuation). Kept below the
+// model's 512 sub-word limit once the prefix and WordPiece expansion are added,
+// so passages are embedded without silent tail truncation.
+const MIN_BODY_CHUNK_TOKEN_BUDGET = 300;
 const PATH_TOKEN_STOPWORDS = new Set([
   "amp",
   "api",
@@ -170,9 +176,36 @@ const composeHostnameTokens = (hostname: string): string => {
   return Array.from(new Set(hostnameTokens)).join(" ");
 };
 
-// Mirrors composeEmbeddingText: plain text, no field labels, so query and
-// document vectors live in the same representation space (jina-v2 is not
-// trained for query/passage prefixes).
+const collectUniqueTextParts = (parts: Array<string | undefined>, limit: number): string[] => {
+  const out: string[] = [];
+  const keys: string[] = [];
+  for (const part of parts) {
+    const text = trimContent(part || "", limit);
+    if (!text) continue;
+    const key = safeLower(text);
+    if (keys.some((existing) => existing.includes(key) || key.includes(existing))) continue;
+    keys.push(key);
+    out.push(text);
+  }
+  return out;
+};
+
+const composeMediaEmbeddingText = (media: EmbeddingTextSource["media"]): string => {
+  const parts: Array<string | undefined> = [];
+  for (const entry of media || []) {
+    parts.push(entry.altText, entry.titleText, entry.ariaLabel, entry.pageTitle, entry.siteName);
+    if (entry.ocr?.status === "done") parts.push(entry.ocr.text);
+  }
+  return collectUniqueTextParts(parts, MAX_MEDIA_TEXT_CHARS).join("\n\n");
+};
+
+// mdbr-leaf-ir is an asymmetric IR model: queries are prefixed with the
+// retrieval prompt below, while passages/documents are embedded with no prefix
+// (see composeEmbeddingTexts). Both still share a single representation space,
+// so the prompt is the only query/passage difference.
+export const QUERY_EMBEDDING_PROMPT =
+  "Represent this sentence for searching relevant passages: ";
+
 export const composeQueryEmbeddingText = (query: string): string => {
   const normalized = trimContent(query || "", MAX_QUERY_CHARS);
   if (!normalized) return "";
@@ -182,7 +215,10 @@ export const composeQueryEmbeddingText = (query: string): string => {
   const urlParts = urlToken ? normalizeUrlParts(urlToken) : { hostname: "", pathname: "", pathTokens: [] };
   const hostnameTerms = composeHostnameTokens(urlParts.hostname);
 
-  return [queryText, hostnameTerms, urlParts.pathTokens.join(" ")].filter(Boolean).join("\n");
+  const composed = [queryText, hostnameTerms, urlParts.pathTokens.join(" ")]
+    .filter(Boolean)
+    .join("\n");
+  return composed ? `${QUERY_EMBEDDING_PROMPT}${composed}` : "";
 };
 
 // Content-first, no field labels. `source`/media are hard filters elsewhere,
@@ -196,11 +232,12 @@ export const composeEmbeddingTexts = (item: EmbeddingTextSource): string[] => {
   const title = trimContent(item.title || "", 220);
   const textContent = trimContent(item.textContent || "", MAX_CONTENT_CHARS);
   const ocrText = trimContent(item.ocrText || "", MAX_OCR_CHARS);
+  const mediaText = composeMediaEmbeddingText(item.media);
   const author = safeLower((item.authorUsername || "").replace(/^@+/, ""));
   const { hostname, pathTokens } = normalizeUrlParts(item.url || "");
   const hostnameTerms = composeHostnameTokens(hostname);
   const prefix = [title, hostnameTerms, pathTokens.join(" "), author].filter(Boolean).join("\n");
-  const body = [textContent, ocrText].filter(Boolean).join("\n\n");
+  const body = collectUniqueTextParts([textContent, ocrText, mediaText], MAX_OCR_CHARS).join("\n\n");
   const bodyBudget = Math.max(
     MIN_BODY_CHUNK_TOKEN_BUDGET,
     EMBEDDING_CHUNK_TOKEN_BUDGET - countTokenLike(prefix)

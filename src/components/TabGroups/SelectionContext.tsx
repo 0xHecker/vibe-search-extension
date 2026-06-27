@@ -1,20 +1,19 @@
-import { createContext, useContext, useState, useCallback, ReactNode } from "react";
+import { createContext, useContext, useState, useCallback, useMemo, ReactNode } from "react";
 import { ItemDocType } from "@src/schemas/item_schema";
 
 interface SelectionContextType {
   selectedIds: Set<string>;
   isSelectionMode: boolean;
-  selectItem: (id: string) => void;
+  selectItem: (item: ItemDocType) => void;
   deselectItem: (id: string) => void;
-  toggleItem: (id: string) => void;
-  selectAll: (items: ItemDocType[]) => void;
-  deselectAll: () => void;
+  toggleItem: (item: ItemDocType) => void;
   toggleSelectAll: (items: ItemDocType[]) => void;
+  deselectAll: () => void;
   isSelected: (id: string) => boolean;
   enterSelectionMode: () => void;
   exitSelectionMode: () => void;
   selectedCount: number;
-  getSelectedItems: (allItems: ItemDocType[]) => ItemDocType[];
+  getSelectedItems: () => ItemDocType[];
 }
 
 const SelectionContext = createContext<SelectionContextType | null>(null);
@@ -27,103 +26,111 @@ export const useSelection = () => {
   return context;
 };
 
+/**
+ * App-level selection store. It keeps the full selected item objects (not just
+ * ids) so the floating bulk-actions bar can act on tabs even after you navigate
+ * to a different space — the selection persists across spaces and space groups
+ * until you clear it, reload, or close.
+ */
 export const SelectionProvider = ({ children }: { children: ReactNode }) => {
-  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  const [selected, setSelected] = useState<Map<string, ItemDocType>>(new Map());
   const [isSelectionMode, setIsSelectionMode] = useState(false);
 
-  const selectItem = useCallback((id: string) => {
-    setSelectedIds((prev) => new Set([...prev, id]));
+  const selectItem = useCallback((item: ItemDocType) => {
+    setSelected((prev) => {
+      if (prev.has(item.id)) return prev;
+      const next = new Map(prev);
+      next.set(item.id, item);
+      return next;
+    });
     setIsSelectionMode(true);
   }, []);
 
   const deselectItem = useCallback((id: string) => {
-    setSelectedIds((prev) => {
-      const next = new Set(prev);
+    setSelected((prev) => {
+      if (!prev.has(id)) return prev;
+      const next = new Map(prev);
       next.delete(id);
-      if (next.size === 0) {
-        setIsSelectionMode(false);
-      }
+      if (next.size === 0) setIsSelectionMode(false);
       return next;
     });
   }, []);
 
-  const toggleItem = useCallback((id: string) => {
-    setSelectedIds((prev) => {
-      const next = new Set(prev);
-      if (next.has(id)) {
-        next.delete(id);
+  const toggleItem = useCallback((item: ItemDocType) => {
+    setSelected((prev) => {
+      const next = new Map(prev);
+      if (next.has(item.id)) {
+        next.delete(item.id);
       } else {
-        next.add(id);
+        next.set(item.id, item);
       }
-      if (next.size === 0) {
-        setIsSelectionMode(false);
-      } else {
-        setIsSelectionMode(true);
-      }
+      setIsSelectionMode(next.size > 0);
       return next;
     });
-  }, []);
-
-  const selectAll = useCallback((items: ItemDocType[]) => {
-    setSelectedIds(new Set(items.map((item) => item.id)));
-    setIsSelectionMode(true);
-  }, []);
-
-  const deselectAll = useCallback(() => {
-    setSelectedIds(new Set());
-    setIsSelectionMode(false);
   }, []);
 
   const toggleSelectAll = useCallback((items: ItemDocType[]) => {
-    setSelectedIds((prev) => {
-      const allSelected = items.every((item) => prev.has(item.id));
+    setSelected((prev) => {
+      const allSelected = items.length > 0 && items.every((it) => prev.has(it.id));
+      const next = new Map(prev);
       if (allSelected) {
-        setIsSelectionMode(false);
-        return new Set();
+        for (const it of items) next.delete(it.id);
       } else {
-        setIsSelectionMode(true);
-        return new Set(items.map((item) => item.id));
+        for (const it of items) next.set(it.id, it);
       }
+      setIsSelectionMode(next.size > 0);
+      return next;
     });
   }, []);
 
-  const isSelected = useCallback((id: string) => selectedIds.has(id), [selectedIds]);
-
-  const enterSelectionMode = useCallback(() => {
-    setIsSelectionMode(true);
-  }, []);
-
-  const exitSelectionMode = useCallback(() => {
-    setSelectedIds(new Set());
+  const deselectAll = useCallback(() => {
+    setSelected(new Map());
     setIsSelectionMode(false);
   }, []);
 
-  const getSelectedItems = useCallback(
-    (allItems: ItemDocType[]) => {
-      return allItems.filter((item) => selectedIds.has(item.id));
-    },
-    [selectedIds]
+  const isSelected = useCallback((id: string) => selected.has(id), [selected]);
+
+  const enterSelectionMode = useCallback(() => setIsSelectionMode(true), []);
+
+  const exitSelectionMode = useCallback(() => {
+    setSelected(new Map());
+    setIsSelectionMode(false);
+  }, []);
+
+  const getSelectedItems = useCallback(() => Array.from(selected.values()), [selected]);
+
+  const selectedIds = useMemo(() => new Set(selected.keys()), [selected]);
+
+  const value = useMemo<SelectionContextType>(
+    () => ({
+      selectedIds,
+      isSelectionMode,
+      selectItem,
+      deselectItem,
+      toggleItem,
+      toggleSelectAll,
+      deselectAll,
+      isSelected,
+      enterSelectionMode,
+      exitSelectionMode,
+      selectedCount: selected.size,
+      getSelectedItems,
+    }),
+    [
+      selectedIds,
+      isSelectionMode,
+      selectItem,
+      deselectItem,
+      toggleItem,
+      toggleSelectAll,
+      deselectAll,
+      isSelected,
+      enterSelectionMode,
+      exitSelectionMode,
+      selected.size,
+      getSelectedItems,
+    ]
   );
 
-  return (
-    <SelectionContext.Provider
-      value={{
-        selectedIds,
-        isSelectionMode,
-        selectItem,
-        deselectItem,
-        toggleItem,
-        selectAll,
-        deselectAll,
-        toggleSelectAll,
-        isSelected,
-        enterSelectionMode,
-        exitSelectionMode,
-        selectedCount: selectedIds.size,
-        getSelectedItems,
-      }}
-    >
-      {children}
-    </SelectionContext.Provider>
-  );
+  return <SelectionContext.Provider value={value}>{children}</SelectionContext.Provider>;
 };

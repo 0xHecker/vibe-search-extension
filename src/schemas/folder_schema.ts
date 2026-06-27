@@ -20,7 +20,7 @@ export type FolderDocType = {
 
 export const folderSchema: RxJsonSchema<FolderDocType> = {
   title: "folder schema",
-  version: 6,
+  version: 0,
   description: "Describes a folder for organizing items or a group of tabs",
   primaryKey: "id",
   type: "object",

@@ -2,10 +2,9 @@ import React from 'react';
 import { createRoot } from 'react-dom/client';
 import Options from '@pages/options/Options';
 import '@pages/options/index.css';
+import { loadReactGrabInDevelopment } from '@src/lib/react-grab';
 
-if (import.meta.env.DEV) {
-  void import('react-grab');
-}
+loadReactGrabInDevelopment();
 
 function init() {
   const rootContainer = document.querySelector("#__root");

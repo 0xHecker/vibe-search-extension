@@ -1,16 +1,49 @@
-import { scheduleForProcessing } from "@src/services/metadata-pipeline";
+import {
+  retryStoredFailedMetadataUrls,
+  scheduleForProcessing,
+  setMetadataProgressListener,
+  type MetadataProgressSnapshot,
+} from "@src/services/metadata-pipeline";
 import { setupOffscreenDocument } from "@src/services/offscreen-helper";
 import { PRIVATE_SPACE_ID, PUBLIC_SPACE_ID } from "@src/common/spaces";
+import { OPEN_ON_NEW_TAB_STORAGE_KEY } from "@src/common/new-tab-pref";
 import type { ImportTargetSpace } from "@src/services/db-manager";
 import type { FolderDocType } from "@src/schemas/folder_schema";
 import type { ItemDocType } from "@src/schemas/item_schema";
 import { inferSource } from "@src/utils/infer-source";
+import {
+  isLikelyDirectResourceUrl,
+  isMetadataFetchableUrl,
+} from "@src/utils/metadata-url";
+import {
+  saveMediaToOpfs,
+  uploadOpfsFileToR2,
+  uploadRemoteMediaToR2,
+  deleteMediaFromOpfs,
+} from "@src/services/media-storage";
+import { OCR_MODEL_VERSION } from "@src/services/ocr-model-config";
+import {
+  syncSnapshotToGoogleWorkspace,
+  getGoogleWorkspaceSyncState,
+  clearGoogleWorkspaceAuth,
+  downloadGoogleWorkspaceBackup,
+  listGoogleWorkspaceBackups,
+} from "@src/services/google-workspace-sync";
+import type { ShareSnapshotV1 } from "@src/services/share-snapshot";
+import type {
+  BrowserBookmarkImportResult,
+  BrowserBookmarkNode,
+} from "@src/services/browser-bookmark-import";
+import type { GitHubStar, GitHubStarsImportResult } from "@src/services/github-stars-import";
+import { collectGitHubStarsPages } from "@src/services/github-stars-api";
 
 const SYNC_ALARM_NAME = "vector-sync-alarm";
 const EMBEDDING_ALARM_NAME = "embedding-alarm";
+const METADATA_RETRY_ALARM_NAME = "metadata-retry-alarm";
 const FORCE_DEV_OFFSCREEN_RESET = (import.meta as any)?.env?.VITE_FORCE_DEV_OFFSCREEN_RESET === "1";
 const SEARCH_PAGE_PATH = "/src/pages/search/index.html";
 const SEARCH_ONLY_OFFSCREEN_METHODS = new Set<string>([
+  "items:getByIds",
   "items:moveToSpace",
   "spaces:listSpaces",
   "spaces:createSpace",
@@ -25,13 +58,10 @@ const SEARCH_ONLY_OFFSCREEN_METHODS = new Set<string>([
 ]);
 const INTERNAL_ONLY_OFFSCREEN_METHODS = new Set<string>(["items:saveFetchedMetadata"]);
 
-const METADATA_WORKER_BASE_URL = "https://metadata-worker.watermelons.workers.dev";
-const LEGACY_METADATA_WORKER_BASE_URL = "https://meta.vibesearch.app";
-const IMPORT_MEDIA_ENDPOINT = `${METADATA_WORKER_BASE_URL}/import-media`;
-const LEGACY_IMPORT_MEDIA_ENDPOINT = `${LEGACY_METADATA_WORKER_BASE_URL}/import-media`;
-const IMPORT_MEDIA_UPLOAD_TOKEN = `${(import.meta as any)?.env?.VITE_IMPORT_MEDIA_UPLOAD_TOKEN || ""}`.trim();
 const IMPORT_SETTINGS_KEY = "vs_import_settings_v1";
 const IMPORT_DRAFTS_KEY = "vs_import_drafts_v1";
+const IMPORT_LRU_FOLDERS_KEY = "vs_import_lru_folders_v1";
+const IMPORT_LRU_MAX = 5;
 const IMPORT_MAX_DRAFTS = 24;
 const IMPORT_FAILED_ATTEMPTS_MAX = 20;
 const IMPORT_CONTEXTS: [`${chrome.contextMenus.ContextType}`, ...`${chrome.contextMenus.ContextType}`[]] = [
@@ -45,6 +75,7 @@ const IMPORT_CONTEXTS: [`${chrome.contextMenus.ContextType}`, ...`${chrome.conte
 ];
 const MENU_ROOT_ID = "vs:root";
 const MENU_OPEN_SEARCH_ID = "vs:open:search";
+const MENU_IMPORT_SHARED_ID = "vs:import:shared";
 // Content-aware primary actions
 const MENU_SAVE_IMAGE_ID = "vs:save:image";
 const MENU_SAVE_VIDEO_ID = "vs:save:video";
@@ -59,12 +90,15 @@ const MENU_SHOT_REGION_ID = "vs:shot:region";
 const MENU_SAVE_TARGETS_ID = "vs:targets:save";
 const MENU_EXTRACT_TARGETS_ID = "vs:targets:extract";
 const MENU_SHOT_TARGETS_ID = "vs:targets:shot";
-const MENU_MAX_SPACES = 6;
-const MENU_MAX_FOLDERS = 8;
-const MENU_MAX_ITEMS = 2;
 const MENU_REFRESH_DEBOUNCE_MS = 180;
 const MENU_REFRESH_LOW_PRIORITY_DEBOUNCE_MS = 900;
 const MENU_REFRESH_MIN_INTERVAL_MS = 2500;
+const HOVER_SAVE_TARGET_TTL_MS = 30_000;
+const SHARE_URL_HOSTS = new Set([
+  "share-worker.watermelons.workers.dev",
+  "share.watermelons.workers.dev",
+  "share.vibesearch.app",
+]);
 
 
 const LOCAL_IMPORT_HOST = "local.vibesearch.invalid";
@@ -72,7 +106,7 @@ const PROCESS_STATUS_HISTORY_MAX = 120;
 
 type OffscreenResponse<T> = { success?: boolean; payload?: T; error?: string };
 type ImportMode = "save" | "shot" | "extract";
-type ImportTarget = { mode: ImportMode; spaceId?: string; folderId?: string; itemId?: string; screenshotMode?: "visible" | "region" };
+type ImportTarget = { mode: ImportMode; spaceId?: string; folderId?: string; itemId?: string; screenshotMode?: "visible" | "region"; extractIntent?: boolean };
 type ImportSettings = { reviewBeforeSave: boolean };
 type ImportRetryAction = "RETRY_IMPORT";
 type ImportClickContext = {
@@ -87,7 +121,12 @@ type ImportClickContext = {
   tabFavIconUrl: string | null;
   capturedAt: number;
 };
-type MediaUploadResponse = { url?: string | null; key?: string; error?: string };
+type HoverSaveTarget = {
+  url: string;
+  title?: string;
+  capturedAt: number;
+};
+type ImportMediaUpload = { url?: string | null; key?: string };
 type ExtractImageTextResponse = {
   status: "done" | "skipped" | "error";
   text: string;
@@ -96,7 +135,7 @@ type ExtractImageTextResponse = {
   sourceHash: string;
   error?: string;
 };
-type SaveContentKind = "default" | "text-only" | "image-only";
+type SaveContentKind = "default" | "text-only" | "image-only" | "video-only" | "audio-only";
 type ImageDomMetadata = {
   pageTitle: string;
   siteName: string;
@@ -109,6 +148,7 @@ type ImageDomMetadata = {
   height: number;
 };
 type PreparedImportContent = {
+  itemId?: string;
   primaryUrl: string;
   title: string;
   textContent: string;
@@ -120,6 +160,7 @@ type PreparedImportContent = {
   ocrStatus?: ItemDocType["ocrStatus"];
   ocrConfidence?: number;
   ocrLineCount?: number;
+  ocrModelVersion?: string;
   ocrSourceHash?: string;
   tags: string[];
   shouldFetchMetadata: boolean;
@@ -164,6 +205,7 @@ type TabSnapshot = {
 };
 type ImportDraft = {
   id: string;
+  itemId?: string;
   mode: ImportMode;
   createdAt: number;
   updatedAt: number;
@@ -179,6 +221,7 @@ type ImportDraft = {
   ocrStatus?: ItemDocType["ocrStatus"];
   ocrConfidence?: number;
   ocrLineCount?: number;
+  ocrModelVersion?: string;
   ocrSourceHash?: string;
   shouldFetchMetadata?: boolean;
   isMetaFetched?: boolean;
@@ -213,6 +256,10 @@ type ProcessStatusRecord = {
   retryAction?: string;
   updatedAt: number;
 };
+type PublicShareResponse = {
+  share?: unknown;
+  snapshot?: ShareSnapshotV1;
+};
 
 const trimText = (value: string, max = 80) =>
   value.length <= max ? value : `${value.slice(0, Math.max(0, max - 1)).trim()}…`;
@@ -235,6 +282,21 @@ const normalizeHttpUrl = (value: string | null | undefined): string | null => {
   } catch {
     return null;
   }
+};
+const isVibeShareUrl = (value: string | null | undefined): boolean => {
+  const normalized = normalizeHttpUrl(value);
+  if (!normalized) return false;
+  try {
+    const parsed = new URL(normalized);
+    if (!SHARE_URL_HOSTS.has(parsed.hostname)) return false;
+    return parsed.pathname.startsWith("/s/") || parsed.pathname.startsWith("/v1/public-shares/");
+  } catch {
+    return false;
+  }
+};
+const pickSharedUrl = (context: ImportClickContext): string | null => {
+  const candidates = [context.linkUrl, context.pageUrl, context.tabUrl, context.frameUrl];
+  return candidates.find(isVibeShareUrl) || null;
 };
 const normalizeIconUrl = (value: string | null | undefined): string | null => {
   if (!value) return null;
@@ -309,10 +371,7 @@ const autoFolderName = (context: ImportClickContext, mode: ImportMode) => {
   return trimText(`${label} · ${pickHostLabel(context)} · ${day}`, 80);
 };
 const looksLikeMediaUrl = (url: string | null) =>
-  !!url &&
-  [".jpg", ".jpeg", ".png", ".gif", ".webp", ".avif", ".mp4", ".webm", ".mov", ".m3u8", ".mp3", ".wav", ".ogg", ".m4a", ".aac"].some((ext) =>
-    url.toLowerCase().includes(ext)
-  );
+  isLikelyDirectResourceUrl(url);
 const resolveMediaType = (
   mediaType: chrome.contextMenus.OnClickData["mediaType"] | null,
   url: string | null
@@ -362,6 +421,33 @@ const listRecentProcessStatuses = (max = 24): ProcessStatusRecord[] =>
   [...recentProcessStatuses.values()]
     .sort((a, b) => b.updatedAt - a.updatedAt)
     .slice(0, Math.max(1, Math.min(200, max)));
+
+// Publish a live "Metadata" row so a bulk import shows exactly how much
+// enrichment is left. The pipeline already paces and retries requests; this
+// only mirrors its progress for the UI.
+setMetadataProgressListener((snapshot: MetadataProgressSnapshot) => {
+  if (snapshot.pending > 0) {
+    sendProcessStatus(
+      "metadata-queue",
+      "Metadata",
+      "processing",
+      `Fetching metadata — ${snapshot.completed.toLocaleString()} done, ${snapshot.pending.toLocaleString()} pending${
+        snapshot.failed > 0 ? `, ${snapshot.failed.toLocaleString()} failed` : ""
+      }.`
+    );
+    return;
+  }
+  sendProcessStatus(
+    "metadata-queue",
+    "Metadata",
+    "success",
+    snapshot.completed > 0
+      ? `Metadata complete for ${snapshot.completed.toLocaleString()} links${
+          snapshot.failed > 0 ? ` (${snapshot.failed.toLocaleString()} failed)` : ""
+        }.`
+      : "Metadata is idle."
+  );
+});
 const createImportJob = (mode: ImportMode, context: ImportClickContext) => ({
   id: `import-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
   label: `${mode === "shot" ? "Screenshot" : mode === "extract" ? "Extract text" : "Import"} • ${pickHostLabel(context)}`,
@@ -398,6 +484,96 @@ const saveDrafts = async (drafts: ImportDraft[]) => {
     [...drafts].sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0)).slice(0, IMPORT_MAX_DRAFTS)
   );
 };
+
+type LruFolderEntry = {
+  folderId: string;
+  spaceId: string;
+  folderName: string;
+  spaceName: string;
+  usedAt: number;
+};
+
+const getLruFolders = async (): Promise<LruFolderEntry[]> => {
+  const raw = await getStorageValue<unknown[]>(IMPORT_LRU_FOLDERS_KEY, []);
+  if (!Array.isArray(raw)) return [];
+  return raw
+    .filter((entry): entry is LruFolderEntry =>
+      !!entry && typeof (entry as LruFolderEntry).folderId === "string"
+    )
+    .sort((a, b) => b.usedAt - a.usedAt)
+    .slice(0, IMPORT_LRU_MAX);
+};
+
+const recordLruFolder = async (entry: LruFolderEntry): Promise<void> => {
+  const current = await getLruFolders();
+  const filtered = current.filter((existing) => existing.folderId !== entry.folderId);
+  filtered.unshift(entry);
+  await setStorageValue(IMPORT_LRU_FOLDERS_KEY, filtered.slice(0, IMPORT_LRU_MAX));
+};
+
+const pruneLruFolders = async (): Promise<LruFolderEntry[]> => {
+  const lru = await getLruFolders();
+  if (lru.length === 0) return [];
+  const verified = await Promise.all(
+    lru.map(async (entry) => {
+      try {
+        const folder = await sendForwardedToOffscreen<FolderDocType | null>({
+          service: "folders",
+          type: "getById",
+          payload: { id: entry.folderId, skipLockCheck: true },
+        });
+        if (!folder?.id) return null;
+        if (folder.name !== entry.folderName) {
+          return { ...entry, folderName: folder.name };
+        }
+        return entry;
+      } catch {
+        return null;
+      }
+    })
+  );
+  const alive = verified.filter((entry): entry is LruFolderEntry => entry !== null);
+  if (alive.length !== lru.length) {
+    await setStorageValue(IMPORT_LRU_FOLDERS_KEY, alive);
+  }
+  return alive;
+};
+
+const resolveQuickSaveFolder = async (): Promise<{
+  folderId: string;
+  spaceId: string;
+  folderName: string;
+} | null> => {
+  const lru = await pruneLruFolders();
+  if (lru.length === 0) return null;
+  const top = lru[0];
+  return { folderId: top.folderId, spaceId: top.spaceId, folderName: top.folderName };
+};
+
+const buildLruEntryFromFolder = (
+  folder: { id: string; spaceId: string; name: string },
+  spaceName: string
+): LruFolderEntry => ({
+  folderId: folder.id,
+  spaceId: folder.spaceId,
+  folderName: folder.name,
+  spaceName,
+  usedAt: Date.now(),
+});
+
+const fetchSpaceName = async (spaceId: string): Promise<string> => {
+  try {
+    const spaces = await sendForwardedToOffscreen<Array<{ id: string; name: string }>>({
+      service: "spaces",
+      type: "listSpaces",
+      payload: {},
+    });
+    return spaces?.find((s) => s.id === spaceId)?.name || "Space";
+  } catch {
+    return "Space";
+  }
+};
+
 const toTabSnapshot = (tab?: chrome.tabs.Tab): TabSnapshot | undefined => {
   if (!tab) return undefined;
   return {
@@ -435,14 +611,6 @@ const resolveRetryTab = async (snapshot?: TabSnapshot): Promise<chrome.tabs.Tab 
   return snapshot as chrome.tabs.Tab;
 };
 
-const buildImportUploadHeaders = (contentType: string): Headers => {
-  const headers = new Headers({ "Content-Type": contentType });
-  if (IMPORT_MEDIA_UPLOAD_TOKEN) {
-    headers.set("X-VS-Import-Token", IMPORT_MEDIA_UPLOAD_TOKEN);
-  }
-  return headers;
-};
-
 const sendForwardedToOffscreen = async <T = unknown>(request: {
   service: string;
   type: string;
@@ -458,43 +626,122 @@ const sendForwardedToOffscreen = async <T = unknown>(request: {
   return response.payload as T;
 };
 
-const postImportMedia = async (init: RequestInit, label: string): Promise<MediaUploadResponse> => {
-  let lastError = "";
-  for (const endpoint of [IMPORT_MEDIA_ENDPOINT, LEGACY_IMPORT_MEDIA_ENDPOINT]) {
-    try {
-      const response = await fetch(endpoint, init);
-      const payload = (await response.json().catch(() => ({}))) as MediaUploadResponse;
-      if (response.ok) return payload;
-      lastError = payload.error || `${label} failed (${response.status})`;
-    } catch (error) {
-      lastError = error instanceof Error ? error.message : String(error);
+let browserBookmarkImportInFlight: Promise<BrowserBookmarkImportResult> | null = null;
+let githubStarsImportInFlight: Promise<GitHubStarsImportResult> | null = null;
+
+const fetchGitHubStars = async (accessToken: string): Promise<GitHubStar[]> => {
+  const token = accessToken.trim();
+  if (!token) throw new Error("GITHUB_TOKEN_REQUIRED");
+
+  const headers = {
+    Accept: "application/vnd.github+json",
+    Authorization: `Bearer ${token}`,
+    "X-GitHub-Api-Version": "2022-11-28",
+  };
+  return collectGitHubStarsPages(async (page, pageSize) => {
+    const url = new URL("https://api.github.com/user/starred");
+    url.searchParams.set("per_page", String(pageSize));
+    url.searchParams.set("page", String(page));
+    url.searchParams.set("sort", "created");
+    url.searchParams.set("direction", "desc");
+    const response = await fetch(url, { headers });
+    if (!response.ok) {
+      const detail = await response.text().catch(() => "");
+      throw new Error(`GitHub stars request failed: ${response.status} ${detail.slice(0, 200)}`);
     }
+    return response.json();
+  });
+};
+
+const importBrowserBookmarks = async (): Promise<BrowserBookmarkImportResult> => {
+  if (browserBookmarkImportInFlight) return browserBookmarkImportInFlight;
+
+  const run = (async () => {
+    if (!chrome.bookmarks?.getTree) {
+      throw new Error("Browser bookmark access is not available in this browser.");
+    }
+
+    sendProcessStatus("browser-bookmarks", "Browser bookmarks", "processing", "Reading your bookmark folders...");
+    const tree = (await chrome.bookmarks.getTree()) as BrowserBookmarkNode[];
+    sendProcessStatus("browser-bookmarks", "Browser bookmarks", "processing", "Preserving folders and importing bookmarks...");
+    const result = await sendForwardedToOffscreen<BrowserBookmarkImportResult>({
+      service: "browserBookmarks",
+      type: "importTree",
+      payload: { tree },
+    });
+    const metadataUrls = result.metadataUrls;
+    if (metadataUrls.length > 0) {
+      sendProcessStatus(
+        "browser-bookmarks",
+        "Browser bookmarks",
+        "processing",
+        `Queueing metadata for ${metadataUrls.length.toLocaleString()} bookmarks...`
+      );
+      scheduleForProcessing(metadataUrls, false);
+    }
+    scheduleContextMenuRefresh("high");
+    sendProcessStatus(
+      "browser-bookmarks",
+      "Browser bookmarks",
+      "success",
+      `Synced ${result.bookmarkCount.toLocaleString()} bookmarks across ${result.spaceIds.length.toLocaleString()} spaces; metadata queued for ${metadataUrls.length.toLocaleString()}.`
+    );
+    return result;
+  })();
+
+  browserBookmarkImportInFlight = run;
+  try {
+    return await run;
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : "Browser bookmark import failed.";
+    sendProcessStatus("browser-bookmarks", "Browser bookmarks", "error", detail);
+    throw error;
+  } finally {
+    browserBookmarkImportInFlight = null;
   }
-  throw new Error(lastError || `${label} failed`);
 };
 
-const postImportMediaJson = async (body: Record<string, unknown>) => {
-  const payload = await postImportMedia(
-    {
-      method: "POST",
-      headers: buildImportUploadHeaders("application/json"),
-      body: JSON.stringify(body),
-    },
-    "Media upload"
-  );
-  return { ...payload, url: resolveUploadedMediaUrl(payload) };
-};
-const postImportMediaBinary = async (blob: Blob, sourcePageUrl?: string | null, fileName?: string) => {
-  const headers = buildImportUploadHeaders(blob.type || "image/png");
-  if (sourcePageUrl) headers.set("X-VS-Source-Url", sourcePageUrl);
-  if (fileName) headers.set("X-VS-File-Name", fileName);
-  const payload = await postImportMedia({ method: "POST", headers, body: blob }, "Binary upload");
-  return { ...payload, url: resolveUploadedMediaUrl(payload) };
-};
+const importGitHubStars = async (accessToken: string): Promise<GitHubStarsImportResult> => {
+  if (githubStarsImportInFlight) return githubStarsImportInFlight;
 
-const resolveUploadedMediaUrl = (payload: MediaUploadResponse): string | null => {
-  if (payload.key) return `${METADATA_WORKER_BASE_URL}/r2/${encodeURIComponent(payload.key)}`;
-  return payload.url || null;
+  const run = (async () => {
+    sendProcessStatus("github-stars", "GitHub stars", "processing", "Reading starred repositories...");
+    const stars = await fetchGitHubStars(accessToken);
+    sendProcessStatus("github-stars", "GitHub stars", "processing", "Syncing starred repositories...");
+    const result = await sendForwardedToOffscreen<GitHubStarsImportResult>({
+      service: "githubStars",
+      type: "importStars",
+      payload: { stars },
+    });
+    if (result.metadataUrls.length > 0) {
+      sendProcessStatus(
+        "github-stars",
+        "GitHub stars",
+        "processing",
+        `Queueing metadata for ${result.metadataUrls.length.toLocaleString()} starred repositories...`
+      );
+      scheduleForProcessing(result.metadataUrls, false);
+    }
+    scheduleContextMenuRefresh("high");
+    sendProcessStatus(
+      "github-stars",
+      "GitHub stars",
+      "success",
+      `Synced ${result.importedCount.toLocaleString()} starred repositories across ${result.spaceIds.length.toLocaleString()} spaces; metadata queued for ${result.metadataUrls.length.toLocaleString()}.`
+    );
+    return result;
+  })();
+
+  githubStarsImportInFlight = run;
+  try {
+    return await run;
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : "GitHub stars import failed.";
+    sendProcessStatus("github-stars", "GitHub stars", "error", detail);
+    throw error;
+  } finally {
+    githubStarsImportInFlight = null;
+  }
 };
 
 const captureVisibleTabPng = async (tab?: chrome.tabs.Tab) =>
@@ -512,22 +759,85 @@ const parseTargetFromMenuId = (menuId: string): ImportTarget | null => {
   if (bySpace) return { mode: bySpace[1] as ImportMode, spaceId: bySpace[2] };
   const byFolder = /^vs:(save|shot|extract):folder:([^:]+)$/i.exec(menuId);
   if (byFolder) return { mode: byFolder[1] as ImportMode, folderId: byFolder[2] };
-  const byItem = /^vs:(save|shot):item:([^:]+):([^:]+)$/i.exec(menuId);
-  if (byItem) return { mode: byItem[1] as ImportMode, folderId: byItem[2], itemId: byItem[3] };
+  const byLru = /^vs:save:lru:folder:([^:]+)$/i.exec(menuId);
+  if (byLru) return { mode: "save", folderId: byLru[1] };
   return null;
 };
-const collectContext = (info: chrome.contextMenus.OnClickData, tab?: chrome.tabs.Tab): ImportClickContext => ({
-  pageUrl: normalizeHttpUrl(info.pageUrl || null),
-  frameUrl: normalizeHttpUrl(info.frameUrl || null),
-  linkUrl: normalizeHttpUrl(info.linkUrl || null),
-  mediaUrl: normalizeHttpUrl(info.srcUrl || null),
-  mediaType: info.mediaType || null,
-  selectionText: normalizeSelectionText(info.selectionText || ""),
+const hoverSaveTargetsByTab = new Map<number, HoverSaveTarget>();
+
+const getHoverSaveTarget = (tabId: number | undefined): HoverSaveTarget | null => {
+  if (typeof tabId !== "number") return null;
+  const target = hoverSaveTargetsByTab.get(tabId);
+  if (!target) return null;
+  if (Date.now() - target.capturedAt > HOVER_SAVE_TARGET_TTL_MS) {
+    hoverSaveTargetsByTab.delete(tabId);
+    return null;
+  }
+  return target;
+};
+
+const rememberHoverSaveTarget = (tabId: number, url: string, title?: string): void => {
+  hoverSaveTargetsByTab.set(tabId, {
+    url,
+    title: title ? trimText(title.trim(), 160) : undefined,
+    capturedAt: Date.now(),
+  });
+};
+
+const collectContext = (info: chrome.contextMenus.OnClickData, tab?: chrome.tabs.Tab): ImportClickContext => {
+  const hoverTarget = getHoverSaveTarget(tab?.id);
+  return {
+    pageUrl: normalizeHttpUrl(info.pageUrl || null),
+    frameUrl: normalizeHttpUrl(info.frameUrl || null),
+    linkUrl: normalizeHttpUrl(info.linkUrl || null) || hoverTarget?.url || null,
+    mediaUrl: normalizeHttpUrl(info.srcUrl || null),
+    mediaType: info.mediaType || null,
+    selectionText: normalizeSelectionText(info.selectionText || ""),
+    tabUrl: normalizeHttpUrl(tab?.url || null),
+    tabTitle: hoverTarget?.title || (tab?.title || "").trim(),
+    tabFavIconUrl: normalizeIconUrl(tab?.favIconUrl || null),
+    capturedAt: Date.now(),
+  };
+};
+const collectContextFromTab = (tab?: chrome.tabs.Tab): ImportClickContext => ({
+  pageUrl: normalizeHttpUrl(tab?.url || null),
+  frameUrl: null,
+  linkUrl: null,
+  mediaUrl: null,
+  mediaType: null,
+  selectionText: "",
   tabUrl: normalizeHttpUrl(tab?.url || null),
   tabTitle: (tab?.title || "").trim(),
   tabFavIconUrl: normalizeIconUrl(tab?.favIconUrl || null),
   capturedAt: Date.now(),
 });
+const getActiveTab = async (): Promise<chrome.tabs.Tab | undefined> => {
+  try {
+    const [active] = await chrome.tabs.query({ active: true, currentWindow: true });
+    return active;
+  } catch {
+    return undefined;
+  }
+};
+const buildContextFromUrl = (url: string): ImportClickContext => {
+  const normalized = normalizeHttpUrl(url);
+  let host: string | null = null;
+  try {
+    host = new URL(normalized!).hostname.replace(/^www\./, "");
+  } catch {}
+  return {
+    pageUrl: normalized,
+    frameUrl: null,
+    linkUrl: normalized,
+    mediaUrl: null,
+    mediaType: null,
+    selectionText: "",
+    tabUrl: normalized,
+    tabTitle: host || normalized || "Pasted link",
+    tabFavIconUrl: host ? `https://${host}/favicon.ico` : null,
+    capturedAt: Date.now(),
+  };
+};
 const resolvePrimaryUrl = (context: ImportClickContext, mode: ImportMode) => {
   if (mode === "shot") {
     return context.pageUrl || context.tabUrl || context.linkUrl || context.mediaUrl || null;
@@ -556,15 +866,23 @@ const contextText = (context: ImportClickContext, mode: ImportMode) => {
   if (context.mediaUrl) lines.push(`Media source: ${context.mediaUrl}`);
   return lines.join("\n");
 };
+const screenshotText = (context: ImportClickContext) => {
+  const lines: string[] = [];
+  lines.push("Imported via: page-screenshot");
+  lines.push(`Imported at: ${new Date(context.capturedAt).toISOString()}`);
+  if (context.tabTitle) lines.push(`Tab: ${context.tabTitle}`);
+  return lines.join("\n");
+};
 const suggestedTags = (context: ImportClickContext, source: ItemDocType["source"]) =>
   uniqueList([source !== "web" ? source : "", pickHostLabel(context), context.mediaType || ""]).slice(0, 6);
 
 const uploadRemoteMediaIfPresent = async (context: ImportClickContext) => {
   const mediaUrl = context.mediaUrl || (!context.mediaUrl && looksLikeMediaUrl(context.linkUrl) ? context.linkUrl : null);
-  if (!mediaUrl) return { upload: null as MediaUploadResponse | null, mediaType: null as "image" | "video" | "audio" | null, originalUrl: null as string | null };
+  if (!mediaUrl) return { upload: null as ImportMediaUpload | null, mediaType: null as "image" | "video" | "audio" | null, originalUrl: null as string | null };
   const mediaType = resolveMediaType(context.mediaType, mediaUrl);
   if (!mediaType) return { upload: null, mediaType: null, originalUrl: mediaUrl };
-  const upload = await postImportMediaJson({ remoteUrl: mediaUrl, sourcePageUrl: context.pageUrl || context.tabUrl || mediaUrl });
+  const uploaded = await uploadRemoteMediaToR2(mediaUrl, context.pageUrl || context.tabUrl || mediaUrl);
+  const upload = uploaded ? { url: uploaded.r2Url, key: uploaded.key } : null;
   return { upload, mediaType, originalUrl: mediaUrl };
 };
 const dataUrlToBlob = (dataUrl: string): Blob => {
@@ -626,13 +944,16 @@ const cropScreenshotBlob = async (
     bitmap.close();
   }
 };
-const uploadScreenshot = async (
+const captureScreenshotBlob = async (
   context: ImportClickContext,
   tab: chrome.tabs.Tab | undefined,
   sequence = 0,
   selection?: ScreenshotRegionSelection,
   onCaptured?: () => Promise<void> | void
 ) => {
+  if (selection) {
+    await new Promise((r) => setTimeout(r, 150));
+  }
   const dataUrl = await captureVisibleTabPng(tab);
   if (onCaptured) {
     await onCaptured();
@@ -640,11 +961,10 @@ const uploadScreenshot = async (
   const sourceBlob = dataUrlToBlob(dataUrl);
   const uploadBlob = selection ? await cropScreenshotBlob(sourceBlob, selection) : sourceBlob;
   const suffix = sequence > 0 ? `-${sequence + 1}` : "";
-  return await postImportMediaBinary(
-    uploadBlob,
-    context.pageUrl || context.tabUrl,
-    `screenshot-${context.capturedAt}${suffix}.png`
-  );
+  return {
+    blob: uploadBlob,
+    fileName: `screenshot-${context.capturedAt}${suffix}.png`,
+  };
 };
 
 const executeScriptInTab = async <T>(
@@ -693,8 +1013,119 @@ const extractContentFromPage = async (
           if (!href) return null;
           try { return new URL(href, window.location.href).href; } catch { return null; }
         };
+        const text = (el: Element | null | undefined): string => trim(el?.textContent || "");
+        const queryText = (root: ParentNode, selectors: string[]): string => {
+          for (const selector of selectors) {
+            const value = text(root.querySelector(selector));
+            if (value) return value;
+          }
+          return "";
+        };
+        const youtubeVideoId = (): string | null => {
+          const path = window.location.pathname;
+          if (path.startsWith("/shorts/")) {
+            return path.split("/shorts/")[1]?.split(/[?#/]/)[0] || null;
+          }
+          const fromSearch = new URLSearchParams(window.location.search).get("v");
+          if (fromSearch) return fromSearch;
+          const href = clickedUrl || window.location.href;
+          const watchMatch = /[?&]v=([^&#]+)/.exec(href);
+          if (watchMatch?.[1]) return watchMatch[1];
+          const shortMatch = /\/shorts\/([^/?#]+)/.exec(href);
+          return shortMatch?.[1] || null;
+        };
+        const visibleScore = (el: Element): number => {
+          const rect = el.getBoundingClientRect();
+          if (rect.width <= 0 || rect.height <= 0) return Number.POSITIVE_INFINITY;
+          if (rect.bottom < 0 || rect.top > window.innerHeight) return Number.POSITIVE_INFINITY;
+          const centerY = rect.top + rect.height / 2;
+          return Math.abs(centerY - window.innerHeight / 2);
+        };
+        const findShortRenderer = (videoId: string): Element | null => {
+          const renderers = Array.from(document.querySelectorAll("ytd-reel-video-renderer, ytd-shorts, [is-active]"));
+          const matching = renderers
+            .filter((el) =>
+              Array.from(el.querySelectorAll("a[href]")).some((anchor) =>
+                ((anchor as HTMLAnchorElement).href || anchor.getAttribute("href") || "").includes(videoId)
+              )
+            )
+            .sort((a, b) => visibleScore(a) - visibleScore(b));
+          if (matching[0]) return matching[0];
 
-        const canonicalUrl = clickedUrl || getMeta("url") || document.querySelector('link[rel="canonical"]')?.getAttribute("href") || window.location.href;
+          const active = renderers.find((el) => {
+            const attr = el.getAttribute("is-active");
+            return attr === "" || attr === "true";
+          });
+          if (active) return active;
+
+          return renderers.sort((a, b) => visibleScore(a) - visibleScore(b))[0] || null;
+        };
+        const extractYouTube = (): ExtractedContent | null => {
+          const host = window.location.hostname.replace(/^www\./, "");
+          if (host !== "youtube.com" && host !== "youtu.be") return null;
+
+          const videoId = youtubeVideoId();
+          if (!videoId) return null;
+          const isShort = window.location.pathname.startsWith("/shorts/");
+          const canonicalUrl = isShort
+            ? `https://www.youtube.com/shorts/${videoId}`
+            : `https://www.youtube.com/watch?v=${videoId}`;
+          const thumbnailUrl = `https://i.ytimg.com/vi/${videoId}/maxresdefault.jpg`;
+
+          if (isShort) {
+            const root = findShortRenderer(videoId) || document;
+            const title =
+              queryText(root, [
+                "#title h2",
+                "h2 #video-title",
+                "h2 yt-formatted-string",
+                "#video-title",
+                "h2",
+              ]) || "YouTube Short";
+            const author = queryText(root, [
+              "ytd-channel-name a",
+              "#channel-name a",
+              "a[href^='/@']",
+              "a[href*='/@']",
+            ]);
+            return {
+              canonicalUrl,
+              title: trim(title, 160),
+              author: author || undefined,
+              description: trim(getMeta("description"), 300),
+              thumbnailUrl,
+              platform: "youtube",
+            };
+          }
+
+          const title =
+            queryText(document, [
+              "h1.ytd-watch-metadata yt-formatted-string",
+              "h1.title",
+              "h1",
+            ]) ||
+            trim((document.title || "").replace(/\s+-\s+YouTube$/, ""), 160) ||
+            "YouTube video";
+          const author = queryText(document, [
+            "ytd-channel-name a",
+            "#owner-name a",
+            "#channel-name a",
+            "a[href^='/@']",
+          ]);
+          return {
+            canonicalUrl,
+            title: trim(title, 160),
+            author: author || undefined,
+            description: trim(getMeta("description"), 300),
+            thumbnailUrl,
+            platform: "youtube",
+          };
+        };
+
+        const platformResult = extractYouTube();
+        if (platformResult) return platformResult;
+
+        const canonicalUrl = resolveUrl(clickedUrl) || resolveUrl(getMeta("url")) || resolveUrl(document.querySelector('link[rel="canonical"]')?.getAttribute("href")) || window.location.href;
         const title = getMeta("title") || document.querySelector("h1")?.textContent?.trim() || document.title || "Saved page";
         const description = getMeta("description");
         const thumbnailUrl = resolveUrl(getMeta("image"));
@@ -800,6 +1231,7 @@ const showBrandedToast = async (
             display: "flex",
             gap: "8px",
             alignItems: "center",
+            flexWrap: "wrap",
           });
 
           for (const action of payload.actions) {
@@ -825,18 +1257,11 @@ const showBrandedToast = async (
               btn.style.background = "transparent";
             });
             btn.addEventListener("click", () => {
-              if (action.action === "UNDO_SAVE") {
-                chrome.runtime.sendMessage({
-                  target: "background",
-                  type: "UNDO_SAVE",
-                  payload: action.payload,
-                });
-              } else if (action.action === "OPEN_SEARCH") {
-                chrome.runtime.sendMessage({
-                  target: "background",
-                  type: "OPEN_SEARCH",
-                });
-              }
+              chrome.runtime.sendMessage({
+                target: "background",
+                type: action.action,
+                payload: action.payload,
+              });
               toast.remove();
               if (container.childElementCount === 0) root!.remove();
             });
@@ -860,6 +1285,325 @@ const showBrandedToast = async (
   );
 };
 
+type DestinationPickerSpace = {
+  spaceId: string;
+  spaceName: string;
+  folders: Array<{ folderId: string; folderName: string; usedAt: number }>;
+};
+
+const showDestinationPickerToast = async (
+  tab: chrome.tabs.Tab | undefined,
+  title: string,
+  spaces: DestinationPickerSpace[],
+  confirmAction: string,
+  extraPayload: Record<string, unknown> = {},
+  options: {
+    autoSave?: { timeoutMs: number; targetLabel: string };
+    allowSpaceDirectSave?: boolean;
+  } = {}
+) => {
+  await executeScriptInTab(
+    tab,
+    (payload: {
+      title: string;
+      spaces: Array<{
+        spaceId: string;
+        spaceName: string;
+        folders: Array<{ folderId: string; folderName: string; usedAt: number }>;
+      }>;
+      confirmAction: string;
+      extraPayload: Record<string, unknown>;
+      autoSave: { timeoutMs: number; targetLabel: string } | null;
+      allowSpaceDirectSave: boolean;
+    }) => {
+      try {
+        const TOKENS = {
+          bg: "#ffffff",
+          border: "#c6c6c6",
+          accent: "#ff4d4d",
+          accentFaded: "#ffe5e5",
+          text: "#212121",
+          textMuted: "#6b6b6b",
+          rowHover: "#f5f5f5",
+          shadow: "0px 20px 35px rgba(15, 23, 42, 0.18)",
+          radius: "10px",
+          radiusSm: "6px",
+          fontSans: '"Neutral Sans", ui-sans-serif, system-ui, sans-serif',
+        };
+
+        const rootId = "__vibesearch_picker_root__";
+        const existing = document.getElementById(rootId);
+        if (existing) existing.remove();
+
+        const root = document.createElement("div");
+        root.id = rootId;
+        const shadow = root.attachShadow({ mode: "open" });
+
+        let closed = false;
+        let countdownTimer: ReturnType<typeof setInterval> | null = null;
+        let onKey: ((event: KeyboardEvent) => void) | null = null;
+        const cleanup = () => {
+          if (countdownTimer !== null) {
+            clearInterval(countdownTimer);
+            countdownTimer = null;
+          }
+          if (onKey) {
+            window.removeEventListener("keydown", onKey, true);
+            onKey = null;
+          }
+        };
+        const dismiss = () => {
+          if (closed) return;
+          closed = true;
+          cleanup();
+          root.remove();
+        };
+        const confirmSave = (folderId: string, spaceId: string, auto: boolean) => {
+          if (closed) return;
+          chrome.runtime.sendMessage({
+            target: "background",
+            type: payload.confirmAction,
+            payload: { ...payload.extraPayload, folderId, spaceId, autoSave: auto },
+          });
+          dismiss();
+        };
+
+        const panel = document.createElement("div");
+        Object.assign(panel.style, {
+          position: "fixed",
+          right: "16px",
+          bottom: "16px",
+          zIndex: "2147483647",
+          width: "320px",
+          maxHeight: "420px",
+          display: "flex",
+          flexDirection: "column",
+          background: TOKENS.bg,
+          border: `1px solid ${TOKENS.border}`,
+          borderRadius: TOKENS.radius,
+          boxShadow: TOKENS.shadow,
+          fontFamily: TOKENS.fontSans,
+          color: TOKENS.text,
+          fontSize: "13px",
+          overflow: "hidden",
+          pointerEvents: "auto",
+        });
+
+        const header = document.createElement("div");
+        Object.assign(header.style, {
+          padding: "10px 14px",
+          borderBottom: `1px solid ${TOKENS.border}`,
+          fontWeight: "600",
+          fontSize: "13px",
+          display: "flex",
+          justifyContent: "space-between",
+          alignItems: "center",
+        });
+        header.textContent = payload.title;
+
+        const closeBtn = document.createElement("button");
+        closeBtn.type = "button";
+        closeBtn.textContent = "×";
+        Object.assign(closeBtn.style, {
+          background: "transparent",
+          border: "none",
+          color: TOKENS.textMuted,
+          fontSize: "18px",
+          cursor: "pointer",
+          padding: "0 4px",
+          lineHeight: "1",
+          fontFamily: TOKENS.fontSans,
+        });
+        closeBtn.addEventListener("click", () => {
+          dismiss();
+        });
+        header.appendChild(closeBtn);
+        panel.appendChild(header);
+
+        const listScroll = document.createElement("div");
+        Object.assign(listScroll.style, {
+          overflowY: "auto",
+          flex: "1",
+          padding: "4px 0",
+        });
+
+        const renderRow = (
+          label: string,
+          onClick: () => void,
+          opts: { indent?: boolean; muted?: boolean; bold?: boolean; chevron?: boolean } = {}
+        ) => {
+          const row = document.createElement("div");
+          Object.assign(row.style, {
+            padding: "8px 14px",
+            cursor: "pointer",
+            display: "flex",
+            alignItems: "center",
+            gap: "8px",
+            paddingLeft: opts.indent ? "28px" : "14px",
+            color: opts.muted ? TOKENS.textMuted : TOKENS.text,
+            fontWeight: opts.bold ? "600" : "400",
+            fontSize: "13px",
+            transition: "background 120ms",
+            fontFamily: TOKENS.fontSans,
+          });
+          row.textContent = label;
+          row.addEventListener("mouseenter", () => {
+            row.style.background = TOKENS.rowHover;
+          });
+          row.addEventListener("mouseleave", () => {
+            row.style.background = "transparent";
+          });
+          row.addEventListener("click", onClick);
+          return row;
+        };
+
+        const addHint = (row: HTMLElement, text: string) => {
+          const hint = document.createElement("span");
+          hint.textContent = text;
+          Object.assign(hint.style, {
+            marginLeft: "auto",
+            fontSize: "11px",
+            fontWeight: "400",
+            color: TOKENS.textMuted,
+          });
+          row.appendChild(hint);
+        };
+
+        for (const space of payload.spaces) {
+          const spaceLabel = `space-${space.spaceName}`;
+          const sortedFolders = [...space.folders].sort((a, b) => b.usedAt - a.usedAt);
+
+          // A space with no groups can't be expanded into folder rows. Instead of
+          // leaving an inert row that looks "stuck", make it directly saveable
+          // (screenshot picker) or show it as non-actionable.
+          if (sortedFolders.length === 0) {
+            if (payload.allowSpaceDirectSave) {
+              const spaceRow = renderRow(
+                spaceLabel,
+                () => confirmSave("", space.spaceId, false),
+                { bold: true }
+              );
+              addHint(spaceRow, "save here");
+              listScroll.appendChild(spaceRow);
+            } else {
+              const spaceRow = renderRow(spaceLabel, () => {}, { bold: true, muted: true });
+              spaceRow.style.cursor = "default";
+              addHint(spaceRow, "no groups");
+              listScroll.appendChild(spaceRow);
+            }
+            continue;
+          }
+
+          let expanded = false;
+          const folderRows: HTMLElement[] = [];
+
+          const spaceRow = renderRow(
+            spaceLabel,
+            () => {
+              expanded = !expanded;
+              for (const fr of folderRows) {
+                fr.style.display = expanded ? "flex" : "none";
+              }
+            },
+            { bold: true, chevron: true }
+          );
+
+          const chevron = document.createElement("span");
+          chevron.textContent = "›";
+          Object.assign(chevron.style, {
+            fontSize: "14px",
+            color: TOKENS.textMuted,
+            transition: "transform 150ms",
+          });
+          spaceRow.insertBefore(chevron, spaceRow.firstChild!);
+
+          listScroll.appendChild(spaceRow);
+
+          for (const folder of sortedFolders) {
+            const folderRow = renderRow(
+              folder.folderName || "Untitled",
+              () => confirmSave(folder.folderId, space.spaceId, false),
+              { indent: true, muted: false }
+            );
+            folderRow.style.display = "none";
+            folderRows.push(folderRow);
+            listScroll.appendChild(folderRow);
+          }
+        }
+
+        panel.appendChild(listScroll);
+
+        if (payload.autoSave) {
+          const autoSave = payload.autoSave;
+          const footer = document.createElement("div");
+          Object.assign(footer.style, {
+            padding: "8px 14px",
+            borderTop: `1px solid ${TOKENS.border}`,
+            fontSize: "12px",
+            color: TOKENS.textMuted,
+            fontFamily: TOKENS.fontSans,
+          });
+          panel.appendChild(footer);
+
+          let remainingMs = autoSave.timeoutMs;
+          let paused = false;
+          let lastTick = Date.now();
+          const secondsLeft = () => Math.max(0, Math.ceil(remainingMs / 1000));
+          const renderFooter = () => {
+            footer.textContent = paused
+              ? `Paused. Move away to resume saving to ${autoSave.targetLabel}.`
+              : `Auto-saving to ${autoSave.targetLabel} in ${secondsLeft()}s. Hover to pause.`;
+          };
+          renderFooter();
+
+          countdownTimer = setInterval(() => {
+            const now = Date.now();
+            const delta = now - lastTick;
+            lastTick = now;
+            if (!paused) {
+              remainingMs -= delta;
+              if (remainingMs <= 0) {
+                // No explicit choice within the window: save to the recent/LRU
+                // folder (empty folderId + spaceId routes through preferLru).
+                confirmSave("", "", true);
+                return;
+              }
+            }
+            renderFooter();
+          }, 200);
+
+          panel.addEventListener("mouseenter", () => {
+            paused = true;
+            renderFooter();
+          });
+          panel.addEventListener("mouseleave", () => {
+            paused = false;
+            lastTick = Date.now();
+            renderFooter();
+          });
+        }
+
+        shadow.appendChild(panel);
+        document.documentElement.appendChild(root);
+
+        onKey = (event: KeyboardEvent) => {
+          if (event.key === "Escape") dismiss();
+        };
+        window.addEventListener("keydown", onKey, true);
+      } catch {}
+    },
+    [
+      {
+        title,
+        spaces,
+        confirmAction,
+        extraPayload,
+        autoSave: options.autoSave ?? null,
+        allowSpaceDirectSave: options.allowSpaceDirectSave === true,
+      },
+    ]
+  );
+};
 
 const selectScreenshotRegion = async (
   tab: chrome.tabs.Tab | undefined
@@ -962,12 +1706,19 @@ const selectScreenshotRegion = async (
             } | null
           ) => {
             window.removeEventListener("keydown", onKeyDown, true);
+            scrim.removeEventListener("mousedown", onMouseDown);
+            scrim.removeEventListener("mousemove", onMouseMove);
+            scrim.removeEventListener("mouseup", onMouseUp);
             root.remove();
-            if (selection) {
-              resolve({ status: "selected", selection });
-            } else {
-              resolve({ status: "cancelled" });
-            }
+            requestAnimationFrame(() => {
+              requestAnimationFrame(() => {
+                if (selection) {
+                  resolve({ status: "selected", selection });
+                } else {
+                  resolve({ status: "cancelled" });
+                }
+              });
+            });
           };
 
           const onMouseDown = (e: MouseEvent) => {
@@ -1083,6 +1834,24 @@ const resolveSaveContentKind = (context: ImportClickContext): SaveContentKind =>
   if (mediaType === "image" && !!mediaUrl) {
     return "image-only";
   }
+  if (mediaType === "video" && !!mediaUrl) {
+    return "video-only";
+  }
+  if (mediaType === "audio" && !!mediaUrl) {
+    return "audio-only";
+  }
+
+  const pageMediaUrl = looksLikeMediaUrl(context.pageUrl) ? context.pageUrl
+    : looksLikeMediaUrl(context.tabUrl) ? context.tabUrl
+    : looksLikeMediaUrl(context.frameUrl) ? context.frameUrl
+    : null;
+  if (pageMediaUrl) {
+    const pageMediaType = resolveMediaType(null, pageMediaUrl);
+    if (pageMediaType === "image") return "image-only";
+    if (pageMediaType === "video") return "video-only";
+    if (pageMediaType === "audio") return "audio-only";
+  }
+
   if (hasSelectionText && !mediaUrl) {
     return "text-only";
   }
@@ -1101,6 +1870,10 @@ const resolveSavePrimaryUrlOrFallback = (
     return { url: primary, synthetic: false };
   }
   return { url: buildSyntheticImportUrl(context, mode), synthetic: true };
+};
+
+const isMetadataFetchablePageUrl = (url: string): boolean => {
+  return isMetadataFetchableUrl(url, { blockedHosts: [LOCAL_IMPORT_HOST] });
 };
 
 const fetchImageDomMetadata = async (
@@ -1192,13 +1965,17 @@ const buildImageOnlyContent = async (
   tab: chrome.tabs.Tab | undefined
 ): Promise<PreparedImportContent | null> => {
   const mediaUrl =
-    context.mediaUrl || (!context.mediaUrl && looksLikeMediaUrl(context.linkUrl) ? context.linkUrl : null);
+    context.mediaUrl ||
+    (looksLikeMediaUrl(context.linkUrl) ? context.linkUrl : null) ||
+    (looksLikeMediaUrl(context.pageUrl) ? context.pageUrl : null) ||
+    (looksLikeMediaUrl(context.tabUrl) ? context.tabUrl : null) ||
+    (looksLikeMediaUrl(context.frameUrl) ? context.frameUrl : null);
   if (!mediaUrl) return null;
   const mediaType = resolveMediaType(context.mediaType, mediaUrl);
   if (mediaType !== "image") return null;
 
   const domMeta = await fetchImageDomMetadata(tab, mediaUrl);
-  const pageUrl = normalizeHttpUrl(domMeta?.pageUrl || null) || resolveSavePrimaryUrl(context) || null;
+  const pageUrl = normalizeHttpUrl(domMeta?.pageUrl || null) || context.pageUrl || context.tabUrl || null;
   const source = inferSource(pageUrl || mediaUrl);
 
   let media: ItemDocType["media"] | undefined;
@@ -1253,28 +2030,99 @@ const buildImageOnlyContent = async (
     domMeta?.altText || domMeta?.titleText || domMeta?.ariaLabel || getFileNameFromUrl(mediaUrl),
     80
   );
-  const title = candidateLabel || trimText(`Image · ${pickHostLabel(context)}`, 80);
-  const metadataLines = [
-    domMeta?.altText ? `Alt: ${domMeta.altText}` : "",
-    domMeta?.titleText ? `Title: ${domMeta.titleText}` : "",
-    domMeta?.siteName ? `Site: ${domMeta.siteName}` : "",
-    domMeta?.pageTitle ? `Page title: ${domMeta.pageTitle}` : "",
-    pageUrl ? `Page URL: ${pageUrl}` : "",
-    mediaUrl ? `Image URL: ${mediaUrl}` : "",
-    domMeta?.faviconUrl ? `Favicon: ${domMeta.faviconUrl}` : "",
-    domMeta?.width && domMeta?.height ? `Dimensions: ${domMeta.width}x${domMeta.height}` : "",
-    `Imported at: ${new Date(context.capturedAt).toISOString()}`,
-  ].filter(Boolean);
+  const title = candidateLabel || `Image · ${getFileNameFromUrl(mediaUrl)}`;
 
   return {
     primaryUrl: mediaUrl,
     title,
-    textContent: metadataLines.join("\n"),
+    textContent: "",
     source,
     iconUrl: normalizeIconUrl(domMeta?.faviconUrl || null) || context.tabFavIconUrl || undefined,
     displayImageUrl,
     media,
     tags: uniqueList([source !== "web" ? source : "", "image", pickHostLabel(context)]),
+    shouldFetchMetadata: false,
+    isMetaFetched: true,
+  };
+};
+
+const buildVideoOnlyContent = async (
+  context: ImportClickContext
+): Promise<PreparedImportContent | null> => {
+  const mediaUrl =
+    context.mediaUrl ||
+    (looksLikeMediaUrl(context.linkUrl) ? context.linkUrl : null) ||
+    (looksLikeMediaUrl(context.pageUrl) ? context.pageUrl : null) ||
+    (looksLikeMediaUrl(context.tabUrl) ? context.tabUrl : null) ||
+    (looksLikeMediaUrl(context.frameUrl) ? context.frameUrl : null);
+  if (!mediaUrl) return null;
+  const mediaType = resolveMediaType(context.mediaType, mediaUrl);
+  if (mediaType !== "video") return null;
+
+  const pageUrl = context.pageUrl || context.tabUrl || null;
+  const source = inferSource(pageUrl || mediaUrl);
+
+  const media: ItemDocType["media"] = [{
+    type: "video",
+    originalUrl: mediaUrl,
+    storageType: "hotlink",
+    pageUrl: pageUrl || undefined,
+    pageTitle: context.tabTitle || undefined,
+    faviconUrl: context.tabFavIconUrl || undefined,
+    capturedAt: context.capturedAt,
+  }];
+
+  const title = trimText(context.tabTitle || `Video · ${getFileNameFromUrl(mediaUrl)}`, 80) || "Video";
+
+  return {
+    primaryUrl: mediaUrl,
+    title,
+    textContent: "",
+    source,
+    iconUrl: context.tabFavIconUrl || undefined,
+    media,
+    tags: uniqueList([source !== "web" ? source : "", "video", pickHostLabel(context)]),
+    shouldFetchMetadata: false,
+    isMetaFetched: true,
+  };
+};
+
+const buildAudioOnlyContent = async (
+  context: ImportClickContext
+): Promise<PreparedImportContent | null> => {
+  const mediaUrl =
+    context.mediaUrl ||
+    (looksLikeMediaUrl(context.linkUrl) ? context.linkUrl : null) ||
+    (looksLikeMediaUrl(context.pageUrl) ? context.pageUrl : null) ||
+    (looksLikeMediaUrl(context.tabUrl) ? context.tabUrl : null) ||
+    (looksLikeMediaUrl(context.frameUrl) ? context.frameUrl : null);
+  if (!mediaUrl) return null;
+  const mediaType = resolveMediaType(context.mediaType, mediaUrl);
+  if (mediaType !== "audio") return null;
+
+  const pageUrl = context.pageUrl || context.tabUrl || null;
+  const source = inferSource(pageUrl || mediaUrl);
+
+  const media: ItemDocType["media"] = [{
+    type: "audio",
+    originalUrl: mediaUrl,
+    storageType: "hotlink",
+    pageUrl: pageUrl || undefined,
+    pageTitle: context.tabTitle || undefined,
+    faviconUrl: context.tabFavIconUrl || undefined,
+    capturedAt: context.capturedAt,
+  }];
+
+  const title = trimText(context.tabTitle || `Audio · ${getFileNameFromUrl(mediaUrl)}`, 80) || "Audio";
+
+  return {
+    primaryUrl: mediaUrl,
+    title,
+    textContent: "",
+    source,
+    iconUrl: context.tabFavIconUrl || undefined,
+    media,
+    tags: uniqueList([source !== "web" ? source : "", "audio", pickHostLabel(context)]),
     shouldFetchMetadata: false,
     isMetaFetched: true,
   };
@@ -1301,11 +2149,14 @@ const buildExtractedImageTextContent = async (
     type: "extractImageText",
     payload: { url: mediaUrl },
   });
-  if (result.status !== "done" || !result.text.trim()) {
-    throw new Error(result.error || "No readable text found in image.");
-  }
 
-  const text = trimMultilineText(result.text, 12000);
+  const OCR_CONFIDENCE_THRESHOLD = 0.3;
+  const hasUsableText =
+    result.status === "done" &&
+    result.text.trim().length > 0 &&
+    (typeof result.confidence !== "number" || result.confidence >= OCR_CONFIDENCE_THRESHOLD);
+
+  const text = hasUsableText ? trimMultilineText(result.text, 12000) : "";
   const firstLine = text.split(/\n+/).find((line) => line.trim()) || "";
   const titleSeed =
     firstLine ||
@@ -1313,33 +2164,62 @@ const buildExtractedImageTextContent = async (
     domMeta?.titleText ||
     domMeta?.ariaLabel ||
     getFileNameFromUrl(mediaUrl);
-  const metadataLines = [
-    "",
-    "Image metadata:",
-    domMeta?.altText ? `Alt: ${domMeta.altText}` : "",
-    domMeta?.titleText ? `Title: ${domMeta.titleText}` : "",
-    domMeta?.siteName ? `Site: ${domMeta.siteName}` : "",
-    domMeta?.pageTitle ? `Page title: ${domMeta.pageTitle}` : "",
-    pageUrl ? `Page URL: ${pageUrl}` : "",
-    `Image URL: ${mediaUrl}`,
-    domMeta?.width && domMeta?.height ? `Dimensions: ${domMeta.width}x${domMeta.height}` : "",
-    result.lineCount ? `OCR lines: ${result.lineCount}` : "",
-    typeof result.confidence === "number" ? `OCR confidence: ${Math.round(result.confidence * 100)}%` : "",
-    `Extracted at: ${new Date(context.capturedAt).toISOString()}`,
-  ].filter(Boolean);
+
+  const sourceImageMedia: ItemDocType["media"] = [{
+    type: "image",
+    originalUrl: mediaUrl,
+    storageType: "hotlink",
+    altText: domMeta?.altText || undefined,
+    titleText: domMeta?.titleText || undefined,
+    ariaLabel: domMeta?.ariaLabel || undefined,
+    pageUrl: pageUrl || undefined,
+    pageTitle: domMeta?.pageTitle || undefined,
+    siteName: domMeta?.siteName || undefined,
+    faviconUrl: normalizeIconUrl(domMeta?.faviconUrl || null) || context.tabFavIconUrl || undefined,
+    width: domMeta?.width || undefined,
+    height: domMeta?.height || undefined,
+    capturedAt: context.capturedAt,
+    ...(hasUsableText
+      ? {
+          ocr: {
+            status: "done" as const,
+            text,
+            confidence: typeof result.confidence === "number" ? result.confidence : null,
+            lineCount: result.lineCount,
+            modelVersion: OCR_MODEL_VERSION,
+            sourceHash: result.sourceHash,
+            extractedAt: context.capturedAt,
+            engine: "paddleocr",
+          },
+        }
+      : {}),
+  }];
 
   return {
     primaryUrl: mediaUrl,
-    title: trimText(`Image text · ${titleSeed}`, 80),
-    textContent: trimMultilineText([text, ...metadataLines].join("\n"), 16000),
+    title: hasUsableText
+      ? trimText(`Image text · ${titleSeed}`, 80)
+      : trimText(titleSeed || `Image · ${getFileNameFromUrl(mediaUrl)}`, 80) || "Image",
+    // Extracted OCR must be saved as visible tab text and as OCR provenance.
+    // `textContent` feeds notes/snippets immediately; `ocrText` keeps OCR-specific
+    // indexing and later media OCR updates from discarding or duplicating it.
+    textContent: hasUsableText ? text : "",
     source,
     iconUrl: normalizeIconUrl(domMeta?.faviconUrl || null) || context.tabFavIconUrl || undefined,
-    ocrText: text,
-    ocrStatus: "done",
-    ocrConfidence: result.confidence,
-    ocrLineCount: result.lineCount,
-    ocrSourceHash: result.sourceHash,
-    tags: uniqueList([source !== "web" ? source : "", "image-text", "ocr", pickHostLabel(context)]),
+    displayImageUrl: mediaUrl,
+    media: sourceImageMedia,
+    ocrText: hasUsableText ? text : undefined,
+    ocrStatus: hasUsableText ? "done" : "skipped",
+    ocrConfidence: hasUsableText ? result.confidence : undefined,
+    ocrLineCount: hasUsableText ? result.lineCount : undefined,
+    ocrModelVersion: hasUsableText ? OCR_MODEL_VERSION : undefined,
+    ocrSourceHash: hasUsableText ? result.sourceHash : undefined,
+    tags: uniqueList([
+      source !== "web" ? source : "",
+      hasUsableText ? "image-text" : "image",
+      hasUsableText ? "ocr" : "",
+      pickHostLabel(context),
+    ]),
     shouldFetchMetadata: false,
     isMetaFetched: true,
   };
@@ -1349,8 +2229,9 @@ const captureScreenshotMedia = async (
   context: ImportClickContext,
   tab: chrome.tabs.Tab | undefined,
   job: { id: string; label: string },
+  itemId: string,
   mode: "visible" | "region" = "visible"
-): Promise<{ media?: ItemDocType["media"]; displayImageUrl?: string }> => {
+): Promise<{ media?: ItemDocType["media"] }> => {
   let regionSelection: ScreenshotRegionSelection | undefined;
 
   if (mode === "region") {
@@ -1381,16 +2262,16 @@ const captureScreenshotMedia = async (
   }
 
   sendProcessStatus(job.id, job.label, "processing", "Capturing screenshot...");
-  let upload: MediaUploadResponse;
+  let captured: { blob: Blob; fileName: string };
   try {
-    upload = await uploadScreenshot(
+    captured = await captureScreenshotBlob(
       context,
       tab,
       0,
       regionSelection,
       async () => {
-        sendProcessStatus(job.id, job.label, "processing", "Screenshot captured. Uploading...");
-        await showBrandedToast(tab, "Screenshot captured. Uploading...");
+        sendProcessStatus(job.id, job.label, "processing", "Screenshot captured. Saving locally...");
+        await showBrandedToast(tab, "Screenshot captured. Saving locally...");
       }
     );
   } catch (error) {
@@ -1399,18 +2280,20 @@ const captureScreenshotMedia = async (
     throw error;
   }
 
-  if (!upload.url) {
-    throw new Error("Screenshot upload failed. Nothing was captured.");
-  }
+  const file = new File([captured.blob], captured.fileName, {
+    type: captured.blob.type || "image/png",
+    lastModified: context.capturedAt,
+  });
+  const saved = await saveMediaToOpfs(itemId, file, captured.fileName);
 
-  sendProcessStatus(job.id, job.label, "processing", "Screenshot uploaded.");
+  sendProcessStatus(job.id, job.label, "processing", "Screenshot saved locally.");
 
-  const sourcePage = context.pageUrl || context.tabUrl || "screenshot";
   const media: ItemDocType["media"] = [{
     type: "image",
-    originalUrl: `${sourcePage}#screenshot-1`,
-    storageType: "s3",
-    s3Url: upload.url,
+    originalUrl: captured.fileName,
+    storageType: "opfs",
+    opfsPath: saved.opfsPath,
+    altText: context.tabTitle ? `Screenshot of ${context.tabTitle}` : "Screenshot",
     pageUrl: context.pageUrl || context.tabUrl || undefined,
     pageTitle: context.tabTitle || undefined,
     faviconUrl: context.tabFavIconUrl || undefined,
@@ -1418,7 +2301,6 @@ const captureScreenshotMedia = async (
   }];
   return {
     media,
-    displayImageUrl: upload.url,
   };
 };
 const prepareImportContent = async (
@@ -1428,21 +2310,24 @@ const prepareImportContent = async (
   job: { id: string; label: string }
 ): Promise<PreparedImportContent> => {
   if (target.mode === "shot") {
+    const itemId = crypto.randomUUID();
     const resolved = resolveSavePrimaryUrlOrFallback(context, "shot");
     const primaryUrl = resolved.url;
-    const screenshot = await captureScreenshotMedia(context, tab, job, target.screenshotMode || "visible");
+    const screenshot = await captureScreenshotMedia(context, tab, job, itemId, target.screenshotMode || "visible");
     const source = inferSource(primaryUrl);
     return {
+      itemId,
       primaryUrl,
       title: createTitle(context, target.mode, primaryUrl),
-      textContent: contextText(context, target.mode),
+      textContent: screenshotText(context),
       source,
       iconUrl: context.tabFavIconUrl || undefined,
-      displayImageUrl: screenshot.displayImageUrl,
       media: screenshot.media,
+      ocrStatus: "pending",
+      ocrModelVersion: "",
       tags: uniqueList([source !== "web" ? source : "", "screenshot", pickHostLabel(context)]),
-      shouldFetchMetadata: !resolved.synthetic,
-      isMetaFetched: resolved.synthetic,
+      shouldFetchMetadata: false,
+      isMetaFetched: true,
     };
   }
 
@@ -1458,9 +2343,17 @@ const prepareImportContent = async (
     const imageOnly = await buildImageOnlyContent(context, tab);
     if (imageOnly) return imageOnly;
   }
+  if (kind === "video-only") {
+    const videoOnly = await buildVideoOnlyContent(context);
+    if (videoOnly) return videoOnly;
+  }
+  if (kind === "audio-only") {
+    const audioOnly = await buildAudioOnlyContent(context);
+    if (audioOnly) return audioOnly;
+  }
 
   const resolved = resolveSavePrimaryUrlOrFallback(context, "save");
-  const primaryUrl = extracted?.canonicalUrl || resolved.url;
+  const primaryUrl = normalizeHttpUrl(extracted?.canonicalUrl || null) || resolved.url;
   const source = inferSource(primaryUrl);
   let media: ItemDocType["media"] | undefined;
   let displayImageUrl: string | undefined;
@@ -1474,6 +2367,20 @@ const prepareImportContent = async (
     }));
     if (extracted.mediaUrls[0].type === "image") {
       displayImageUrl = extracted.thumbnailUrl || extracted.mediaUrls[0].url;
+    }
+  }
+
+  const extractedThumbnailUrl = normalizeHttpUrl(extracted?.thumbnailUrl || null);
+  if (extractedThumbnailUrl) {
+    displayImageUrl = displayImageUrl || extractedThumbnailUrl;
+    if (!media) {
+      media = [{
+        type: "image",
+        originalUrl: extractedThumbnailUrl,
+        storageType: "hotlink" as const,
+        pageUrl: primaryUrl,
+        capturedAt: context.capturedAt,
+      }];
     }
   }
   
@@ -1501,9 +2408,26 @@ const prepareImportContent = async (
     }
   }
 
+  // Fallback: if we have a direct media URL but no media entry, store as hotlink
+  if (!media) {
+    const directMediaUrl = context.mediaUrl || (looksLikeMediaUrl(context.linkUrl) ? context.linkUrl : null);
+    const directMediaType = resolveMediaType(context.mediaType, directMediaUrl);
+    if (directMediaUrl && directMediaType) {
+      media = [{
+        type: directMediaType,
+        originalUrl: directMediaUrl,
+        storageType: "hotlink",
+        pageUrl: resolveSavePrimaryUrl(context) || undefined,
+        capturedAt: context.capturedAt,
+      }];
+      if (directMediaType === "image") displayImageUrl = directMediaUrl;
+    }
+  }
+
   // Use extracted content for title, description, author
   const title = extracted?.title || createTitle(context, target.mode, primaryUrl);
   const textContent = extracted?.description || contextText(context, target.mode);
+  const shouldFetchMetadata = isMetadataFetchablePageUrl(primaryUrl);
 
   return {
     primaryUrl,
@@ -1514,12 +2438,13 @@ const prepareImportContent = async (
     displayImageUrl,
     media,
     tags: suggestedTags(context, source),
-    shouldFetchMetadata: !resolved.synthetic && !extracted,
-    isMetaFetched: resolved.synthetic || !!extracted,
+    shouldFetchMetadata,
+    isMetaFetched: !shouldFetchMetadata,
   };
 };
 
 const toItemPayload = (params: {
+  id?: string;
   context: ImportClickContext;
   mode: ImportMode;
   primaryUrl: string;
@@ -1535,14 +2460,17 @@ const toItemPayload = (params: {
   ocrStatus?: ItemDocType["ocrStatus"];
   ocrConfidence?: number;
   ocrLineCount?: number;
+  ocrModelVersion?: string;
   ocrSourceHash?: string;
   shouldFetchMetadata?: boolean;
   isMetaFetched?: boolean;
+  deferBackgroundProcessing?: boolean;
 }) => ({
+  id: params.id,
   folderId: params.folderId,
   url: params.primaryUrl,
   title: params.title || createTitle(params.context, params.mode, params.primaryUrl),
-  textContent: params.textContent || contextText(params.context, params.mode),
+  textContent: params.textContent ?? contextText(params.context, params.mode),
   source: params.source || inferSource(params.primaryUrl),
   iconUrl: params.iconUrl,
   displayImageUrl: params.displayImageUrl,
@@ -1551,12 +2479,14 @@ const toItemPayload = (params: {
   ocrStatus: params.ocrStatus,
   ocrConfidence: params.ocrConfidence,
   ocrLineCount: params.ocrLineCount,
+  ocrModelVersion: params.ocrModelVersion,
   ocrSourceHash: params.ocrSourceHash,
   parentId: params.parentId,
   chunkOrder: params.context.capturedAt,
   allowLockedPrivateWrite: true,
   isMetaFetched: params.isMetaFetched ?? false,
   shouldFetchMetadata: params.shouldFetchMetadata ?? true,
+  deferBackgroundProcessing: params.deferBackgroundProcessing === true,
   isDirty: true,
   createdAt: params.context.capturedAt,
   updatedAt: params.context.capturedAt,
@@ -1583,6 +2513,49 @@ const resolveTargetFolder = async (
   return created.id;
 };
 
+const recordFolderToLru = async (
+  folderId: string,
+  fallbackSpaceId: string,
+  fallbackName?: string
+): Promise<void> => {
+  if (!folderId) return;
+  try {
+    const folder = await sendForwardedToOffscreen<FolderDocType | null>({
+      service: "folders",
+      type: "getById",
+      payload: { id: folderId, skipLockCheck: true },
+    });
+    if (!folder?.id) return;
+    const spaceName = await fetchSpaceName(folder.spaceId);
+    await recordLruFolder(
+      buildLruEntryFromFolder(
+        { id: folder.id, spaceId: folder.spaceId, name: folder.name || fallbackName || "Folder" },
+        spaceName
+      )
+    );
+  } catch (error) {
+    void error;
+  }
+};
+
+const resolveQuickSaveTarget = async (
+  target: ImportTarget,
+  context: ImportClickContext,
+  mode: ImportMode
+): Promise<{ folderId: string; spaceId: string }> => {
+  if (target.folderId) {
+    return { folderId: target.folderId, spaceId: target.spaceId || PUBLIC_SPACE_ID };
+  }
+  const lru = await resolveQuickSaveFolder();
+  if (lru) return { folderId: lru.folderId, spaceId: lru.spaceId };
+  const folderId = await resolveTargetFolder(
+    { spaceId: target.spaceId || PUBLIC_SPACE_ID, folderId: undefined, newFolderName: autoFolderName(context, mode) },
+    context,
+    mode
+  );
+  return { folderId, spaceId: target.spaceId || PUBLIC_SPACE_ID };
+};
+
 let menuRefreshTimer: ReturnType<typeof setTimeout> | null = null;
 let menuRefreshRunning = false;
 let menuRefreshQueued = false;
@@ -1593,7 +2566,7 @@ const loadImportTargets = async () => {
     const payload = await sendForwardedToOffscreen<ImportTargetSpace[]>({
       service: "dbManager",
       type: "getImportTargets",
-      payload: { maxSpaces: MENU_MAX_SPACES, maxFoldersPerSpace: MENU_MAX_FOLDERS, maxItemsPerFolder: MENU_MAX_ITEMS },
+      payload: { maxSpaces: 0, maxFoldersPerSpace: 0, maxItemsPerFolder: 0 },
     });
     return Array.isArray(payload) ? payload : [];
   } catch {
@@ -1610,10 +2583,13 @@ const refreshContextMenus = async () => {
   try {
     await new Promise<void>((resolve) => chrome.contextMenus.removeAll(() => resolve()));
     const add = (options: chrome.contextMenus.CreateProperties) =>
-      new Promise<void>((resolve, reject) => {
-        chrome.contextMenus.create(options, () =>
-          chrome.runtime.lastError ? reject(new Error(chrome.runtime.lastError.message)) : resolve()
-        );
+      new Promise<void>((resolve) => {
+        chrome.contextMenus.create(options, () => {
+          if (chrome.runtime.lastError) {
+            console.warn("[ContextMenu] create failed:", chrome.runtime.lastError.message, options.id);
+          }
+          resolve();
+        });
       });
 
     await add({ id: MENU_ROOT_ID, title: "VibeSearch", contexts: IMPORT_CONTEXTS });
@@ -1655,6 +2631,12 @@ const refreshContextMenus = async () => {
       title: "Save this page", 
       contexts: [chrome.contextMenus.ContextType.PAGE, chrome.contextMenus.ContextType.FRAME] 
     });
+    await add({
+      id: MENU_IMPORT_SHARED_ID,
+      parentId: MENU_ROOT_ID,
+      title: "Import shared VibeSearch link",
+      contexts: IMPORT_CONTEXTS,
+    });
 
     // Screenshot submenu
     await add({ id: `${MENU_ROOT_ID}:sep:shot`, parentId: MENU_ROOT_ID, type: "separator", contexts: IMPORT_CONTEXTS });
@@ -1673,10 +2655,24 @@ const refreshContextMenus = async () => {
 
     // Save to… submenu (spaces/folders)
     await add({ id: `${MENU_ROOT_ID}:sep:targets`, parentId: MENU_ROOT_ID, type: "separator", contexts: IMPORT_CONTEXTS });
-    await add({ id: MENU_SAVE_TARGETS_ID, parentId: MENU_ROOT_ID, title: "Save to…", contexts: IMPORT_CONTEXTS });
+    await add({ id: MENU_SAVE_TARGETS_ID, parentId: MENU_ROOT_ID, title: "Save this link to…", contexts: IMPORT_CONTEXTS });
+
+    const root = MENU_SAVE_TARGETS_ID;
+
+    const lruFolders = await pruneLruFolders();
+    if (lruFolders.length > 0) {
+      for (const entry of lruFolders) {
+        await add({
+          id: `vs:save:lru:folder:${entry.folderId}`,
+          parentId: root,
+          title: trimText(`${entry.folderName} · ${entry.spaceName}`, 60),
+          contexts: IMPORT_CONTEXTS,
+        });
+      }
+      await add({ id: `${MENU_ROOT_ID}:sep:lru`, parentId: root, type: "separator", contexts: IMPORT_CONTEXTS });
+    }
 
     const spaces = await loadImportTargets();
-    const root = MENU_SAVE_TARGETS_ID;
     for (const space of spaces) {
       const spaceNodeId = `vs:node:save:space:${space.id}`;
       await add({
@@ -1701,23 +2697,13 @@ const refreshContextMenus = async () => {
         title: "Save in this space (new folder)",
         contexts: IMPORT_CONTEXTS,
       });
-      for (const folder of space.folders.slice(0, MENU_MAX_FOLDERS)) {
-        const folderNodeId = `vs:node:save:folder:${space.id}:${folder.id}`;
-        await add({ id: folderNodeId, parentId: spaceNodeId, title: trimText(folder.name || "Untitled folder", 60), contexts: IMPORT_CONTEXTS });
+      for (const folder of space.folders) {
         await add({
           id: `vs:save:folder:${folder.id}`,
-          parentId: folderNodeId,
-          title: "Save in this folder",
+          parentId: spaceNodeId,
+          title: trimText(folder.name || "Untitled folder", 60),
           contexts: IMPORT_CONTEXTS,
         });
-        for (const item of folder.recentItems.slice(0, MENU_MAX_ITEMS)) {
-          await add({
-            id: `vs:save:item:${folder.id}:${item.id}`,
-            parentId: folderNodeId,
-            title: trimText(`Attach under: ${item.title}`, 60),
-            contexts: IMPORT_CONTEXTS,
-          });
-        }
       }
     }
 
@@ -1752,7 +2738,7 @@ const refreshContextMenus = async () => {
         title: "Extract into this space (new folder)",
         contexts: [chrome.contextMenus.ContextType.IMAGE],
       });
-      for (const folder of space.folders.slice(0, MENU_MAX_FOLDERS)) {
+      for (const folder of space.folders) {
         await add({
           id: `vs:extract:folder:${folder.id}`,
           parentId: spaceNodeId,
@@ -1795,6 +2781,7 @@ const createDraftFromAction = async (
   const prepared = await prepareImportContent(target, context, tab, job);
   const draft: ImportDraft = {
     id: crypto.randomUUID(),
+    itemId: prepared.itemId,
     mode: target.mode,
     createdAt: Date.now(),
     updatedAt: Date.now(),
@@ -1806,6 +2793,12 @@ const createDraftFromAction = async (
     iconUrl: prepared.iconUrl,
     displayImageUrl: prepared.displayImageUrl,
     media: prepared.media,
+    ocrText: prepared.ocrText,
+    ocrStatus: prepared.ocrStatus,
+    ocrConfidence: prepared.ocrConfidence,
+    ocrLineCount: prepared.ocrLineCount,
+    ocrModelVersion: prepared.ocrModelVersion,
+    ocrSourceHash: prepared.ocrSourceHash,
     shouldFetchMetadata: prepared.shouldFetchMetadata,
     isMetaFetched: prepared.isMetaFetched,
     context,
@@ -1845,21 +2838,23 @@ const runImportAction = async (
     return;
   }
 
-  sendProcessStatus(job.id, job.label, "processing", "Resolving destination...");
-
-  const folderId = await resolveTargetFolder(
-    { spaceId: target.spaceId || PUBLIC_SPACE_ID, folderId: target.folderId, newFolderName: autoFolderName(context, target.mode) },
-    context,
-    target.mode
-  );
+  sendProcessStatus(job.id, job.label, "processing", "Preparing import...");
 
   const prepared = await prepareImportContent(target, context, tab, job);
 
+  // Save immediately to the resolved destination so the quick-save stays one
+  // click — no action required. When the user didn't pick an explicit folder we
+  // additionally surface a destination picker that *re-files* the saved item if
+  // they choose to; taking no action just leaves it where it landed.
+  sendProcessStatus(job.id, job.label, "processing", "Resolving destination...");
+  const { folderId, spaceId } = await resolveQuickSaveTarget(target, context, target.mode);
+
   sendProcessStatus(job.id, job.label, "processing", "Saving...");
-  await sendForwardedToOffscreen({
+  const inserted = await sendForwardedToOffscreen<ItemDocType>({
     service: "items",
     type: "addToFolder",
     payload: toItemPayload({
+      id: prepared.itemId,
       context,
       mode: target.mode,
       primaryUrl: prepared.primaryUrl,
@@ -1871,31 +2866,100 @@ const runImportAction = async (
       iconUrl: prepared.iconUrl,
       media: prepared.media,
       displayImageUrl: prepared.displayImageUrl,
+      ocrText: prepared.ocrText,
+      ocrStatus: prepared.ocrStatus,
+      ocrConfidence: prepared.ocrConfidence,
+      ocrLineCount: prepared.ocrLineCount,
+      ocrModelVersion: prepared.ocrModelVersion,
+      ocrSourceHash: prepared.ocrSourceHash,
       shouldFetchMetadata: prepared.shouldFetchMetadata,
       isMetaFetched: prepared.isMetaFetched,
+      deferBackgroundProcessing: false,
     }),
   });
 
+  // Saved images (right-click → save image, image links, etc.) are OCR'd like
+  // screenshots so their text becomes searchable; OCR then re-embeds them. The
+  // explicit per-item trigger is reliable even in a large library.
+  if (
+    prepared.ocrStatus !== "done" &&
+    (prepared.media || []).some((entry) => entry?.type === "image")
+  ) {
+    void forwardProcessingTriggerToOffscreen("TRIGGER_OCR", { itemId: inserted.id }).catch(
+      (error) => console.warn("[Import] Failed to start OCR for saved image.", error)
+    );
+  }
+
+  await recordFolderToLru(folderId, spaceId, autoFolderName(context, target.mode));
   sendProcessStatus(job.id, job.label, "success", "Imported.");
   scheduleContextMenuRefresh("low");
 
-  // Show branded toast with Undo / Open actions
-  const primaryHostname = (() => {
+  const savedActions = [
+    { label: "Undo", action: "UNDO_SAVE", payload: { primaryUrl: prepared.primaryUrl } },
+    { label: "Open", action: "OPEN_SEARCH" },
+  ];
+
+  // The "Save … to…" submenu already chose the destination — just confirm.
+  if (target.folderId) {
+    await showBrandedToast(tab, "Saved", savedActions, 4000);
+    return;
+  }
+
+  // Quick-save: offer to re-file into any space/folder. Doing nothing keeps the
+  // item in its auto-picked destination; picking one moves the already-saved item.
+  const spaces = await buildDestinationPickerSpaces();
+  if (spaces.length === 0) {
+    await showBrandedToast(tab, "Saved", savedActions, 4000);
+    return;
+  }
+  await showDestinationPickerToast(tab, "Saved — move to…?", spaces, "MOVE_SAVED_ITEM", {
+    itemId: inserted.id,
+    primaryUrl: prepared.primaryUrl,
+  });
+};
+
+// Re-file an already-saved item into a folder chosen from the post-save picker.
+// The item was saved immediately, so this is an optional correction — it never
+// blocks the original one-click save.
+const moveSavedItemToFolder = async (
+  itemId: string,
+  folderId: string,
+  tab?: chrome.tabs.Tab
+): Promise<void> => {
+  if (!itemId || !folderId) return;
+  try {
+    const moved = await sendForwardedToOffscreen<{ updated: number }>({
+      service: "items",
+      type: "moveToFolder",
+      payload: { itemIds: [itemId], targetFolderId: folderId },
+    });
+    scheduleContextMenuRefresh("low");
+    await showBrandedToast(
+      tab,
+      moved?.updated ? "Moved" : "Already there",
+      [{ label: "Open", action: "OPEN_SEARCH" }],
+      3000
+    );
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : "Could not move the saved item.";
+    await showBrandedToast(tab, detail);
+  }
+};
+
+const scheduleScreenshotPostImportWork = (itemId: string, pageUrl: string): void => {
+  void (async () => {
+    // OCR starts before network work so a screenshot remains useful offline.
     try {
-      return new URL(prepared.primaryUrl).hostname.replace(/^www\./, "");
-    } catch {
-      return "this page";
+      await forwardProcessingTriggerToOffscreen("TRIGGER_OCR", { itemId });
+    } catch (error) {
+      console.warn("[Screenshot] Failed to start OCR.", error);
+    }
+
+    await triggerOpfsPromotion();
+    if (isMetadataFetchablePageUrl(pageUrl)) {
+      scheduleForProcessing([pageUrl]);
     }
   })();
-  await showBrandedToast(
-    tab,
-    `Saved from ${primaryHostname}`,
-    [
-      { label: "Undo", action: "UNDO_SAVE", payload: { primaryUrl: prepared.primaryUrl } },
-      { label: "Open", action: "OPEN_SEARCH" },
-    ],
-    5000
-  );
 };
 
 const runExtractTextAction = async (
@@ -1906,15 +2970,7 @@ const runExtractTextAction = async (
   const job = createImportJob("extract", context);
   sendProcessStatus(job.id, job.label, "processing", "Resolving destination...");
 
-  const folderId = await resolveTargetFolder(
-    {
-      spaceId: target.spaceId || PUBLIC_SPACE_ID,
-      folderId: target.folderId,
-      newFolderName: autoFolderName(context, "extract"),
-    },
-    context,
-    "extract"
-  );
+  const { folderId, spaceId } = await resolveQuickSaveTarget(target, context, "extract");
 
   const prepared = await buildExtractedImageTextContent(context, tab, job);
   sendProcessStatus(job.id, job.label, "processing", "Saving extracted text...");
@@ -1931,15 +2987,20 @@ const runExtractTextAction = async (
       textContent: prepared.textContent,
       source: prepared.source,
       iconUrl: prepared.iconUrl,
+      displayImageUrl: prepared.displayImageUrl,
+      media: prepared.media,
       ocrText: prepared.ocrText,
       ocrStatus: prepared.ocrStatus,
       ocrConfidence: prepared.ocrConfidence,
       ocrLineCount: prepared.ocrLineCount,
+      ocrModelVersion: prepared.ocrModelVersion,
       ocrSourceHash: prepared.ocrSourceHash,
       shouldFetchMetadata: false,
       isMetaFetched: true,
     }),
   });
+
+  void recordFolderToLru(folderId, spaceId, autoFolderName(context, "extract"));
 
   sendProcessStatus(job.id, job.label, "success", "Extracted text saved.");
   scheduleContextMenuRefresh("low");
@@ -1954,16 +3015,294 @@ const runExtractTextAction = async (
   );
 };
 
+type PendingScreenshot = {
+  pendingId: string;
+  context: ImportClickContext;
+  tab: chrome.tabs.Tab | undefined;
+  job: { id: string; label: string };
+  itemId: string;
+  primaryUrl: string;
+  prepared: PreparedImportContent;
+  createdAt: number;
+};
+
+const pendingScreenshots = new Map<string, PendingScreenshot>();
+const PENDING_SCREENSHOT_TTL_MS = 5 * 60 * 1000;
+
+const buildDestinationPickerSpaces = async (): Promise<DestinationPickerSpace[]> => {
+  const [targets, lru] = await Promise.all([
+    loadImportTargets().catch(() => [] as ImportTargetSpace[]),
+    pruneLruFolders(),
+  ]);
+  const lruByFolder = new Map(lru.map((entry) => [entry.folderId, entry.usedAt]));
+  const lruSpaceRank = new Map<string, number>();
+  for (const entry of lru) {
+    if (!lruSpaceRank.has(entry.spaceId)) {
+      lruSpaceRank.set(entry.spaceId, entry.usedAt);
+    }
+  }
+  return targets
+    .filter((space) => space.isUnlocked)
+    .map((space) => ({
+      spaceId: space.id,
+      spaceName: space.name,
+      folders: space.folders.map((folder) => ({
+        folderId: folder.id,
+        folderName: folder.name || "Untitled",
+        usedAt: lruByFolder.get(folder.id) ?? 0,
+      })),
+    }))
+    .sort((a, b) => (lruSpaceRank.get(b.spaceId) ?? 0) - (lruSpaceRank.get(a.spaceId) ?? 0));
+};
+
+const runScreenshotAction = async (
+  target: ImportTarget,
+  context: ImportClickContext,
+  tab?: chrome.tabs.Tab
+) => {
+  const job = createImportJob("shot", context);
+  sendProcessStatus(job.id, job.label, "processing", "Queued...");
+  const settings = await getImportSettings();
+
+  if (settings.reviewBeforeSave) {
+    sendProcessStatus(job.id, job.label, "processing", "Preparing draft...");
+    const draft = await createDraftFromAction(target, context, tab, job);
+    await openDraftEditor(draft.id);
+    sendProcessStatus(job.id, job.label, "success", "Draft ready. Review and save.");
+    return;
+  }
+
+  const itemId = crypto.randomUUID();
+  const resolved = resolveSavePrimaryUrlOrFallback(context, "shot");
+  const primaryUrl = resolved.url;
+  const source = inferSource(primaryUrl);
+
+  sendProcessStatus(job.id, job.label, "processing", "Capturing screenshot...");
+  let screenshotMedia: { media?: ItemDocType["media"] };
+  try {
+    screenshotMedia = await captureScreenshotMedia(context, tab, job, itemId, target.screenshotMode || "visible");
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : "Screenshot capture failed.";
+    if (error instanceof ImportCancelledError) {
+      sendProcessStatus(job.id, job.label, "success", detail);
+      return;
+    }
+    await showBrandedToast(tab, detail);
+    throw error;
+  }
+
+  const prepared: PreparedImportContent = {
+    itemId,
+    primaryUrl,
+    title: createTitle(context, target.extractIntent ? "extract" : "shot", primaryUrl),
+    textContent: screenshotText(context),
+    source,
+    iconUrl: context.tabFavIconUrl || undefined,
+    media: screenshotMedia.media,
+    ocrStatus: "pending",
+    ocrModelVersion: "",
+    tags: uniqueList([source !== "web" ? source : "", "screenshot", pickHostLabel(context)]),
+    shouldFetchMetadata: false,
+    isMetaFetched: true,
+  };
+
+  const pendingId = `shot-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  pendingScreenshots.set(pendingId, {
+    pendingId,
+    context,
+    tab,
+    job,
+    itemId,
+    primaryUrl,
+    prepared,
+    createdAt: Date.now(),
+  });
+
+  sendProcessStatus(job.id, job.label, "processing", "Choose where to save...");
+
+  const spaces = await buildDestinationPickerSpaces();
+  if (spaces.length === 0) {
+    await finalizeScreenshotSave(pendingId, "", target.spaceId || PUBLIC_SPACE_ID, {
+      preferLru: true,
+    });
+    return;
+  }
+  const quickSaveTarget = await resolveQuickSaveFolder();
+  const autoSaveTargetLabel = quickSaveTarget?.folderName?.trim() || "a new folder";
+  await showDestinationPickerToast(
+    tab,
+    "Save screenshot to…",
+    spaces,
+    "SAVE_SCREENSHOT_TO",
+    { pendingId },
+    {
+      allowSpaceDirectSave: true,
+      autoSave: { timeoutMs: 5000, targetLabel: autoSaveTargetLabel },
+    }
+  );
+};
+
+const finalizeScreenshotSave = async (
+  pendingId: string,
+  folderId: string,
+  spaceId: string,
+  options: { preferLru?: boolean } = {}
+): Promise<void> => {
+  const pending = pendingScreenshots.get(pendingId);
+  if (!pending) return;
+  pendingScreenshots.delete(pendingId);
+
+  const { context, tab, job, prepared } = pending;
+
+  let resolvedFolderId = folderId;
+  let resolvedSpaceId = spaceId || PUBLIC_SPACE_ID;
+  if (!resolvedFolderId) {
+    // Only fall back to the most-recently-used folder when the caller has no
+    // explicit destination (the 5s auto-save). When a user explicitly picks a
+    // space with no groups, honor that space and create a folder inside it.
+    const lru = options.preferLru ? await resolveQuickSaveFolder() : null;
+    if (lru) {
+      resolvedFolderId = lru.folderId;
+      resolvedSpaceId = lru.spaceId;
+    } else {
+      const created = await sendForwardedToOffscreen<FolderDocType>({
+        service: "folders",
+        type: "create",
+        payload: {
+          name: autoFolderName(context, "shot"),
+          userId: "",
+          spaceId: resolvedSpaceId,
+          allowLockedPrivateWrite: true,
+        },
+      });
+      if (!created?.id) {
+        sendProcessStatus(job.id, job.label, "error", "Could not create destination folder.");
+        return;
+      }
+      resolvedFolderId = created.id;
+    }
+  }
+
+  sendProcessStatus(job.id, job.label, "processing", "Saving screenshot...");
+  try {
+    const inserted = await sendForwardedToOffscreen<ItemDocType>({
+      service: "items",
+      type: "addToFolder",
+      payload: toItemPayload({
+        id: prepared.itemId,
+        context,
+        mode: "shot",
+        primaryUrl: prepared.primaryUrl,
+        folderId: resolvedFolderId,
+        parentId: null,
+        title: prepared.title,
+        textContent: prepared.textContent,
+        source: prepared.source,
+        iconUrl: prepared.iconUrl,
+        media: prepared.media,
+        displayImageUrl: prepared.displayImageUrl,
+        ocrText: prepared.ocrText,
+        ocrStatus: prepared.ocrStatus,
+        ocrConfidence: prepared.ocrConfidence,
+        ocrLineCount: prepared.ocrLineCount,
+        ocrModelVersion: prepared.ocrModelVersion,
+        ocrSourceHash: prepared.ocrSourceHash,
+        shouldFetchMetadata: prepared.shouldFetchMetadata,
+        isMetaFetched: prepared.isMetaFetched,
+        deferBackgroundProcessing: true,
+      }),
+    });
+
+    scheduleScreenshotPostImportWork(inserted.id, prepared.primaryUrl);
+    void recordFolderToLru(resolvedFolderId, resolvedSpaceId, autoFolderName(context, "shot"));
+
+    sendProcessStatus(job.id, job.label, "success", "Screenshot saved.");
+    scheduleContextMenuRefresh("low");
+    await showBrandedToast(tab, "Screenshot saved", [
+      { label: "Undo", action: "UNDO_SAVE", payload: { primaryUrl: prepared.primaryUrl } },
+      { label: "Open", action: "OPEN_SEARCH" },
+    ], 4000);
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : "Failed to save screenshot.";
+    sendProcessStatus(job.id, job.label, "error", detail);
+    await showBrandedToast(tab, detail);
+  }
+};
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [id, pending] of pendingScreenshots) {
+    if (now - pending.createdAt > PENDING_SCREENSHOT_TTL_MS) {
+      pendingScreenshots.delete(id);
+    }
+  }
+}, 60 * 1000).unref?.();
+
 const runTargetAction = async (
   target: ImportTarget,
   context: ImportClickContext,
   tab?: chrome.tabs.Tab
 ) => {
+  if (target.mode === "shot") {
+    await runScreenshotAction(target, context, tab);
+    return;
+  }
   if (target.mode === "extract") {
     await runExtractTextAction(target, context, tab);
     return;
   }
   await runImportAction(target, context, tab);
+};
+const SHARE_WORKER_JSON_BASE = "https://share-worker.watermelons.workers.dev";
+const sharePairFromShareUrl = (url: string): string | null => {
+  try {
+    const { pathname } = new URL(url);
+    const viewer = pathname.match(/\/s\/([^/]+?)(?:\.json)?$/);
+    if (viewer) return viewer[1];
+    const api = pathname.match(/\/v1\/public-shares\/([^/]+?)(?:\/export\.json)?$/);
+    if (api) return api[1];
+  } catch {
+    // fall through to null
+  }
+  return null;
+};
+const fetchShareSnapshot = async (url: string): Promise<ShareSnapshotV1> => {
+  const normalized = normalizeHttpUrl(url);
+  if (!normalized || !isVibeShareUrl(normalized)) throw new Error("INVALID_SHARE_URL");
+  // A share link may point at the HTML viewer (e.g. share.watermelons.workers.dev)
+  // or the worker. Either way, fetch the snapshot JSON from the worker's export
+  // endpoint instead of the viewer's HTML page.
+  const pair = sharePairFromShareUrl(normalized);
+  const fetchUrl = pair ? `${SHARE_WORKER_JSON_BASE}/s/${pair}.json` : normalized;
+  const response = await fetch(fetchUrl, {
+    headers: { Accept: "application/json" },
+  });
+  if (!response.ok) throw new Error(`SHARE_FETCH_FAILED_${response.status}`);
+  const body = (await response.json()) as PublicShareResponse | ShareSnapshotV1;
+  if ((body as ShareSnapshotV1).schemaVersion === 1) return body as ShareSnapshotV1;
+  if ((body as PublicShareResponse).snapshot?.schemaVersion === 1) {
+    return (body as PublicShareResponse).snapshot as ShareSnapshotV1;
+  }
+  throw new Error("SHARE_SNAPSHOT_MISSING");
+};
+const importSharedLink = async (url: string, targetSpaceId = PUBLIC_SPACE_ID) => {
+  const jobId = `share-import-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  sendProcessStatus(jobId, "Shared link import", "processing", "Fetching shared snapshot...");
+  const snapshot = await fetchShareSnapshot(url);
+  sendProcessStatus(jobId, "Shared link import", "processing", `Importing ${snapshot.items.length} items...`);
+  const result = await sendForwardedToOffscreen({
+    service: "dbManager",
+    type: "importSharedSnapshot",
+    payload: {
+      snapshot,
+      targetSpaceId,
+      rootFolderName: snapshot.title,
+    },
+  });
+  await forwardProcessingTriggerToOffscreen("TRIGGER_EMBEDDING").catch(() => {});
+  scheduleContextMenuRefresh("high");
+  sendProcessStatus(jobId, "Shared link import", "success", `Imported ${snapshot.items.length} items.`);
+  return result;
 };
 const isSearchPageSender = (sender: chrome.runtime.MessageSender) => {
   const senderUrl = typeof sender.url === "string" ? sender.url : "";
@@ -2098,8 +3437,14 @@ const handleImportControlMessage = async (message: any, sender: chrome.runtime.M
     const effectiveDisplayImageUrl = didPrimaryUrlChange
       ? undefined
       : payload.displayImageUrl ?? draft.displayImageUrl;
-    const effectiveShouldFetchMetadata = didPrimaryUrlChange ? true : draft.shouldFetchMetadata ?? true;
-    const effectiveIsMetaFetched = didPrimaryUrlChange ? false : draft.isMetaFetched ?? false;
+    const effectiveShouldFetchMetadata = didPrimaryUrlChange
+      ? isMetadataFetchablePageUrl(primaryUrl)
+      : draft.shouldFetchMetadata ?? true;
+    const effectiveIsMetaFetched = effectiveShouldFetchMetadata
+      ? didPrimaryUrlChange
+        ? false
+        : draft.isMetaFetched ?? false
+      : true;
     const effectiveSource = payload.source || (didPrimaryUrlChange ? inferSource(primaryUrl) : draft.source);
 
     const spaceId = (payload.spaceId || draft.target.spaceId || PUBLIC_SPACE_ID).trim() || PUBLIC_SPACE_ID;
@@ -2132,6 +3477,7 @@ const handleImportControlMessage = async (message: any, sender: chrome.runtime.M
       service: "items",
       type: "addToFolder",
       payload: toItemPayload({
+        id: didPrimaryUrlChange ? undefined : draft.itemId,
         context: draft.context,
         mode: draft.mode,
         primaryUrl,
@@ -2143,8 +3489,15 @@ const handleImportControlMessage = async (message: any, sender: chrome.runtime.M
         iconUrl: payload.iconUrl ?? draft.iconUrl,
         displayImageUrl: effectiveDisplayImageUrl,
         media: effectiveMedia,
+        ocrText: draft.ocrText,
+        ocrStatus: draft.ocrStatus,
+        ocrConfidence: draft.ocrConfidence,
+        ocrLineCount: draft.ocrLineCount,
+        ocrModelVersion: draft.ocrModelVersion,
+        ocrSourceHash: draft.ocrSourceHash,
         shouldFetchMetadata: effectiveShouldFetchMetadata,
         isMetaFetched: effectiveIsMetaFetched,
+        deferBackgroundProcessing: draft.mode === "shot" && !didPrimaryUrlChange,
       }),
     });
 
@@ -2163,6 +3516,9 @@ const handleImportControlMessage = async (message: any, sender: chrome.runtime.M
     }
 
     await saveDrafts(drafts.filter((entry) => entry.id !== draft.id));
+    if (draft.mode === "shot" && !didPrimaryUrlChange) {
+      scheduleScreenshotPostImportWork(inserted.id, primaryUrl);
+    }
     scheduleContextMenuRefresh("low");
     sendProcessStatus(`import-submit-${Date.now()}`, "Import", "success", "Draft imported.");
     return { success: true, payload: inserted };
@@ -2182,6 +3538,13 @@ chrome.contextMenus.onClicked.addListener((info, tab) => {
     }
     const context = collectContext(info, tab);
     attemptedContext = context;
+
+    if (menuId === MENU_IMPORT_SHARED_ID) {
+      const sharedUrl = pickSharedUrl(context);
+      if (!sharedUrl) throw new Error("No VibeSearch shared link found.");
+      await importSharedLink(sharedUrl, PUBLIC_SPACE_ID);
+      return;
+    }
     
     // Content-aware primary actions (instant save to Public/auto-folder)
     if (menuId === MENU_SAVE_IMAGE_ID || menuId === MENU_SAVE_VIDEO_ID || 
@@ -2240,6 +3603,8 @@ chrome.contextMenus.onClicked.addListener((info, tab) => {
 chrome.runtime.onInstalled.addListener(() => {
   chrome.alarms.create(SYNC_ALARM_NAME, { periodInMinutes: 6 * 60 });
   chrome.alarms.create(EMBEDDING_ALARM_NAME, { periodInMinutes: 5 });
+  chrome.alarms.create(METADATA_RETRY_ALARM_NAME, { periodInMinutes: 30 });
+  void retryStoredFailedMetadataUrls().catch(() => {});
   scheduleContextMenuRefresh("high");
 });
 
@@ -2251,6 +3616,7 @@ chrome.runtime.onStartup.addListener(() => {
       target: "offscreen",
       isForwarded: true,
     });
+    await retryStoredFailedMetadataUrls();
   })().catch(() => {});
   scheduleContextMenuRefresh("high");
 });
@@ -2271,14 +3637,246 @@ chrome.alarms.onAlarm.addListener((alarm) => {
         target: "offscreen",
         isForwarded: true,
       });
+    } else if (alarm.name === METADATA_RETRY_ALARM_NAME) {
+      await retryStoredFailedMetadataUrls();
+    } else if (alarm.name === "opfs-promote-alarm") {
+      triggerOpfsPromotion();
     }
   })().catch(() => {});
 });
 
+const isOnline = (): boolean =>
+  typeof navigator !== "undefined" ? navigator.onLine : true;
+
+const promoteOpfsMediaToR2 = async (): Promise<void> => {
+  if (!isOnline()) return;
+  let items: { id: string; media: NonNullable<ItemDocType["media"]> }[];
+  try {
+    items = await sendForwardedToOffscreen<{
+      id: string;
+      media: NonNullable<ItemDocType["media"]>;
+    }[]>({
+      service: "items",
+      type: "listItemsWithOpfsMedia",
+    });
+  } catch (e) {
+    console.error("[promoteOpfsMedia] list failed", e);
+    return;
+  }
+  if (!items || items.length === 0) return;
+
+  for (const { id, media } of items) {
+    if (!isOnline()) break;
+    let changed = false;
+    const promotedOpfsPaths: string[] = [];
+    const nextMedia = await Promise.all(
+      (media || []).map(async (entry) => {
+        if (typeof entry?.opfsPath !== "string" || !entry.opfsPath) return entry;
+        try {
+          const uploaded = await uploadOpfsFileToR2(entry.opfsPath, entry.originalUrl);
+          if (!uploaded) return entry;
+          promotedOpfsPaths.push(entry.opfsPath);
+          changed = true;
+          return {
+            ...entry,
+            s3Url: uploaded.r2Url,
+            storageType: "s3" as const,
+            opfsPath: undefined,
+          };
+        } catch (e) {
+          console.error("[promoteOpfsMedia] upload failed for", entry.opfsPath, e);
+          return entry;
+        }
+      })
+    );
+
+    if (!changed) continue;
+
+    // Clean undefined keys before persisting
+    const cleaned = nextMedia.map((m) => {
+      const { opfsPath, ...rest } = m as any;
+      return rest;
+    });
+
+    try {
+      await sendForwardedToOffscreen({
+        service: "items",
+        type: "updateMedia",
+        payload: { id, media: cleaned, preserveOcr: true },
+      });
+      await Promise.all(promotedOpfsPaths.map((opfsPath) => deleteMediaFromOpfs(opfsPath).catch(() => {})));
+    } catch (e) {
+      console.error("[promoteOpfsMedia] updateMedia failed for", id, e);
+    }
+  }
+};
+
+let opfsPromotionInFlight: Promise<void> | null = null;
+let opfsPromotionQueued = false;
+const triggerOpfsPromotion = (): Promise<void> => {
+  if (!isOnline()) return Promise.resolve();
+  opfsPromotionQueued = true;
+  if (opfsPromotionInFlight) return opfsPromotionInFlight;
+
+  const promotion = (async () => {
+    while (opfsPromotionQueued && isOnline()) {
+      opfsPromotionQueued = false;
+      await promoteOpfsMediaToR2();
+    }
+  })()
+    .catch((error) => console.error("[promoteOpfsMedia] error", error))
+    .finally(() => {
+      opfsPromotionInFlight = null;
+    });
+  opfsPromotionInFlight = promotion;
+  return promotion;
+};
+
+type ProcessingTriggerType = "TRIGGER_EMBEDDING" | "TRIGGER_OCR";
+
+const isProcessingTrigger = (type: unknown): type is ProcessingTriggerType =>
+  type === "TRIGGER_EMBEDDING" || type === "TRIGGER_OCR";
+
+const forwardProcessingTriggerToOffscreen = async (
+  type: ProcessingTriggerType,
+  payload?: { itemId?: string; force?: boolean }
+): Promise<void> => {
+  await setupOffscreenDocument();
+  const response = (await chrome.runtime.sendMessage({
+    type,
+    target: "offscreen",
+    isForwarded: true,
+    payload,
+  })) as OffscreenResponse<unknown>;
+  if (!response?.success) throw new Error(response?.error || `${type} failed`);
+};
+
+// Attempt promotion on startup
+void triggerOpfsPromotion();
+
+// Listen for connectivity regain (service worker context: self)
+if (typeof self !== "undefined" && typeof self.addEventListener === "function") {
+  self.addEventListener("online", () => triggerOpfsPromotion());
+}
+
+chrome.alarms.create("opfs-promote-alarm", { periodInMinutes: 30 });
+
+chrome.tabs.onRemoved.addListener((tabId) => {
+  hoverSaveTargetsByTab.delete(tabId);
+});
+
+// Open VibeSearch on the new-tab page when enabled (Settings → Misc). A
+// background redirect (not a manifest override) keeps the native new tab when
+// the option is off.
+chrome.tabs.onCreated.addListener((tab) => {
+  try {
+    const url = tab.pendingUrl || tab.url || "";
+    if (!/^chrome:\/\/newtab\/?$/.test(url)) return;
+    const tabId = tab.id;
+    if (typeof tabId !== "number") return;
+    chrome.storage.local.get(OPEN_ON_NEW_TAB_STORAGE_KEY, (result) => {
+      if (result?.[OPEN_ON_NEW_TAB_STORAGE_KEY] !== true) return;
+      void chrome.tabs.update(tabId, {
+        url: chrome.runtime.getURL("src/pages/search/index.html"),
+      });
+    });
+  } catch {}
+});
+
+// Keyboard command shortcuts (Settings → Shortcuts). Reuse the same actions the
+// context menu uses so behavior stays identical.
+if (chrome.commands?.onCommand) {
+  chrome.commands.onCommand.addListener((command) => {
+    void (async () => {
+      if (command === "quick-save") {
+        const tab = await getActiveTab();
+        await runTargetAction({ mode: "save", spaceId: PUBLIC_SPACE_ID }, collectContextFromTab(tab), tab);
+      } else if (command === "take-screenshot") {
+        const tab = await getActiveTab();
+        await runTargetAction({ mode: "shot", spaceId: PUBLIC_SPACE_ID }, collectContextFromTab(tab), tab);
+      }
+    })().catch((error) => {
+      console.error("[background] command failed:", command, error);
+    });
+  });
+}
+
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (message?.target === "background" && message?.type === "HOVER_SAVE_TARGET") {
+    const tabId = sender.tab?.id;
+    const url = normalizeHttpUrl(typeof message?.payload?.url === "string" ? message.payload.url : null);
+    const title = typeof message?.payload?.title === "string" ? message.payload.title : undefined;
+    if (sender.id === chrome.runtime.id && typeof tabId === "number" && url) {
+      rememberHoverSaveTarget(tabId, url, title);
+    }
+    return;
+  }
+
   if (message?.target === "background" && message?.type === "FETCH_METADATA") {
     const { urls, revalidate } = message.payload || { urls: [], revalidate: false };
     scheduleForProcessing(urls, revalidate === true);
+    return;
+  }
+
+  if (message?.target === "background" && message?.type === "IMPORT_SHARED_LINK_FROM_PAGE") {
+    // Triggered by the share-viewer bridge content script. Import the share the
+    // visitor is viewing — the URL comes from sender.url (set by Chrome, not the
+    // page) and must be a recognized vibe share link.
+    const senderUrl = typeof sender.url === "string" ? sender.url : "";
+    if (sender.id !== chrome.runtime.id || !isVibeShareUrl(senderUrl)) {
+      sendResponse({ success: false, error: "UNAUTHORIZED_SHARE_IMPORT" });
+      return true;
+    }
+    void importSharedLink(senderUrl, PUBLIC_SPACE_ID)
+      .then(() => sendResponse({ success: true }))
+      .catch((error) =>
+        sendResponse({ success: false, error: error instanceof Error ? error.message : "Share import failed." })
+      );
+    return true;
+  }
+
+  if (message?.target === "background" && message?.type === "IMPORT_BROWSER_BOOKMARKS") {
+    if (!isTrustedExtensionSender(sender) || !isSearchPageSender(sender)) {
+      sendResponse({ success: false, error: "UNAUTHORIZED_CONTEXT" });
+      return true;
+    }
+    void importBrowserBookmarks()
+      .then((payload) => sendResponse({ success: true, payload }))
+      .catch((error) =>
+        sendResponse({ success: false, error: error instanceof Error ? error.message : "Browser bookmark import failed." })
+      );
+    return true;
+  }
+
+  if (message?.target === "background" && message?.type === "IMPORT_GITHUB_STARS") {
+    if (!isTrustedExtensionSender(sender) || !isSearchPageSender(sender)) {
+      sendResponse({ success: false, error: "UNAUTHORIZED_CONTEXT" });
+      return true;
+    }
+    const accessToken = typeof message?.payload?.accessToken === "string" ? message.payload.accessToken : "";
+    void importGitHubStars(accessToken)
+      .then((payload) => sendResponse({ success: true, payload }))
+      .catch((error) =>
+        sendResponse({ success: false, error: error instanceof Error ? error.message : "GitHub stars import failed." })
+      );
+    return true;
+  }
+
+  if (message?.target === "background" && isProcessingTrigger(message?.type)) {
+    const triggerPayload = {
+      itemId: typeof message?.payload?.itemId === "string" ? message.payload.itemId : undefined,
+      force: message?.payload?.force === true,
+    };
+    void forwardProcessingTriggerToOffscreen(message.type, triggerPayload)
+      .then(() => sendResponse({ success: true }))
+      .catch((error) =>
+        sendResponse({ success: false, error: error instanceof Error ? error.message : String(error) })
+      );
+    return true;
+  }
+
+  if (message?.target === "background" && message?.type === "PROMOTE_OPFS_MEDIA") {
+    triggerOpfsPromotion();
     return;
   }
 
@@ -2297,6 +3895,156 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message?.target === "background" && message?.type === "OPEN_SEARCH") {
     void chrome.tabs.create({ url: chrome.runtime.getURL("src/pages/search/index.html") });
     return;
+  }
+
+  if (message?.target === "background" && message?.type === "SAVE_SCREENSHOT_TO") {
+    const pendingId = typeof message?.payload?.pendingId === "string" ? message.payload.pendingId : "";
+    const folderId = typeof message?.payload?.folderId === "string" ? message.payload.folderId : "";
+    const spaceId = typeof message?.payload?.spaceId === "string" ? message.payload.spaceId : PUBLIC_SPACE_ID;
+    const autoSave = message?.payload?.autoSave === true;
+    if (pendingId) {
+      void finalizeScreenshotSave(pendingId, folderId, spaceId, { preferLru: autoSave });
+    }
+    return;
+  }
+
+  if (message?.target === "background" && message?.type === "MOVE_SAVED_ITEM") {
+    const itemId = typeof message?.payload?.itemId === "string" ? message.payload.itemId : "";
+    const folderId = typeof message?.payload?.folderId === "string" ? message.payload.folderId : "";
+    if (itemId && folderId) {
+      void moveSavedItemToFolder(itemId, folderId, sender?.tab);
+    }
+    return;
+  }
+
+  if (message?.target === "background" && message?.type === "QUICK_SAVE_PAGE") {
+    void (async () => {
+      const tab = await getActiveTab();
+      if (!tab?.id) return;
+      const context = collectContextFromTab(tab);
+      await runImportAction({ mode: "save", spaceId: PUBLIC_SPACE_ID }, context, tab);
+    })();
+    return;
+  }
+
+  if (message?.target === "background" && message?.type === "QUICK_SCREENSHOT") {
+    const screenshotMode = message?.payload?.mode === "region" ? "region" : "visible";
+    void (async () => {
+      const tab = await getActiveTab();
+      if (!tab?.id) return;
+      const context = collectContextFromTab(tab);
+      await runScreenshotAction({ mode: "shot", spaceId: PUBLIC_SPACE_ID, screenshotMode }, context, tab);
+    })();
+    return;
+  }
+
+  if (message?.target === "background" && message?.type === "QUICK_EXTRACT_PAGE") {
+    void (async () => {
+      const tab = await getActiveTab();
+      if (!tab?.id) return;
+      const context = collectContextFromTab(tab);
+      await runScreenshotAction({ mode: "shot", spaceId: PUBLIC_SPACE_ID, screenshotMode: "visible", extractIntent: true }, context, tab);
+    })();
+    return;
+  }
+
+  if (message?.target === "background" && message?.type === "SAVE_PASTED_URL") {
+    const url = normalizeHttpUrl(typeof message?.payload?.url === "string" ? message.payload.url.trim() : "");
+    if (!url) return;
+    void (async () => {
+      const context = buildContextFromUrl(url);
+      await runImportAction({ mode: "save", spaceId: PUBLIC_SPACE_ID }, context, undefined);
+    })();
+    return;
+  }
+
+  if (message?.target === "background" && message?.type === "SHARE_IMPORT_FROM_URL") {
+    void (async () => {
+      const url = normalizeHttpUrl(typeof message?.payload?.url === "string" ? message.payload.url : "");
+      if (!url) throw new Error("INVALID_SHARE_URL");
+      const targetSpaceId =
+        typeof message?.payload?.targetSpaceId === "string" ? message.payload.targetSpaceId : PUBLIC_SPACE_ID;
+      const result = await importSharedLink(url, targetSpaceId);
+      sendResponse({ success: true, payload: result });
+    })().catch((error) =>
+      sendResponse({ success: false, error: error instanceof Error ? error.message : "Share import failed" })
+    );
+    return true;
+  }
+
+  if (message?.target === "background" && message?.type === "GOOGLE_SYNC_STATUS") {
+    void getGoogleWorkspaceSyncState()
+      .then((payload) => sendResponse({ success: true, payload }))
+      .catch((error) =>
+        sendResponse({ success: false, error: error instanceof Error ? error.message : "Google sync status failed" })
+      );
+    return true;
+  }
+
+  if (message?.target === "background" && message?.type === "GOOGLE_SYNC_CLEAR_AUTH") {
+    void clearGoogleWorkspaceAuth()
+      .then(() => sendResponse({ success: true, payload: { cleared: true } }))
+      .catch((error) =>
+        sendResponse({ success: false, error: error instanceof Error ? error.message : "Google auth clear failed" })
+      );
+    return true;
+  }
+
+  if (message?.target === "background" && message?.type === "GOOGLE_BACKUP_LIST") {
+    void listGoogleWorkspaceBackups()
+      .then((payload) => sendResponse({ success: true, payload }))
+      .catch((error) =>
+        sendResponse({ success: false, error: error instanceof Error ? error.message : "Google backup listing failed" })
+      );
+    return true;
+  }
+
+  if (message?.target === "background" && message?.type === "GOOGLE_BACKUP_RESTORE") {
+    void (async () => {
+      const fileId = typeof message?.payload?.fileId === "string" ? message.payload.fileId : "";
+      if (!fileId) throw new Error("GOOGLE_BACKUP_FILE_ID_MISSING");
+      sendProcessStatus("google-backup-restore", "Google backup", "processing", "Downloading backup...");
+      const snapshot = await downloadGoogleWorkspaceBackup(fileId);
+      sendProcessStatus(
+        "google-backup-restore",
+        "Google backup",
+        "processing",
+        `Merging ${snapshot.items.length.toLocaleString()} items...`
+      );
+      const payload = await sendForwardedToOffscreen({
+        service: "dbManager",
+        type: "mergeBackupSnapshot",
+        payload: { snapshot },
+      });
+      scheduleContextMenuRefresh("high");
+      sendProcessStatus("google-backup-restore", "Google backup", "success", "Backup merged.");
+      sendResponse({ success: true, payload });
+    })().catch((error) => {
+      const detail = error instanceof Error ? error.message : "Google backup restore failed";
+      sendProcessStatus("google-backup-restore", "Google backup", "error", detail);
+      sendResponse({ success: false, error: detail });
+    });
+    return true;
+  }
+
+  if (message?.target === "background" && message?.type === "GOOGLE_SYNC_EXPORT_ALL") {
+    void (async () => {
+      sendProcessStatus("google-sync", "Google sync", "processing", "Building local export...");
+      const snapshot = await sendForwardedToOffscreen<ShareSnapshotV1>({
+        service: "dbManager",
+        type: "buildExportSnapshot",
+        payload: { title: "VibeSearch export" },
+      });
+      sendProcessStatus("google-sync", "Google sync", "processing", `Syncing ${snapshot.items.length} items...`);
+      const payload = await syncSnapshotToGoogleWorkspace(snapshot, { interactive: true });
+      sendProcessStatus("google-sync", "Google sync", "success", `Synced ${snapshot.items.length} items.`);
+      sendResponse({ success: true, payload });
+    })().catch((error) => {
+      const detail = error instanceof Error ? error.message : "Google sync failed";
+      sendProcessStatus("google-sync", "Google sync", "error", detail);
+      sendResponse({ success: false, error: detail });
+    });
+    return true;
   }
 
   if (message?.target === "background" && typeof message?.type === "string" && message.type.startsWith("IMPORT_")) {

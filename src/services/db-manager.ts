@@ -1,13 +1,71 @@
 import { getDb } from "@src/services/DatabaseService";
-import { ItemDocType } from "@src/schemas/item_schema";
+import { ItemDocType, MediaOcrMetadata } from "@src/schemas/item_schema";
 import { FolderDocType } from "@src/schemas/folder_schema";
 import { PRIVATE_SPACE_ID, PUBLIC_SPACE_ID } from "@src/common/spaces";
 import { spaceSessionService } from "@src/services/space-session.service";
+import {
+  hasEmbeddableText,
+  hasVectorReference,
+  isMetadataReadyForEmbedding,
+} from "@src/search-core/embedding-state";
+import {
+  appendOcrTextToTextContent,
+  normalizeOcrText,
+} from "@src/services/ocr-text";
+import { isMetadataFetchableUrl } from "@src/utils/metadata-url";
+import {
+  buildLocalExportSnapshot,
+  importSharedSnapshot,
+  type BuildExportSnapshotPayload,
+  type ImportSharedSnapshotPayload,
+  type ImportSharedSnapshotResult,
+  type ShareSnapshotV1,
+} from "@src/services/share-snapshot";
+import {
+  buildLocalExtensionMigrationBundle,
+  restoreLocalExtensionMigrationBundle as restoreLocalExtensionMigration,
+  summarizeLocalExtensionMigrationBundle,
+  validateLocalExtensionMigrationBundle,
+  type LocalExtensionMigrationBundle,
+  type LocalExtensionMigrationSummary,
+  type RestoreLocalExtensionMigrationResult,
+} from "@src/services/local-extension-migration";
+import {
+  mergeBackupSnapshot,
+  type MergeBackupSnapshotResult,
+} from "@src/services/share-snapshot";
 
 type SearchScope = "current" | "global" | "private" | "public";
 type AccessContext = {
   activeSpaceId?: string;
   searchScope?: SearchScope;
+};
+type MediaEntry = NonNullable<ItemDocType["media"]>[number];
+type SavedMediaOcrResult = {
+  url: string;
+  source?: "display" | "s3" | "original" | "opfs";
+  status?: MediaOcrMetadata["status"];
+  text?: string;
+  confidence?: number | null;
+  lineCount?: number;
+  sourceHash?: string;
+  error?: string;
+};
+const BULK_ITEM_UPDATE_BATCH_SIZE = 400;
+const STAGED_RESTORE_TTL_MS = 15 * 60 * 1000;
+const yieldToEventLoop = () => new Promise<void>((resolve) => window.setTimeout(resolve, 0));
+
+const isWriteConflict = (error: unknown): boolean => {
+  const candidate = error as {
+    status?: unknown;
+    rxdb?: { status?: unknown };
+    parameters?: { writeError?: { status?: unknown } };
+  };
+  return (
+    candidate?.status === 409 ||
+    candidate?.rxdb?.status === 409 ||
+    candidate?.parameters?.writeError?.status === 409
+  );
 };
 
 export type ImportTargetItemPreview = {
@@ -37,6 +95,7 @@ export type ImportTargetSpace = {
 
 class DatabaseManager {
   [key: string]: any;
+  private stagedLocalRestoreBundles = new Map<string, LocalExtensionMigrationBundle>();
 
   private normalizeUserId(userId: string | null | undefined): string {
     return typeof userId === "string" ? userId : "";
@@ -55,15 +114,6 @@ class DatabaseManager {
     );
   }
 
-  private normalizeOcrText(text: string | undefined): string {
-    return (text || "")
-      .replace(/\s+\n/g, "\n")
-      .replace(/\n\s+/g, "\n")
-      .replace(/[ \t]+/g, " ")
-      .replace(/\n{3,}/g, "\n\n")
-      .trim();
-  }
-
   private normalizeOcrConfidence(value: unknown): number | null {
     if (!Number.isFinite(value)) return null;
     return Math.max(0, Math.min(1, value as number));
@@ -72,6 +122,147 @@ class DatabaseManager {
   private normalizeOcrLineCount(value: unknown): number {
     if (!Number.isFinite(value)) return 0;
     return Math.max(0, Math.floor(value as number));
+  }
+
+  private normalizeComparableUrl(value: unknown): string {
+    if (typeof value !== "string") return "";
+    const trimmed = value.trim();
+    if (!trimmed) return "";
+    try {
+      return new URL(trimmed).toString();
+    } catch {
+      return trimmed;
+    }
+  }
+
+  private mediaOcrResultMatchesEntry(entry: MediaEntry, result: SavedMediaOcrResult): boolean {
+    const target = this.normalizeComparableUrl(result.url);
+    if (!target) return false;
+
+    if (result.source === "s3") {
+      return this.normalizeComparableUrl(entry.s3Url) === target;
+    }
+    if (result.source === "original") {
+      return this.normalizeComparableUrl(entry.originalUrl) === target;
+    }
+    if (result.source === "opfs") {
+      return this.normalizeComparableUrl(entry.opfsPath) === target;
+    }
+
+    return [entry.s3Url, entry.originalUrl, entry.opfsPath]
+      .map((url) => this.normalizeComparableUrl(url))
+      .some((url) => url && url === target);
+  }
+
+  private buildMediaOcrMetadata(
+    result: SavedMediaOcrResult,
+    payload: {
+      status: ItemDocType["ocrStatus"];
+      modelVersion: string;
+      sourceHash: string;
+      text?: string;
+      confidence?: number | null;
+      lineCount?: number;
+      error?: string;
+    },
+    now: number
+  ): MediaOcrMetadata {
+    const status = result.status || payload.status;
+    const text = normalizeOcrText(result.text ?? payload.text);
+    const confidence = this.normalizeOcrConfidence(result.confidence ?? payload.confidence);
+    const lineCount = this.normalizeOcrLineCount(result.lineCount ?? payload.lineCount);
+    const error = (result.error || payload.error || "").slice(0, 500);
+    const ocr: MediaOcrMetadata = {
+      status,
+      confidence,
+      lineCount,
+      modelVersion: payload.modelVersion,
+      sourceHash: result.sourceHash || payload.sourceHash,
+      extractedAt: now,
+      engine: "paddleocr",
+    };
+    if (text) ocr.text = text;
+    if (error) ocr.error = error;
+    return ocr;
+  }
+
+  private applyMediaOcrResults(
+    media: ItemDocType["media"],
+    payload: {
+      status: ItemDocType["ocrStatus"];
+      modelVersion: string;
+      sourceHash: string;
+      text?: string;
+      confidence?: number | null;
+      lineCount?: number;
+      error?: string;
+      media?: SavedMediaOcrResult[];
+    },
+    now: number
+  ): ItemDocType["media"] {
+    if (!media || media.length === 0) return media;
+
+    const imageCount = media.filter((entry) => entry?.type === "image").length;
+    if (imageCount === 0) return media;
+
+    const results = (payload.media || []).filter((result) => result && typeof result.url === "string");
+    const fallbackResult: SavedMediaOcrResult | null =
+      results.length === 0 && imageCount === 1
+        ? {
+            url: "",
+            source: "display",
+            status: payload.status,
+            text: payload.text,
+            confidence: payload.confidence,
+            lineCount: payload.lineCount,
+            sourceHash: payload.sourceHash,
+            error: payload.error,
+          }
+        : null;
+    const usedResults = new Set<number>();
+
+    return media.map((entry) => {
+      if (entry?.type !== "image") return entry;
+
+      let resultIndex = results.findIndex(
+        (result, index) => !usedResults.has(index) && this.mediaOcrResultMatchesEntry(entry, result)
+      );
+      if (resultIndex < 0 && imageCount === 1 && results.length === 1) {
+        resultIndex = 0;
+      }
+
+      const result = resultIndex >= 0 ? results[resultIndex] : fallbackResult;
+      if (!result) return entry;
+      if (resultIndex >= 0) usedResults.add(resultIndex);
+
+      return {
+        ...entry,
+        ocr: this.buildMediaOcrMetadata(result, payload, now),
+      };
+    });
+  }
+
+  private markMediaOcrProcessing(
+    media: ItemDocType["media"],
+    payload: { modelVersion: string; sourceHash: string },
+    now: number
+  ): ItemDocType["media"] {
+    if (!media || media.length === 0) return media;
+    return media.map((entry) => {
+      if (entry?.type !== "image") return entry;
+      return {
+        ...entry,
+        ocr: {
+          ...entry.ocr,
+          status: "processing",
+          modelVersion: payload.modelVersion,
+          sourceHash: payload.sourceHash,
+          extractedAt: now,
+          engine: entry.ocr?.engine || "paddleocr",
+          error: "",
+        },
+      };
+    });
   }
 
   private async resolveAllowedSpaceIds(
@@ -118,9 +309,13 @@ class DatabaseManager {
     return allItems.map((item) => item.toMutableJSON());
   }
 
-  async getAllFolders(payload?: { accessContext?: AccessContext }): Promise<FolderDocType[]> {
+  async getAllFolders(payload?: { accessContext?: AccessContext; spaceIds?: string[] }): Promise<FolderDocType[]> {
     const db = await getDb();
-    const allowedSpaceIds = await this.resolveAllowedSpaceIds(db, payload?.accessContext);
+    const baseAllowedSpaceIds = await this.resolveAllowedSpaceIds(db, payload?.accessContext);
+    const requestedSpaceIds = Array.from(new Set((payload?.spaceIds || []).filter(Boolean)));
+    const allowedSpaceIds = requestedSpaceIds.length > 0
+      ? baseAllowedSpaceIds.filter((spaceId) => requestedSpaceIds.includes(spaceId))
+      : baseAllowedSpaceIds;
     if (allowedSpaceIds.length === 0) return [];
     const allFolders = await db.folders
       .find({ selector: { spaceId: { $in: allowedSpaceIds } } })
@@ -134,12 +329,15 @@ class DatabaseManager {
     maxItemsPerFolder?: number;
   }): Promise<ImportTargetSpace[]> {
     const db = await getDb();
+    const includeAllSpaces = payload?.maxSpaces === 0;
+    const includeAllFolders = payload?.maxFoldersPerSpace === 0;
+    const skipRecentItems = payload?.maxItemsPerFolder === 0;
     const maxSpaces = Math.max(1, Math.min(20, payload?.maxSpaces ?? 8));
     const maxFoldersPerSpace = Math.max(1, Math.min(40, payload?.maxFoldersPerSpace ?? 14));
     const maxItemsPerFolder = Math.max(1, Math.min(6, payload?.maxItemsPerFolder ?? 3));
 
     const spaceDocs = await db.spaces.find({ selector: { isArchived: { $eq: false } } }).exec();
-    const spaces = spaceDocs
+    const sortedSpaces = spaceDocs
       .map((doc) => doc.toMutableJSON() as any)
       .sort((a, b) => {
         if (!!a.isPrivate !== !!b.isPrivate) return a.isPrivate ? 1 : -1;
@@ -147,8 +345,8 @@ class DatabaseManager {
         const bo = typeof b.sortOrder === "number" ? b.sortOrder : Number.MAX_SAFE_INTEGER;
         if (ao !== bo) return ao - bo;
         return (a.createdAt || 0) - (b.createdAt || 0);
-      })
-      .slice(0, maxSpaces);
+      });
+    const spaces = includeAllSpaces ? sortedSpaces : sortedSpaces.slice(0, maxSpaces);
 
     const results: ImportTargetSpace[] = [];
     for (const space of spaces) {
@@ -172,7 +370,7 @@ class DatabaseManager {
       }
 
       const folderDocs = await db.folders.find({ selector: { spaceId: { $eq: spaceId } } }).exec();
-      const folders = folderDocs
+      const sortedFolders = folderDocs
         .map((doc) => doc.toMutableJSON() as FolderDocType)
         .sort((a, b) => {
           if (!!a.isPinned !== !!b.isPinned) return a.isPinned ? -1 : 1;
@@ -180,20 +378,22 @@ class DatabaseManager {
           const bo = b.sortOrder ?? Number.MAX_SAFE_INTEGER;
           if (ao !== bo) return ao - bo;
           return a.createdAt - b.createdAt;
-        })
-        .slice(0, maxFoldersPerSpace);
+        });
+      const folders = includeAllFolders ? sortedFolders : sortedFolders.slice(0, maxFoldersPerSpace);
 
       for (const folder of folders) {
-        const itemDocs = await db.items
-          .find({
-            selector: {
-              folderId: { $eq: folder.id },
-              deletedAt: { $eq: 0 },
-            },
-            sort: [{ updatedAt: "desc" }],
-            limit: maxItemsPerFolder,
-          })
-          .exec();
+        const itemDocs = skipRecentItems
+          ? []
+          : await db.items
+              .find({
+                selector: {
+                  folderId: { $eq: folder.id },
+                  deletedAt: { $eq: 0 },
+                },
+                sort: [{ updatedAt: "desc" }],
+                limit: maxItemsPerFolder,
+              })
+              .exec();
         const recentItems = itemDocs.map((doc) => {
           const item = doc.toMutableJSON() as ItemDocType;
           return {
@@ -219,16 +419,152 @@ class DatabaseManager {
     return results;
   }
 
+  async buildExportSnapshot(payload?: BuildExportSnapshotPayload): Promise<ShareSnapshotV1> {
+    return buildLocalExportSnapshot(payload);
+  }
+
+  async importSharedSnapshot(payload: ImportSharedSnapshotPayload): Promise<ImportSharedSnapshotResult> {
+    return importSharedSnapshot(payload);
+  }
+
+  async restoreLocalExtensionMigrationBundle(payload: {
+    bundle: LocalExtensionMigrationBundle;
+  }): Promise<RestoreLocalExtensionMigrationResult> {
+    return restoreLocalExtensionMigration(payload.bundle);
+  }
+
+  async buildLocalExtensionMigrationBundle(): Promise<LocalExtensionMigrationBundle> {
+    return buildLocalExtensionMigrationBundle();
+  }
+
+  async stageLocalExtensionMigrationBundle(payload: {
+    json: string;
+  }): Promise<{ stageId: string; summary: LocalExtensionMigrationSummary }> {
+    // Only one restore file needs to be retained in the offscreen document.
+    // Clearing stale staged files prevents large JSON blobs from accumulating.
+    this.stagedLocalRestoreBundles.clear();
+    const bundle = validateLocalExtensionMigrationBundle(JSON.parse(payload.json));
+    const stageId = crypto.randomUUID();
+    this.stagedLocalRestoreBundles.set(stageId, bundle);
+    window.setTimeout(() => {
+      this.stagedLocalRestoreBundles.delete(stageId);
+    }, STAGED_RESTORE_TTL_MS);
+    return { stageId, summary: summarizeLocalExtensionMigrationBundle(bundle) };
+  }
+
+  async restoreStagedLocalExtensionMigrationBundle(payload: {
+    stageId: string;
+  }): Promise<RestoreLocalExtensionMigrationResult> {
+    const bundle = this.stagedLocalRestoreBundles.get(payload.stageId);
+    if (!bundle) throw new Error("MIGRATION_FILE_NOT_STAGED");
+    const result = await restoreLocalExtensionMigration(bundle);
+    this.stagedLocalRestoreBundles.delete(payload.stageId);
+    return result;
+  }
+
+  async mergeBackupSnapshot(payload: { snapshot: unknown }): Promise<MergeBackupSnapshotResult> {
+    return mergeBackupSnapshot(payload.snapshot);
+  }
+
+  /**
+   * Permanently wipe every local collection and all OPFS media. Destructive
+   * and irreversible — the caller (Settings → Data → Delete all data) confirms
+   * first. Clears document data rather than removing the database so the live
+   * RxDB instance stays valid for the running page.
+   */
+  async deleteAllData(): Promise<{ deletedCollections: number }> {
+    const db = await getDb();
+    const collections = [
+      db.items,
+      db.folders,
+      db.spaces,
+      db.space_groups,
+      db.tags,
+      db.item_tags,
+      db.search_history,
+      db.flashcards,
+      db.deleted_items,
+    ];
+    let deletedCollections = 0;
+    for (const collection of collections) {
+      try {
+        await collection.find().remove();
+        deletedCollections += 1;
+      } catch (error) {
+        console.error("[db-manager] failed to clear collection", collection?.name, error);
+      }
+    }
+    // Best-effort wipe of OPFS media so deleted tabs don't leave blobs behind.
+    try {
+      const root = await navigator.storage.getDirectory();
+      await root.removeEntry("media", { recursive: true });
+    } catch {
+      /* media dir may not exist */
+    }
+    for (const scope of ["items", "folders", "spaces"] as const) {
+      try {
+        chrome.runtime.sendMessage({ type: "DB_CHANGE", scope });
+      } catch {}
+    }
+    return { deletedCollections };
+  }
+
   /**
    * Retrieves all items that have not yet been embedded.
    * This is used to process new items that need to be added to the vector store.
    */
-  async getItemsToEmbed(): Promise<ItemDocType[]> {
+  async getItemsToEmbed(payload?: { limit?: number }): Promise<ItemDocType[]> {
     const db = await getDb();
+    const limit = Math.max(1, Math.min(100, Math.floor(payload?.limit || 100)));
     const itemsToEmbed = await db.items
-      .find({ selector: { isEmbedded: false, deletedAt: { $eq: 0 } } })
+      .find({ selector: { isEmbedded: false, isMetaFetched: true, deletedAt: { $eq: 0 } }, limit })
       .exec();
-    return itemsToEmbed.map((item) => item.toMutableJSON());
+    return itemsToEmbed
+      .map((item) => item.toMutableJSON())
+      .filter(isMetadataReadyForEmbedding);
+  }
+
+  /**
+   * Repairs records written by older importers that claimed to be embedded
+   * despite having no usable vector reference. It is safe to run once because
+   * blank records stay skipped instead of entering an endless queue.
+   */
+  async repairItemsMissingVectors(): Promise<number> {
+    const db = await getDb();
+    let afterId = "";
+    let repairedCount = 0;
+
+    while (true) {
+      const selector: Record<string, unknown> = {
+        deletedAt: { $eq: 0 },
+        isEmbedded: { $eq: true },
+      };
+      if (afterId) selector.id = { $gt: afterId };
+      const docs = await db.items
+        .find({ selector, sort: [{ id: "asc" }], limit: BULK_ITEM_UPDATE_BATCH_SIZE } as any)
+        .exec();
+      if (docs.length === 0) break;
+
+      const updates = docs
+        .map((doc) => doc.toMutableJSON() as ItemDocType)
+        .filter((item) => hasEmbeddableText(item) && !hasVectorReference(item))
+        .map((item) => ({
+          ...item,
+          vector_index: -1,
+          vector_indexes: [],
+          isEmbedded: false,
+          isDirty: false,
+        }));
+      if (updates.length > 0) {
+        await db.items.bulkUpsert(updates);
+        repairedCount += updates.length;
+      }
+
+      afterId = docs[docs.length - 1].primary;
+      await yieldToEventLoop();
+    }
+
+    return repairedCount;
   }
 
   /**
@@ -245,12 +581,15 @@ class DatabaseManager {
    * Retrieves all active items that have been marked as dirty (i.e., their content has changed).
    * These items need to be re-embedded.
    */
-  async getDirtyItems(): Promise<ItemDocType[]> {
+  async getDirtyItems(payload?: { limit?: number }): Promise<ItemDocType[]> {
     const db = await getDb();
+    const limit = Math.max(1, Math.min(100, Math.floor(payload?.limit || 100)));
     const dirtyItems = await db.items
-      .find({ selector: { isDirty: true, deletedAt: { $eq: 0 } } })
+      .find({ selector: { isDirty: true, isMetaFetched: true, deletedAt: { $eq: 0 } }, limit })
       .exec();
-    return dirtyItems.map((item) => item.toMutableJSON());
+    return dirtyItems
+      .map((item) => item.toMutableJSON())
+      .filter(isMetadataReadyForEmbedding);
   }
 
   async getItemsToOcr(payload: {
@@ -260,25 +599,47 @@ class DatabaseManager {
   }): Promise<ItemDocType[]> {
     const db = await getDb();
     const limit = Math.max(1, Math.min(100, Math.floor(payload.limit || 10)));
-    const docs = await db.items
+
+    // Select items that still need OCR by status, so a freshly-saved image is
+    // found even in a large library. The previous query fetched a fixed slice of
+    // items ordered by random UUID and then filtered, which could skip pending
+    // items entirely (they simply weren't in the fetched slice).
+    const pendingDocs = await db.items
       .find({
         selector: {
           deletedAt: { $eq: 0 },
+          ocrStatus: { $in: ["pending", "processing", "error"] },
         },
         limit: limit * 12,
       } as any)
       .exec();
-
-    return docs
+    const result = pendingDocs
       .map((item) => item.toMutableJSON() as ItemDocType)
       .filter((item) => {
-        if (!item.ocrStatus) return true;
         if (item.ocrStatus === "pending" || item.ocrStatus === "processing") return true;
-        if (item.ocrModelVersion !== payload.modelVersion) return true;
         return item.ocrStatus === "error" && (item.ocrUpdatedAt || 0) < payload.retryErroredBefore;
       })
-      .filter((item) => this.itemHasOcrImage(item))
-      .slice(0, limit);
+      .filter((item) => this.itemHasOcrImage(item));
+
+    // Best-effort re-OCR of items captured by an older model version (a rare
+    // model upgrade). Bounded scan, deduped against the status-selected set.
+    if (result.length < limit) {
+      const ids = new Set(result.map((item) => item.id));
+      const staleDocs = await db.items
+        .find({ selector: { deletedAt: { $eq: 0 } }, limit: limit * 12 } as any)
+        .exec();
+      for (const doc of staleDocs) {
+        if (result.length >= limit) break;
+        const item = doc.toMutableJSON() as ItemDocType;
+        if (ids.has(item.id) || item.ocrStatus !== "done") continue;
+        if (item.ocrModelVersion !== payload.modelVersion && this.itemHasOcrImage(item)) {
+          ids.add(item.id);
+          result.push(item);
+        }
+      }
+    }
+
+    return result.slice(0, limit);
   }
 
   async markItemOcrProcessing(payload: {
@@ -287,15 +648,33 @@ class DatabaseManager {
     sourceHash: string;
   }): Promise<void> {
     const db = await getDb();
-    const doc = await db.items.findOne(payload.id).exec();
-    if (!doc) return;
-    await doc.patch({
-      ocrStatus: "processing",
-      ocrError: "",
-      ocrModelVersion: payload.modelVersion,
-      ocrSourceHash: payload.sourceHash,
-      ocrUpdatedAt: Date.now(),
-    });
+    let lastError: unknown;
+
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      const doc = await db.items.findOne(payload.id).exec();
+      if (!doc) return;
+      const current = doc.toMutableJSON() as ItemDocType;
+      const now = Date.now();
+      const nextMedia = this.markMediaOcrProcessing(current.media, payload, now);
+      const patchData: Partial<ItemDocType> = {
+        ocrStatus: "processing",
+        ocrError: "",
+        ocrModelVersion: payload.modelVersion,
+        ocrSourceHash: payload.sourceHash,
+        ocrUpdatedAt: now,
+      };
+      if (nextMedia) patchData.media = nextMedia;
+
+      try {
+        await doc.patch(patchData);
+        return;
+      } catch (error) {
+        if (!isWriteConflict(error)) throw error;
+        lastError = error;
+      }
+    }
+
+    throw lastError;
   }
 
   async saveItemOcrResult(payload: {
@@ -307,65 +686,97 @@ class DatabaseManager {
     confidence?: number | null;
     lineCount?: number;
     error?: string;
+    media?: SavedMediaOcrResult[];
   }): Promise<void> {
     const db = await getDb();
-    const doc = await db.items.findOne(payload.id).exec();
-    if (!doc) return;
+    let lastError: unknown;
 
-    const current = doc.toMutableJSON() as ItemDocType;
-    const now = Date.now();
-    const nextText = this.normalizeOcrText(payload.text);
-    const currentText = this.normalizeOcrText(current.ocrText);
-    const textChanged = payload.status === "done" && nextText !== currentText;
-    const confidence = this.normalizeOcrConfidence(payload.confidence);
-    const lineCount = this.normalizeOcrLineCount(payload.lineCount);
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      const doc = await db.items.findOne(payload.id).exec();
+      if (!doc) return;
 
-    const patchData: Partial<ItemDocType> = {
-      ocrStatus: payload.status,
-      ocrError: payload.error ? payload.error.slice(0, 500) : "",
-      ocrModelVersion: payload.modelVersion,
-      ocrSourceHash: payload.sourceHash,
-      ocrUpdatedAt: now,
-      ocrConfidence: confidence,
-      ocrLineCount: lineCount,
-    };
+      const current = doc.toMutableJSON() as ItemDocType;
+      const now = Date.now();
+      const nextText = normalizeOcrText(payload.text);
+      const currentText = normalizeOcrText(current.ocrText);
+      const textChanged = payload.status === "done" && nextText !== currentText;
+      const nextTextContent =
+        payload.status === "done"
+          ? appendOcrTextToTextContent(current.textContent, nextText)
+          : current.textContent;
+      const textContentChanged = nextTextContent !== (current.textContent || "").trim();
+      const confidence = this.normalizeOcrConfidence(payload.confidence);
+      const lineCount = this.normalizeOcrLineCount(payload.lineCount);
+      const nextMedia = this.applyMediaOcrResults(current.media, payload, now);
 
-    if (payload.status === "done") {
-      patchData.ocrText = nextText;
+      const patchData: Partial<ItemDocType> = {
+        ocrStatus: payload.status,
+        ocrError: payload.error ? payload.error.slice(0, 500) : "",
+        ocrModelVersion: payload.modelVersion,
+        ocrSourceHash: payload.sourceHash,
+        ocrUpdatedAt: now,
+        ocrConfidence: confidence,
+        ocrLineCount: lineCount,
+      };
+      if (nextMedia) patchData.media = nextMedia;
+
+      if (payload.status === "done") {
+        patchData.ocrText = nextText;
+        patchData.textContent = nextTextContent;
+      }
+
+      if (textChanged || textContentChanged) {
+        patchData.isDirty = true;
+        patchData.isEmbedded = false;
+        patchData.updatedAt = now;
+      }
+
+      try {
+        await doc.patch(patchData);
+        return;
+      } catch (error) {
+        if (!isWriteConflict(error)) throw error;
+        lastError = error;
+      }
     }
 
-    if (textChanged) {
-      patchData.isDirty = true;
-      patchData.isEmbedded = false;
-      patchData.updatedAt = now;
-    }
-
-    await doc.patch(patchData);
+    throw lastError;
   }
 
   async markAllActiveItemsForReembedding(options?: { touchUpdatedAt?: boolean }): Promise<number> {
     const db = await getDb();
     const now = Date.now();
     const touchUpdatedAt = options?.touchUpdatedAt === true;
-    const activeItems = await db.items.find({ selector: { deletedAt: { $eq: 0 } } }).exec();
-    if (activeItems.length === 0) {
-      return 0;
+    let afterId = "";
+    let updatedCount = 0;
+
+    while (true) {
+      const selector: Record<string, any> = { deletedAt: { $eq: 0 } };
+      if (afterId) selector.id = { $gt: afterId };
+      const batch = await db.items
+        .find({ selector, sort: [{ id: "asc" }], limit: BULK_ITEM_UPDATE_BATCH_SIZE } as any)
+        .exec();
+      if (batch.length === 0) break;
+
+      const updates = batch.map((doc) => {
+        const current = doc.toMutableJSON() as ItemDocType;
+        return {
+          ...current,
+          userId: this.normalizeUserId(doc.get("userId") as string | null | undefined),
+          vector_index: -1,
+          vector_indexes: [],
+          isEmbedded: false,
+          isDirty: true,
+          updatedAt: touchUpdatedAt ? now : current.updatedAt,
+        };
+      });
+      await db.items.bulkUpsert(updates);
+      updatedCount += updates.length;
+      afterId = batch[batch.length - 1].primary;
+      await yieldToEventLoop();
     }
 
-    const updates = activeItems.map((doc) => {
-      const current = doc.toMutableJSON() as ItemDocType;
-      return {
-        ...current,
-        userId: this.normalizeUserId(doc.get("userId") as string | null | undefined),
-        vector_index: -1,
-        vector_indexes: [],
-        isEmbedded: false,
-        isDirty: true,
-        updatedAt: touchUpdatedAt ? now : current.updatedAt,
-      };
-    });
-    await db.items.bulkUpsert(updates);
-    return updates.length;
+    return updatedCount;
   }
 
   /**
@@ -406,18 +817,20 @@ class DatabaseManager {
    */
   async bulkUpdateItems(updates: Partial<ItemDocType>[]): Promise<void> {
     const db = await getDb();
-    const ids = updates.map((u) => u.id).filter((id): id is string => !!id);
     const updateMap = new Map<string, Partial<ItemDocType>>();
     for (const update of updates) {
       if (!update.id) continue;
       updateMap.set(update.id, update);
     }
-    const docsMap = await db.items.findByIds(ids).exec();
-    const docsToUpdate = [];
+    const ids = Array.from(updateMap.keys());
+    for (let start = 0; start < ids.length; start += BULK_ITEM_UPDATE_BATCH_SIZE) {
+      const batchIds = ids.slice(start, start + BULK_ITEM_UPDATE_BATCH_SIZE);
+      const docsMap = await db.items.findByIds(batchIds).exec();
+      const docsToUpdate = [];
 
-    for (const doc of docsMap.values()) {
-      const update = updateMap.get(doc.primary);
-      if (update) {
+      for (const doc of docsMap.values()) {
+        const update = updateMap.get(doc.primary);
+        if (!update) continue;
         const mutableDoc = doc.toMutableJSON();
         docsToUpdate.push({
           ...mutableDoc,
@@ -425,10 +838,11 @@ class DatabaseManager {
           userId: this.normalizeUserId((update.userId as string | null | undefined) ?? mutableDoc.userId),
         });
       }
-    }
 
-    if (docsToUpdate.length > 0) {
-      await db.items.bulkUpsert(docsToUpdate);
+      if (docsToUpdate.length > 0) {
+        await db.items.bulkUpsert(docsToUpdate);
+      }
+      if (start + batchIds.length < ids.length) await yieldToEventLoop();
     }
   }
 
@@ -491,6 +905,9 @@ class DatabaseManager {
     const folderSpaceId =
       ((folder?.get("spaceId") as string | undefined) || payload.item.spaceId || PUBLIC_SPACE_ID).trim() ||
       PUBLIC_SPACE_ID;
+    const isMetaFetched = isMetadataFetchableUrl(payload.item.url)
+      ? payload.item.isMetaFetched ?? false
+      : true;
     const item: ItemDocType = {
       id: payload.item.id ?? crypto.randomUUID?.() ?? `${now}`,
       userId: this.normalizeUserId(payload.item.userId),
@@ -507,16 +924,21 @@ class DatabaseManager {
       media: payload.item.media,
       iconUrl: (payload.item as any).iconUrl,
       displayImageUrl: (payload.item as any).displayImageUrl,
+      ocrText: payload.item.ocrText,
+      ocrError: payload.item.ocrError,
       parentId: payload.item.parentId ?? null,
       chunkOrder: payload.item.chunkOrder,
       vector_index: -1,
       vector_indexes: [],
       ocrStatus: payload.item.ocrStatus ?? "pending",
       ocrModelVersion: payload.item.ocrModelVersion ?? "",
+      ocrSourceHash: payload.item.ocrSourceHash,
       ocrUpdatedAt: payload.item.ocrUpdatedAt ?? 0,
+      ocrConfidence: payload.item.ocrConfidence,
+      ocrLineCount: payload.item.ocrLineCount,
       isEmbedded: false,
-      isMetaFetched: false,
-      isDirty: true,
+      isMetaFetched,
+      isDirty: payload.item.isDirty ?? true,
       serverVersion: 0,
       createdAt: now,
       updatedAt: now,

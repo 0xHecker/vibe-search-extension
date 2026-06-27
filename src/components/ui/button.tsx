@@ -5,7 +5,7 @@ import { cva, type VariantProps } from "class-variance-authority";
 import { cn } from "@src/lib/utils";
 
 const buttonVariants = cva(
-  "inline-flex items-center justify-center gap-2 whitespace-nowrap duration-400 ease-in-out text-sm font-medium transition-all cursor-pointer disabled:pointer-events-none disabled:opacity-50 shrink-0 hover:shadow-md hover:shadow-platinum active:shadow-sm active:shadow-platinum focus-visible:ring-2 focus-visible:ring-border-neutral/80 focus-visible:ring-offset-0 outline-none aria-invalid:border-border-danger",
+  "inline-flex shrink-0 cursor-pointer items-center justify-center gap-2 whitespace-nowrap text-sm font-medium outline-none transition-[transform,background-color,border-color,box-shadow,color] duration-150 ease-out hover:shadow-md hover:shadow-platinum active:shadow-sm active:shadow-platinum focus-visible:ring-2 focus-visible:ring-border-neutral/80 focus-visible:ring-offset-0 disabled:pointer-events-none disabled:opacity-50 aria-invalid:border-border-danger",
   {
     variants: {
       variant: {
@@ -38,17 +38,19 @@ function Button({
   variant,
   size,
   asChild = false,
+  static: isStatic = false,
   ...props
 }: React.ComponentProps<"button"> &
   VariantProps<typeof buttonVariants> & {
     asChild?: boolean;
+    static?: boolean;
   }) {
   const Comp = asChild ? Slot : "button";
 
   return (
     <Comp
       data-slot="button"
-      className={cn(buttonVariants({ variant, size, className }))}
+      className={cn(buttonVariants({ variant, size, className }), !isStatic && "active:not-disabled:scale-[0.96]")}
       {...props}
     />
   );

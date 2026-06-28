@@ -376,12 +376,13 @@ let isEmbeddingRunning = false;
 let embeddingScheduled = false;
 let embeddingCheckTimer: number | null = null;
 let embeddingWaitNotified = false;
-const OCR_BATCH_SIZE = 3;
+const OCR_BATCH_SIZE = 1;
 const OCR_RETRY_AFTER_MS = 6 * 60 * 60 * 1000;
 let isOcrRunning = false;
 let ocrScheduled = false;
 let ocrCheckTimer: number | null = null;
 let ocrWaitNotified = false;
+const queuedOcrItemIds = new Map<string, boolean>();
 
 type EmbeddingBatchItem = Pick<
   ItemDocType,
@@ -819,6 +820,21 @@ const processOcrItemById = async (
   return processOcrItem(doc.toMutableJSON() as ItemDocType, force);
 };
 
+const enqueueOcrItem = (itemId: string, force = false): void => {
+  if (!itemId) return;
+  queuedOcrItemIds.set(itemId, force || queuedOcrItemIds.get(itemId) === true);
+};
+
+const takeQueuedOcrItems = (limit: number): Array<{ itemId: string; force: boolean }> => {
+  const items: Array<{ itemId: string; force: boolean }> = [];
+  for (const [itemId, force] of queuedOcrItemIds) {
+    queuedOcrItemIds.delete(itemId);
+    items.push({ itemId, force });
+    if (items.length >= limit) break;
+  }
+  return items;
+};
+
 const processOcrQueue = async () => {
   if (isOcrRunning) {
     ocrScheduled = true;
@@ -847,23 +863,43 @@ const processOcrQueue = async () => {
 
   try {
     while (true) {
-      const items = await databaseManager.getItemsToOcr({
-        limit: OCR_BATCH_SIZE,
-        modelVersion: OCR_MODEL_VERSION,
-        retryErroredBefore: Date.now() - OCR_RETRY_AFTER_MS,
-      });
-      if (items.length === 0) break;
+      const directItems = takeQueuedOcrItems(OCR_BATCH_SIZE);
+      if (directItems.length > 0) {
+        for (const item of directItems) {
+          try {
+            const status = await processOcrItemById(item.itemId, item.force);
+            if (status === "done") processed += 1;
+            else if (status === "skipped" || status === "processing") skipped += 1;
+            else errored += 1;
+          } catch (error) {
+            const message = error instanceof Error ? error.message : "OCR failed for an item";
+            if (message === "OCR_ITEM_NOT_FOUND") {
+              skipped += 1;
+              continue;
+            }
+            errored += 1;
+            processError = message;
+          }
+        }
+      } else {
+        const items = await databaseManager.getItemsToOcr({
+          limit: OCR_BATCH_SIZE,
+          modelVersion: OCR_MODEL_VERSION,
+          retryErroredBefore: Date.now() - OCR_RETRY_AFTER_MS,
+        });
+        if (items.length === 0) break;
 
-      for (const item of items) {
-        try {
-          const status = await processOcrItem(item);
-          if (status === "done") processed += 1;
-          else if (status === "skipped" || status === "processing") skipped += 1;
-          else errored += 1;
-        } catch (error) {
-          errored += 1;
-          const message = error instanceof Error ? error.message : "OCR failed for an item";
-          processError = message;
+        for (const item of items) {
+          try {
+            const status = await processOcrItem(item);
+            if (status === "done") processed += 1;
+            else if (status === "skipped" || status === "processing") skipped += 1;
+            else errored += 1;
+          } catch (error) {
+            errored += 1;
+            const message = error instanceof Error ? error.message : "OCR failed for an item";
+            processError = message;
+          }
         }
       }
 
@@ -873,6 +909,9 @@ const processOcrQueue = async () => {
         state: "processing",
         detail: `OCR processed ${processed} images${skipped ? `, skipped ${skipped}` : ""}${errored ? `, ${errored} errors` : ""}.`,
       });
+    }
+    if (queuedOcrItemIds.size > 0) {
+      ocrScheduled = true;
     }
 
     if (processError && processed === 0) {
@@ -947,20 +986,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       return true;
     }
 
-    // Any OCR trigger re-verifies the model files are in Cache Storage and
-    // re-downloads them if it was cleared — recovery without an extension reload.
-    void ocrService.ensureModelsCached().catch((error) =>
-      console.warn("[Offscreen] OCR model cache check failed:", error)
-    );
-
     const itemId = typeof message?.payload?.itemId === "string" ? message.payload.itemId : "";
     const force = message?.payload?.force === true;
     if (itemId) {
-      void processOcrItemById(itemId, force)
-        .then((status) => sendResponse({ success: true, payload: { status } }))
-        .catch((error) =>
-          sendResponse({ success: false, error: error instanceof Error ? error.message : String(error) })
-        );
+      enqueueOcrItem(itemId, force);
+      triggerOcr();
+      sendResponse({ success: true, payload: { status: "queued" } });
       return true;
     }
 

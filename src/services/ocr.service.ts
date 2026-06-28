@@ -517,9 +517,9 @@ class OcrService {
         height: entry.height,
         capturedAt: entry.capturedAt,
       };
-      add(entry.s3Url ? { url: entry.s3Url, source: "s3", ...meta } : null);
-      add(entry.originalUrl ? { url: entry.originalUrl, source: "original", ...meta } : null);
-      add(entry.opfsPath ? { url: entry.opfsPath, source: "opfs", ...meta } : null);
+      if (entry.opfsPath) add({ url: entry.opfsPath, source: "opfs", ...meta });
+      else if (entry.s3Url) add({ url: entry.s3Url, source: "s3", ...meta });
+      else if (entry.originalUrl) add({ url: entry.originalUrl, source: "original", ...meta });
     }
     add(item.displayImageUrl ? { url: item.displayImageUrl, source: "display" } : null);
 
@@ -645,9 +645,9 @@ class OcrService {
   }
 
   private async runImage(candidate: ImageCandidate): Promise<ImageOcrResult> {
-    const sandbox = await this.initialize();
     const sourceBlob = await this.fetchImageBlob(candidate);
     const image = await this.normalizeImageBlob(sourceBlob);
+    const sandbox = await this.initialize();
     const result = await sandbox.runOcr(image.blob, image, {
       textDetLimitSideLen: 960,
       textDetLimitType: "max",

@@ -78,10 +78,11 @@ export function crxI18n(options: {
 // jsdelivr CDN and wraps it in a blob: URL, which the MV3 extension CSP
 // (script-src 'self') blocks — breaking model init in the offscreen worker.
 export function copyOrtWasm(): PluginOption {
-  const ORT_FILES = [
+  const EMBEDDING_ORT_FILES = [
     "ort-wasm-simd-threaded.asyncify.mjs",
     "ort-wasm-simd-threaded.asyncify.wasm",
   ];
+  const OCR_ORT_FILES = EMBEDDING_ORT_FILES;
   let outDir = "";
   return {
     name: "copy-ort-wasm",
@@ -90,17 +91,26 @@ export function copyOrtWasm(): PluginOption {
       outDir = config.build.outDir;
     },
     writeBundle() {
-      const srcDir = resolve(__dirname, "node_modules/onnxruntime-web/dist");
-      const destDir = resolve(outDir, "ort");
-      fs.mkdirSync(destDir, { recursive: true });
-      for (const file of ORT_FILES) {
-        const from = resolve(srcDir, file);
-        if (!fs.existsSync(from)) {
-          this.warn(`[copy-ort-wasm] missing source file: ${from}`);
-          continue;
+      const copyFiles = (srcDir: string, destDirName: string, files: string[]) => {
+        const destDir = resolve(outDir, destDirName);
+        fs.mkdirSync(destDir, { recursive: true });
+        for (const file of files) {
+          const from = resolve(srcDir, file);
+          if (!fs.existsSync(from)) {
+            this.warn(`[copy-ort-wasm] missing source file: ${from}`);
+            continue;
+          }
+          fs.copyFileSync(from, resolve(destDir, file));
         }
-        fs.copyFileSync(from, resolve(destDir, file));
-      }
+      };
+
+      copyFiles(resolve(__dirname, "node_modules/onnxruntime-web/dist"), "ort", EMBEDDING_ORT_FILES);
+      copyFiles(
+        resolve(__dirname, "node_modules/@paddleocr/paddleocr-js/node_modules/onnxruntime-web/dist"),
+        "ocr-ort",
+        OCR_ORT_FILES
+      );
+
       // Do not prune the ORT wasm files Vite emits into /assets. The OCR
       // sandbox's bundled onnxruntime code contains concrete hashed references
       // to those files; deleting any of them can surface as "no available

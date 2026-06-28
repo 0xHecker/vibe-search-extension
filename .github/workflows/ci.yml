@@ -29,6 +29,8 @@ jobs:
         run: bun install --frozen-lockfile
 
       - name: Build Chrome
+        env:
+          VITE_IMPORT_MEDIA_UPLOAD_TOKEN: ${{ secrets.VITE_IMPORT_MEDIA_UPLOAD_TOKEN }}
         run: bun run build:chrome
 
       - name: Zip Chrome extension

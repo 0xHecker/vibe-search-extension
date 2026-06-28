@@ -1,4 +1,4 @@
-name: Build and Release Chrome Extension
+name: Build and Release Extensions
 
 on:
   push:
@@ -33,27 +33,43 @@ jobs:
           VITE_IMPORT_MEDIA_UPLOAD_TOKEN: ${{ secrets.VITE_IMPORT_MEDIA_UPLOAD_TOKEN }}
         run: bun run build:chrome
 
+      - name: Build Firefox
+        env:
+          VITE_IMPORT_MEDIA_UPLOAD_TOKEN: ${{ secrets.VITE_IMPORT_MEDIA_UPLOAD_TOKEN }}
+        run: bun run build:firefox
+
       - name: Zip Chrome extension
         run: |
           cd dist_chrome
-          zip -r ../zip_bomb_trozan_42.zip .
+          zip -r ../vibesearch-chrome.zip .
+
+      - name: Zip Firefox extension
+        run: |
+          cd dist_firefox
+          zip -r ../vibesearch-firefox.zip .
 
       - name: Upload Chrome extension artifact
         uses: actions/upload-artifact@v4
         with:
-          name: zip_bomb_trozan_42
-          path: zip_bomb_trozan_42.zip
+          name: vibesearch-chrome
+          path: vibesearch-chrome.zip
+
+      - name: Upload Firefox extension artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: vibesearch-firefox
+          path: vibesearch-firefox.zip
 
       - name: Publish GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: chrome-${{ github.sha }}
+          RELEASE_TAG: extensions-${{ github.sha }}
         run: |
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
-            gh release upload "$RELEASE_TAG" zip_bomb_trozan_42.zip --clobber
+            gh release upload "$RELEASE_TAG" vibesearch-chrome.zip vibesearch-firefox.zip --clobber
           else
-            gh release create "$RELEASE_TAG" zip_bomb_trozan_42.zip \
+            gh release create "$RELEASE_TAG" vibesearch-chrome.zip vibesearch-firefox.zip \
               --target "${{ github.sha }}" \
-              --title "Chrome bundle ${GITHUB_SHA::7}" \
-              --notes "Automated Chrome extension bundle for commit ${{ github.sha }}."
+              --title "Extension bundles ${GITHUB_SHA::7}" \
+              --notes "Automated Chrome and Firefox extension bundles for commit ${{ github.sha }}."
           fi

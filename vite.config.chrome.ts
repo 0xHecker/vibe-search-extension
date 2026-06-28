@@ -5,7 +5,6 @@ import { resolve } from "path";
 import baseConfig from "./vite.config.base";
 import baseManifest from "./manifest.base.json";
 import chromeManifest from "./manifest.chrome.json";
-import { copyOrtWasm } from "./custom-vite-plugins";
 import pkg from "./package.json";
 
 const isDev = process.env.NODE_ENV !== "production";
@@ -48,7 +47,6 @@ const chromeConfig = defineConfig({
       manifest,
       browser: "chrome",
     }),
-    copyOrtWasm(),
   ],
 });
 

@@ -13,8 +13,10 @@
 export const MODEL_REMOTE_HOST = "https://metadata-worker.watermelons.workers.dev";
 export const MODEL_REMOTE_PATH_TEMPLATE = "r2/{model}/";
 
-// Bundled (same-origin) ORT asyncify build filenames. The embedding worker pins
-// device "wasm", so this is the only ONNX Runtime variant that gets loaded.
+// ORT asyncify build filenames. The embedding worker pins device "wasm", so
+// this is the only ONNX Runtime variant that gets loaded. These names are only
+// used by the legacy base-URL path; the production worker passes Vite-emitted
+// asset URLs directly so we do not need a duplicate /ort copy.
 const ORT_WASM_FILE = "ort-wasm-simd-threaded.asyncify.wasm";
 const ORT_MJS_FILE = "ort-wasm-simd-threaded.asyncify.mjs";
 
@@ -45,9 +47,12 @@ type EmbeddingWorkerRuntime = {
 };
 
 export type ConfigureEmbeddingRuntimeOptions = {
-  // Same-origin base URL (e.g. chrome-extension://<id>/ort/) where the bundled
-  // ORT wasm assets are served. Loading ORT from here keeps every script
-  // same-origin so no blob: worker is created.
+  // Exact same-origin URLs for the ORT wasm factory and binary. Passing the
+  // Vite-emitted asset URLs lets embeddings reuse the asyncify WASM already
+  // emitted for OCR instead of carrying a second copy under /ort.
+  wasmPaths?: Exclude<WasmPaths, string>;
+  // Legacy same-origin base URL (e.g. chrome-extension://<id>/ort/) where the
+  // bundled ORT wasm assets are served.
   wasmBaseUrl?: string;
 };
 
@@ -68,7 +73,9 @@ export const configureEmbeddingWorkerRuntime = (
   // Load ORT from bundled same-origin files (not the jsdelivr CDN) and disable
   // the wasm-factory blob cache so nothing is loaded via a blob: URL.
   runtime.useWasmCache = false;
-  if (options.wasmBaseUrl) {
+  if (options.wasmPaths) {
+    wasm.wasmPaths = options.wasmPaths;
+  } else if (options.wasmBaseUrl) {
     const base = options.wasmBaseUrl.endsWith("/") ? options.wasmBaseUrl : `${options.wasmBaseUrl}/`;
     wasm.wasmPaths = {
       wasm: `${base}${ORT_WASM_FILE}`,

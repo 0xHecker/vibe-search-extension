@@ -13,6 +13,8 @@ import { VECTOR_DIMENSION } from "@src/common/constants";
 import { configureEmbeddingWorkerRuntime } from "@src/services/embedding-worker-runtime";
 import { planLengthAwareBatches } from "@src/search-core/embedding-batching";
 import type { EmbeddingWorkerRequest, EmbeddingWorkerResponse } from "./embedding-worker-protocol";
+import ortWasmUrl from "onnxruntime-web/ort-wasm-simd-threaded.asyncify.wasm?url";
+import ortMjsUrl from "onnxruntime-web/ort-wasm-simd-threaded.asyncify.mjs?url";
 
 // The model is onnx-community/mdbr-leaf-ir-ONNX, mirrored to our R2 bucket and
 // served via the metadata worker (see embedding-worker-runtime.ts for the host
@@ -59,9 +61,12 @@ let consecutiveFailures = 0;
 let circuitOpenUntil = 0;
 
 configureEmbeddingWorkerRuntime(env, {
-  // self.location is the worker's chrome-extension:// URL; the ORT wasm assets
-  // are emitted to /ort/ by the copy-ort-wasm build plugin.
-  wasmBaseUrl: new URL("/ort/", self.location.href).href,
+  // Vite emits these as chrome-extension:// same-origin assets and reuses the
+  // asyncify WASM that is already present for OCR, avoiding a second /ort copy.
+  wasmPaths: {
+    wasm: new URL(ortWasmUrl, self.location.href).href,
+    mjs: new URL(ortMjsUrl, self.location.href).href,
+  },
 });
 
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));

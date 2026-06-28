@@ -48,6 +48,22 @@ test("embedding worker points ONNX at bundled same-origin wasm when a base URL i
   });
 });
 
+test("embedding worker accepts exact Vite-emitted ONNX wasm asset URLs", () => {
+  const runtime = makeRuntime();
+
+  configureEmbeddingWorkerRuntime(runtime, {
+    wasmPaths: {
+      wasm: "chrome-extension://abc/assets/ort-wasm-simd-threaded.asyncify-hash.wasm",
+      mjs: "chrome-extension://abc/assets/ort-wasm-simd-threaded.asyncify-hash.mjs",
+    },
+  });
+
+  expect(runtime.backends.onnx.wasm.wasmPaths).toEqual({
+    wasm: "chrome-extension://abc/assets/ort-wasm-simd-threaded.asyncify-hash.wasm",
+    mjs: "chrome-extension://abc/assets/ort-wasm-simd-threaded.asyncify-hash.mjs",
+  });
+});
+
 test("embedding worker normalizes a base URL without a trailing slash", () => {
   const runtime = makeRuntime();
 

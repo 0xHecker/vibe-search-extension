@@ -33,15 +33,15 @@ jobs:
           VITE_IMPORT_MEDIA_UPLOAD_TOKEN: ${{ secrets.VITE_IMPORT_MEDIA_UPLOAD_TOKEN }}
         run: bun run build:chrome
 
-      - name: Build Firefox
-        env:
-          VITE_IMPORT_MEDIA_UPLOAD_TOKEN: ${{ secrets.VITE_IMPORT_MEDIA_UPLOAD_TOKEN }}
-        run: bun run build:firefox
-
       - name: Zip Chrome extension
         run: |
           cd dist_chrome
           zip -r ../vibesearch-chrome.zip .
+
+      - name: Build Firefox
+        env:
+          VITE_IMPORT_MEDIA_UPLOAD_TOKEN: ${{ secrets.VITE_IMPORT_MEDIA_UPLOAD_TOKEN }}
+        run: bun run build:firefox
 
       - name: Zip Firefox extension
         run: |

@@ -5,6 +5,7 @@ import {
   REC_MODEL_NAME,
   getOcrModelUrl,
 } from "@src/services/ocr-model-config";
+import { getOcrOrtWasmPaths } from "@src/services/ocr-runtime";
 
 type ModelFetchPayload = {
   status: number;
@@ -42,6 +43,8 @@ type SandboxMessage =
 type OcrRunner = {
   predict(input: unknown, params?: Record<string, unknown>): Promise<OcrResult[]>;
 };
+
+const OCR_ORT_WASM_PATHS = getOcrOrtWasmPaths(new URL("/ocr-ort/", window.location.href).href);
 
 let runnerPromise: Promise<OcrRunner> | null = null;
 const pendingModelFetches = new Map<
@@ -111,6 +114,11 @@ const getRunner = async (): Promise<OcrRunner> => {
       fetch: fetchModelThroughParent,
       ortOptions: {
         backend: "wasm",
+        // PaddleOCR types this as a string, but its bundled onnxruntime-web
+        // accepts the real `{ mjs, wasm }` shape. Use it so OCR loads the
+        // asyncify runtime explicitly instead of inferring the heavier jsep
+        // runtime from the bundled module URL.
+        wasmPaths: OCR_ORT_WASM_PATHS as unknown as string,
         numThreads: 1,
         simd: true,
         proxy: false,

@@ -152,7 +152,7 @@ const SearchResultsComponent = ({
 
   return (
     <TooltipProvider>
-      <div className="w-full max-w-[1090px] mx-auto mt-3 pb-16">
+      <div className="w-full max-w-[1090px] mx-auto mt-1 pb-16">
         <div className="mb-3 flex items-center justify-end px-4">
           <ViewToggle view={viewMode} onViewChange={setViewMode} />
         </div>

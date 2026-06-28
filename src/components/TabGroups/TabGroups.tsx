@@ -455,7 +455,7 @@ const TabGroupsComponent = ({
 
   return (
     <TooltipProvider>
-        <div ref={containerRef} className="w-full h-fit max-w-[1090px] mx-auto mt-14 pb-14">
+        <div ref={containerRef} className="w-full h-fit max-w-[1090px] mx-auto mt-1 pb-14">
           {/* View toggle (top-right). The Organize/drag toggle is a floating
               control pinned at bottom-left (rendered below) with an "O" shortcut. */}
           <div className="flex items-center justify-end gap-2 mb-4 px-4">

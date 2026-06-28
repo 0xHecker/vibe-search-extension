@@ -46,7 +46,7 @@ import type {
   QuerySortOrder,
   RankQueryCursor,
 } from "@src/search-core/contracts";
-import { ArchiveRestore, ArrowLeft, Bookmark, ChevronDown, ChevronRight as ChevronRightIcon, GitFork, Lock, Plus, Settings, Share2, Shield, Globe2, XIcon } from "lucide-react";
+import { ArchiveRestore, ArrowLeft, Bookmark, ChevronDown, ChevronRight as ChevronRightIcon, Eye, EyeOff, GitFork, Lock, Plus, RefreshCw, Settings, Share2, Shield, Globe2, XIcon } from "lucide-react";
 import { Toaster } from "sonner";
 import {
   PRIVATE_PASSWORD_MIN_LENGTH,
@@ -221,6 +221,24 @@ const sortFolders = (list: FolderDocType[]) =>
     return a.createdAt - b.createdAt;
   });
 
+const RECOVERY_QUESTION_SUGGESTIONS = [
+  "What was the name of your first pet?",
+  "What city were you born in?",
+  "What was the name of your first teacher?",
+  "What is your favorite movie?",
+  "What was the name of your primary school?",
+  "What is your favorite food?",
+  "What street did you grow up on?",
+  "What is your favorite book?",
+  "What was your childhood nickname?",
+  "What is your favorite sports team?",
+];
+
+const pickTwoRecoveryQuestions = (): [string, string] => {
+  const shuffled = [...RECOVERY_QUESTION_SUGGESTIONS].sort(() => Math.random() - 0.5);
+  return [shuffled[0], shuffled[1]];
+};
+
 const sortSpaces = (list: SpaceListItem[]) =>
   [...list].sort((a, b) => {
     if (!!a.isPrivate !== !!b.isPrivate) return a.isPrivate ? 1 : -1;
@@ -276,6 +294,7 @@ const SearchInner = () => {
   const [unlockDialogOpen, setUnlockDialogOpen] = useState(false);
   const [unlockPassword, setUnlockPassword] = useState("");
   const [unlockConfirmPassword, setUnlockConfirmPassword] = useState("");
+  const [showPassword, setShowPassword] = useState(false);
   const [unlockQuestion1, setUnlockQuestion1] = useState("");
   const [unlockQuestion2, setUnlockQuestion2] = useState("");
   const [unlockAnswer1, setUnlockAnswer1] = useState("");
@@ -1007,6 +1026,31 @@ const SearchInner = () => {
     setUnlockDialogError(null);
     setUnlockDialogLoading(false);
   }, []);
+
+  const shuffleRecoveryQuestions = useCallback(() => {
+    const [question1, question2] = pickTwoRecoveryQuestions();
+    setUnlockQuestion1(question1);
+    setUnlockQuestion2(question2);
+    setUnlockAnswer1("");
+    setUnlockAnswer2("");
+  }, []);
+
+  // Pre-fill two easy suggested questions when the setup dialog opens so users
+  // aren't staring at empty fields. Only seeds when both are blank, so it never
+  // overwrites anything the user typed (they can clear and write their own).
+  useEffect(() => {
+    if (
+      unlockDialogOpen &&
+      unlockDialogMode === "setup" &&
+      !unlockQuestion1 &&
+      !unlockQuestion2
+    ) {
+      const [question1, question2] = pickTwoRecoveryQuestions();
+      setUnlockQuestion1(question1);
+      setUnlockQuestion2(question2);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [unlockDialogOpen, unlockDialogMode]);
 
   const handleSelectSpace = useCallback(
     async (space: SpaceListItem) => {
@@ -2500,7 +2544,16 @@ const SearchInner = () => {
       void handleSelectSpace(space as SpaceListItem);
     },
     selectSpaceGroup: (group) => handleSelectSpaceGroup(group),
-    selectFolder: (folderId) => setSelectedFolderId(folderId),
+    selectFolder: (folderId) => {
+      // Selecting a tab group narrows the browse view to that folder, so the
+      // items must be re-queried for it (the browse query only loads a limited
+      // page across the scope). Bump refreshToken to re-run executeQuery, the
+      // same trigger the space / space-group handlers use. Without this the
+      // folder shows whatever was already loaded — often nothing — until a
+      // full page reload re-runs the query.
+      setSelectedFolderId(folderId);
+      setRefreshToken((value) => value + 1);
+    },
     toggleSpaceGroupCollapse: (group) => { void toggleSpaceGroupCollapsed(group); },
     toggleFolderCollapse: async (folder) => {
       try {
@@ -3018,7 +3071,7 @@ const SearchInner = () => {
       <button
         onClick={togglePanel}
         className={cn(
-          "fixed top-34 z-50 flex size-10 items-center justify-center rounded-semi bg-background-page-secondary shadow-sm shadow-foreground-muted/60 transition-[transform,opacity,background-color,box-shadow] duration-150 ease-out group cursor-pointer focus-visible:ring-2 focus-visible:ring-border-neutral/80 focus-visible:ring-offset-1",
+          "fixed top-34 p-1 z-50 shadow-sm shadow-foreground-muted/60 rounded-semi bg-background-page-secondary transition-all duration-400 ease-in-out group cursor-pointer hover:bg-background-highlight focus-visible:ring-2 focus-visible:ring-border-neutral/80 focus-visible:ring-offset-1",
           {
             "left-[calc(1rem+240px+8px)]": isOpen,
             "left-2": !isOpen,
@@ -3029,7 +3082,7 @@ const SearchInner = () => {
         )}
       >
         <ChevronRight
-          className={cn("h-5 w-5 transition-[transform,color] duration-150 ease-out text-foreground-tertiary", {
+          className={cn("h-5 w-5 transition-all duration-300 text-foreground-tertiary group-hover:text-foreground-secondary", {
             "rotate-180": isOpen,
           })}
         />
@@ -3151,22 +3204,37 @@ const SearchInner = () => {
 
       <div className="w-full max-w-5xl mx-auto mt-3 px-1">
         <div className="mt-2 flex items-center justify-between gap-3 text-xs text-foreground-secondary">
-          <div className="truncate">
-            {isLoading
-              ? "Searching local data..."
-              : `${resultMeta.total}${resultMeta.totalIsExact ? "" : "+"} result${resultMeta.total === 1 && resultMeta.totalIsExact ? "" : "s"} • space:${activeSpace?.name || "Public"} • scope:${requestedScope} • mode:${resultMeta.mode} • page ${resultMeta.page} • ${resultMeta.lexicalHits} lexical hit${resultMeta.lexicalHits === 1 ? "" : "s"}${
-                  resultModeFeatures.vector
-                    ? ` • ${resultMeta.vectorHits} vector hit${resultMeta.vectorHits === 1 ? "" : "s"}`
-                    : ""
-                }${resultMeta.hasMore ? " • more available" : ""}${
-                  isDebugSearchEnabled && topDebugVectorHit
-                    ? ` • top vector ${topDebugVectorHit.score.toFixed(3)}`
-                    : ""
-                }${
-                  isDebugSearchEnabled ? ` • stale suppressed ${staleSuppressedCount}` : ""
-                }`}
-            {resultMeta.vectorError ? ` • vector error: ${resultMeta.vectorError}` : ""}
-            {error ? ` • error: ${error}` : ""}
+          <div className="flex min-w-0 items-center">
+            {isLoading ? (
+              <span className="text-foreground-tertiary">Searching local data…</span>
+            ) : (
+              <>
+                <span className="shrink-0 font-medium tabular-nums text-foreground-neutral">
+                  {resultMeta.total.toLocaleString()}
+                  {resultMeta.totalIsExact ? "" : "+"} result
+                  {resultMeta.total === 1 && resultMeta.totalIsExact ? "" : "s"}
+                </span>
+                <span className="truncate text-foreground-tertiary">
+                  {` · Page ${resultMeta.page}`}
+                  {resultMeta.hasMore ? " · more available" : ""}
+                  {isDebugSearchEnabled
+                    ? ` · ${requestedScope} · ${resultMeta.mode} · ${resultMeta.lexicalHits} lexical${
+                        resultModeFeatures.vector ? ` · ${resultMeta.vectorHits} vector` : ""
+                      }${topDebugVectorHit ? ` · top ${topDebugVectorHit.score.toFixed(3)}` : ""} · stale ${staleSuppressedCount}`
+                    : ""}
+                </span>
+                {resultMeta.vectorError ? (
+                  <span className="shrink-0 text-foreground-danger" title={resultMeta.vectorError}>
+                    {" · vector error"}
+                  </span>
+                ) : null}
+                {error ? (
+                  <span className="shrink-0 text-foreground-danger" title={error}>
+                    {" · error"}
+                  </span>
+                ) : null}
+              </>
+            )}
           </div>
           <div className="flex items-center gap-2 shrink-0">
             <Button
@@ -3204,9 +3272,9 @@ const SearchInner = () => {
           }
         }}
       >
-        <DialogContent className="flex w-full max-w-md flex-col gap-5 rounded-3xl p-6 sm:max-w-md">
+        <DialogContent className="flex w-full max-w-lg flex-col gap-5 rounded-2xl p-6 sm:max-w-lg">
           <DialogHeader>
-            <div className="mb-1.5 flex size-12 items-center justify-center rounded-2xl bg-foreground-neutral text-background-neutral shadow-[0_6px_16px_-4px_rgba(0,0,0,0.3)]">
+            <div className="mb-1.5 flex size-12 items-center justify-center rounded-xl bg-foreground-neutral text-background-neutral shadow-sm">
               <Lock size={20} />
             </div>
             <DialogTitle className="font-sans-bold text-xl tracking-[-0.01em] text-foreground-neutral">
@@ -3224,38 +3292,69 @@ const SearchInner = () => {
                   : "Enter your password to view private folders and tabs."}
             </DialogDescription>
           </DialogHeader>
-          <div className="space-y-3 py-1">
+          <div className="space-y-4 py-1">
             {(unlockDialogMode === "unlock" || unlockDialogMode === "setup") && (
-              <Input
-                type="password"
-                value={unlockPassword}
-                onChange={(event) => setUnlockPassword(event.target.value)}
-                placeholder="Password"
-                autoFocus
-                onKeyDown={(event) => {
-                  if (event.key === "Enter") {
-                    void submitPrivateAccess();
-                  }
-                }}
-              />
+              <div className="space-y-1.5">
+                <label
+                  htmlFor="private-password"
+                  className="text-[13px] font-medium text-foreground-neutral"
+                >
+                  {unlockDialogMode === "setup" ? "Create a password" : "Password"}
+                </label>
+                <div className="relative">
+                  <Input
+                    id="private-password"
+                    type={showPassword ? "text" : "password"}
+                    value={unlockPassword}
+                    onChange={(event) => setUnlockPassword(event.target.value)}
+                    placeholder={
+                      unlockDialogMode === "setup"
+                        ? "At least 8 characters"
+                        : "Enter your password"
+                    }
+                    autoFocus
+                    className="pr-10"
+                    onKeyDown={(event) => {
+                      if (event.key === "Enter") {
+                        void submitPrivateAccess();
+                      }
+                    }}
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setShowPassword((value) => !value)}
+                    aria-label={showPassword ? "Hide password" : "Show password"}
+                    className="absolute right-1 top-1/2 grid size-8 -translate-y-1/2 place-items-center rounded-md text-foreground-tertiary outline-none transition-colors hover:text-foreground-neutral"
+                  >
+                    {showPassword ? <EyeOff size={16} /> : <Eye size={16} />}
+                  </button>
+                </div>
+              </div>
             )}
             {(unlockDialogMode === "setup" || unlockDialogMode === "recovery") && (
-              <Input
-                type="password"
-                value={unlockConfirmPassword}
-                onChange={(event) => setUnlockConfirmPassword(event.target.value)}
-                placeholder={
-                  unlockDialogMode === "setup" ? "Confirm password" : "Confirm new password"
-                }
-                onKeyDown={(event) => {
-                  if (event.key === "Enter") {
-                    void submitPrivateAccess();
-                  }
-                }}
-              />
+              <div className="space-y-1.5">
+                <label
+                  htmlFor="private-confirm"
+                  className="text-[13px] font-medium text-foreground-neutral"
+                >
+                  {unlockDialogMode === "setup" ? "Confirm password" : "Confirm new password"}
+                </label>
+                <Input
+                  id="private-confirm"
+                  type={showPassword ? "text" : "password"}
+                  value={unlockConfirmPassword}
+                  onChange={(event) => setUnlockConfirmPassword(event.target.value)}
+                  placeholder="Re-enter password"
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter") {
+                      void submitPrivateAccess();
+                    }
+                  }}
+                />
+              </div>
             )}
             {unlockDialogMode === "setup" && (
-              <div className="space-y-2.5 border-t border-border-neutral-faded pt-4">
+              <div className="space-y-3 border-t border-border-neutral-faded pt-4">
                 <div>
                   <p className="text-[11px] font-semibold uppercase tracking-[0.08em] text-foreground-tertiary">
                     Recovery questions
@@ -3264,26 +3363,48 @@ const SearchInner = () => {
                     The only way back in if you forget your password.
                   </p>
                 </div>
-                <Input
-                  value={unlockQuestion1}
-                  onChange={(event) => setUnlockQuestion1(event.target.value)}
-                  placeholder="Recovery question 1"
-                />
-                <Input
-                  value={unlockAnswer1}
-                  onChange={(event) => setUnlockAnswer1(event.target.value)}
-                  placeholder="Answer 1"
-                />
-                <Input
-                  value={unlockQuestion2}
-                  onChange={(event) => setUnlockQuestion2(event.target.value)}
-                  placeholder="Recovery question 2"
-                />
-                <Input
-                  value={unlockAnswer2}
-                  onChange={(event) => setUnlockAnswer2(event.target.value)}
-                  placeholder="Answer 2"
-                />
+                <div className="flex gap-3">
+                  <span className="mt-2 grid size-6 shrink-0 place-items-center rounded-full bg-foreground-neutral text-[11px] font-semibold text-background-neutral">
+                    1
+                  </span>
+                  <div className="flex-1 space-y-2">
+                    <Input
+                      value={unlockQuestion1}
+                      onChange={(event) => setUnlockQuestion1(event.target.value)}
+                      placeholder="Security question"
+                    />
+                    <Input
+                      value={unlockAnswer1}
+                      onChange={(event) => setUnlockAnswer1(event.target.value)}
+                      placeholder="Answer"
+                    />
+                  </div>
+                </div>
+                <div className="flex gap-3">
+                  <span className="mt-2 grid size-6 shrink-0 place-items-center rounded-full bg-foreground-neutral text-[11px] font-semibold text-background-neutral">
+                    2
+                  </span>
+                  <div className="flex-1 space-y-2">
+                    <Input
+                      value={unlockQuestion2}
+                      onChange={(event) => setUnlockQuestion2(event.target.value)}
+                      placeholder="Security question"
+                    />
+                    <Input
+                      value={unlockAnswer2}
+                      onChange={(event) => setUnlockAnswer2(event.target.value)}
+                      placeholder="Answer"
+                    />
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  onClick={shuffleRecoveryQuestions}
+                  className="mx-auto flex w-fit items-center gap-1.5 rounded-md border border-border-neutral-faded px-2.5 py-1.5 text-xs font-medium text-foreground-secondary outline-none transition-colors hover:bg-background-neutral-faded hover:text-foreground-neutral"
+                >
+                  <RefreshCw size={12} />
+                  Shuffle questions
+                </button>
               </div>
             )}
             {unlockDialogMode === "recovery" && (

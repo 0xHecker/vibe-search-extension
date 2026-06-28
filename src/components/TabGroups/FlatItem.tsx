@@ -500,18 +500,13 @@ export const FlatItem = memo(({
         </ContextMenuTrigger>
 
         <ContextMenuContent className="min-w-[170px]">
-          <ContextMenuItem onSelect={handleSelect}>Select</ContextMenuItem>
-          <ContextMenuSeparator />
+          <ContextMenuItem onSelect={handleOpen}>Open in new tab</ContextMenuItem>
           <ContextMenuItem onSelect={handleCopy}>Copy URL</ContextMenuItem>
-          <ContextMenuItem onSelect={handleOpen}>Open in New Tab</ContextMenuItem>
-          <ContextMenuItem onSelect={() => setIsTagEditorOpen(true)}>Edit tags</ContextMenuItem>
+          <ContextMenuItem onSelect={() => setIsEditorOpen(true)}>Edit</ContextMenuItem>
           <ContextMenuItem onSelect={handleRefreshMetadata}>Refresh metadata</ContextMenuItem>
           {hasOcrImage && (
             <ContextMenuItem onSelect={handleRerunOcr}>Re-run OCR</ContextMenuItem>
           )}
-          <ContextMenuItem onSelect={() => setIsPreviewOpen(true)}>
-            View in side panel
-          </ContextMenuItem>
           {moveSpaceOptions.length > 0 && <ContextMenuSeparator />}
           {moveSpaceOptions.length > 0 && (
             <ContextMenuSub>
@@ -533,9 +528,8 @@ export const FlatItem = memo(({
             </ContextMenuSub>
           )}
           <ContextMenuSeparator />
-          <ContextMenuItem onSelect={() => setIsEditorOpen(true)}>Edit</ContextMenuItem>
           <ContextMenuItem onSelect={() => setIsDeleteDialogOpen(true)} variant="destructive">
-            Delete from Current Tab Group
+            Delete from group
           </ContextMenuItem>
         </ContextMenuContent>
       </ContextMenu>

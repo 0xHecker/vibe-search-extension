@@ -45,7 +45,8 @@ import { resolveOpfsMedia, revokeObjectUrl } from "@src/services/media-storage";
 import { useDraggable, useDroppable, type DraggableAttributes, type DraggableSyntheticListeners } from "@dnd-kit/core";
 import type { SpaceMoveOption } from "./TabGroups";
 import type { QueryRankDebugScore } from "@src/search-core/contracts";
-import { resolveToastErrorMessage, withToast } from "@src/utils/toast-feedback";
+import { resolveToastErrorMessage, withToast, showSuccessToast, showErrorToast } from "@src/utils/toast-feedback";
+import { formatTabsForClipboard, getClipboardFormat } from "@src/pages/search/components/settings/clipboard-format";
 import { getYouTubeVideoIdFromUrl, normalizeIframeEmbedUrl } from "@src/utils/media-embed";
 import { appendOcrTextToTextContent } from "@src/services/ocr-text";
 
@@ -126,6 +127,19 @@ export const GridItem = memo(({
     toggleItem(item);
   };
 
+  const handleCopyUrl = async () => {
+    try {
+      await navigator.clipboard.writeText(
+        formatTabsForClipboard([{ title: item.title, url: item.url }], getClipboardFormat())
+      );
+      onCopy(item);
+      showSuccessToast("URL copied.", { tempo: "quick" });
+    } catch (err) {
+      console.error("Failed to copy URL:", err);
+      showErrorToast(resolveToastErrorMessage(err, "Failed to copy URL."));
+    }
+  };
+
   const renderMenu = () => (
     <DropdownMenu open={isMenuOpen} onOpenChange={handleMenuOpenChange}>
       <DropdownMenuTrigger asChild>
@@ -139,8 +153,7 @@ export const GridItem = memo(({
           <DotsVertical size={14} />
         </Button>
       </DropdownMenuTrigger>
-      <DropdownMenuContent sideOffset={4} align="start" className="min-w-[170px]">
-        <DropdownMenuItem onSelect={handleSelect}>Select</DropdownMenuItem>
+      <DropdownMenuContent sideOffset={4} align="start" className="min-w-[180px]">
         <DropdownMenuItem
           onSelect={() => {
             try {
@@ -150,16 +163,14 @@ export const GridItem = memo(({
             }
           }}
         >
-          Open in New Tab
+          Open in new tab
         </DropdownMenuItem>
-        <DropdownMenuItem onSelect={() => setIsTagEditorOpen(true)}>Edit tags</DropdownMenuItem>
+        <DropdownMenuItem onSelect={handleCopyUrl}>Copy URL</DropdownMenuItem>
+        <DropdownMenuItem onSelect={() => setIsEditorOpen(true)}>Edit</DropdownMenuItem>
         <DropdownMenuItem onSelect={handleRefreshMetadata}>Refresh metadata</DropdownMenuItem>
         {hasOcrImage && (
           <DropdownMenuItem onSelect={handleRerunOcr}>Re-run OCR</DropdownMenuItem>
         )}
-        <DropdownMenuItem onSelect={() => setIsPreviewOpen(true)}>
-          View in side panel
-        </DropdownMenuItem>
         {moveSpaceOptions.length > 0 && <DropdownMenuSeparator />}
         {moveSpaceOptions.length > 0 && (
           <DropdownMenuSub>
@@ -195,7 +206,7 @@ export const GridItem = memo(({
             </DropdownMenuSubContent>
           </DropdownMenuSub>
         )}
-        <DropdownMenuItem onSelect={() => setIsEditorOpen(true)}>Edit</DropdownMenuItem>
+        <DropdownMenuSeparator />
         <DropdownMenuItem
           variant="destructive"
           onSelect={() => {
@@ -203,7 +214,7 @@ export const GridItem = memo(({
             setIsDeleteDialogOpen(true);
           }}
         >
-          Delete from Current Tab Group
+          Delete from group
         </DropdownMenuItem>
         <DropdownMenuItem
           variant="destructive"
@@ -212,7 +223,7 @@ export const GridItem = memo(({
             setIsDeleteDialogOpen(true);
           }}
         >
-          Delete from All Tab Groups
+          Delete everywhere
         </DropdownMenuItem>
       </DropdownMenuContent>
     </DropdownMenu>
@@ -763,8 +774,6 @@ export const GridItem = memo(({
       </ContextMenuTrigger>
 
       <ContextMenuContent className="min-w-[170px]">
-        <ContextMenuItem onSelect={handleSelect}>Select</ContextMenuItem>
-        <ContextMenuSeparator />
         <ContextMenuItem
           onSelect={() => {
             try {
@@ -774,16 +783,14 @@ export const GridItem = memo(({
             }
           }}
         >
-          Open in New Tab
+          Open in new tab
         </ContextMenuItem>
-        <ContextMenuItem onSelect={() => setIsTagEditorOpen(true)}>Edit tags</ContextMenuItem>
+        <ContextMenuItem onSelect={handleCopyUrl}>Copy URL</ContextMenuItem>
+        <ContextMenuItem onSelect={() => setIsEditorOpen(true)}>Edit</ContextMenuItem>
         <ContextMenuItem onSelect={handleRefreshMetadata}>Refresh metadata</ContextMenuItem>
         {hasOcrImage && (
           <ContextMenuItem onSelect={handleRerunOcr}>Re-run OCR</ContextMenuItem>
         )}
-        <ContextMenuItem onSelect={() => setIsPreviewOpen(true)}>
-          View in side panel
-        </ContextMenuItem>
         {moveSpaceOptions.length > 0 && <ContextMenuSeparator />}
         {moveSpaceOptions.length > 0 && (
           <ContextMenuSub>
@@ -804,7 +811,6 @@ export const GridItem = memo(({
             </ContextMenuSubContent>
           </ContextMenuSub>
         )}
-        <ContextMenuItem onSelect={() => setIsEditorOpen(true)}>Edit</ContextMenuItem>
         <ContextMenuSeparator />
         <ContextMenuItem
           onSelect={() => {
@@ -813,7 +819,7 @@ export const GridItem = memo(({
           }}
           variant="destructive"
         >
-          Delete from Current Tab Group
+          Delete from group
         </ContextMenuItem>
         <ContextMenuItem
           onSelect={() => {
@@ -822,7 +828,7 @@ export const GridItem = memo(({
           }}
           variant="destructive"
         >
-          Delete from All Tab Groups
+          Delete everywhere
         </ContextMenuItem>
       </ContextMenuContent>
       {isDeleteDialogOpen && (

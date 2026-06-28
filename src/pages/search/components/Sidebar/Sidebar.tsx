@@ -833,6 +833,15 @@ export const Sidebar = React.memo(function Sidebar({
           }}
         >
           {(dnd) => (
+            <TabGroupContextMenu
+              folder={folder}
+              hasChildren={hasChildren}
+              canMoveUp={siblingIndex > 0}
+              canMoveDown={siblingIndex >= 0 && siblingIndex < siblingCount - 1}
+              canNest={depth < 5}
+              spaceMoveTargets={spaceMoveTargets}
+              handlers={tabGroupHandlers}
+            >
             <div
               ref={dnd.setNodeRef}
               {...dnd.attributes}
@@ -885,23 +894,12 @@ export const Sidebar = React.memo(function Sidebar({
                 <span className="min-w-0 flex-1 truncate font-semibold">{folder.name}</span>
               )}
             </div>
+            </TabGroupContextMenu>
           )}
         </SidebarDnd>
       );
 
-      const menu = (
-        <TabGroupContextMenu
-          folder={folder}
-          hasChildren={hasChildren}
-          canMoveUp={siblingIndex > 0}
-          canMoveDown={siblingIndex >= 0 && siblingIndex < siblingCount - 1}
-          canNest={depth < 5}
-          spaceMoveTargets={spaceMoveTargets}
-          handlers={tabGroupHandlers}
-        >
-          {row}
-        </TabGroupContextMenu>
-      );
+      const menu = row;
 
       return (
         <div key={folder.id} className="space-y-0.5">
@@ -966,11 +964,23 @@ export const Sidebar = React.memo(function Sidebar({
 
       const row = (
         <SidebarDnd
+          key={space.id}
           id={`sb-space-${space.id}`}
           data={{ surface: "sidebar", kind: "space", id: space.id, spaceGroupId: space.spaceGroupId ?? null }}
           disabled={!canDelete}
         >
           {(dnd) => (
+            <SpaceContextMenu
+              space={space}
+              canMoveUp={canMoveUp}
+              canMoveDown={canMoveDown}
+              canPin={canPin}
+              canRename={canRename}
+              canDelete={canDelete}
+              canChangePassword={canChangePassword}
+              groupTargets={groupTargets}
+              handlers={spaceHandlers}
+            >
             <div
               ref={dnd.setNodeRef}
               {...dnd.attributes}
@@ -1023,26 +1033,12 @@ export const Sidebar = React.memo(function Sidebar({
                 </span>
               )}
             </div>
+            </SpaceContextMenu>
           )}
         </SidebarDnd>
       );
 
-      return (
-        <SpaceContextMenu
-          key={space.id}
-          space={space}
-          canMoveUp={canMoveUp}
-          canMoveDown={canMoveDown}
-          canPin={canPin}
-          canRename={canRename}
-          canDelete={canDelete}
-          canChangePassword={canChangePassword}
-          groupTargets={groupTargets}
-          handlers={spaceHandlers}
-        >
-          {row}
-        </SpaceContextMenu>
-      );
+      return row;
     },
     [
       activeSpaceGroupId,
@@ -1085,6 +1081,12 @@ export const Sidebar = React.memo(function Sidebar({
       const row = (
         <SidebarDnd id={`sb-group-${group.id}`} data={{ surface: "sidebar", kind: "spaceGroup", id: group.id, name: group.name, collapsed: group.isCollapsed, springId: group.id }}>
           {(dnd) => (
+            <SpaceGroupContextMenu
+              group={group}
+              canMoveUp={canMoveUp}
+              canMoveDown={canMoveDown}
+              handlers={groupHandlers}
+            >
             <div
               ref={dnd.setNodeRef}
               {...dnd.attributes}
@@ -1140,21 +1142,12 @@ export const Sidebar = React.memo(function Sidebar({
                 )}
               </button>
             </div>
+            </SpaceGroupContextMenu>
           )}
         </SidebarDnd>
       );
 
-      return (
-        <SpaceGroupContextMenu
-          key={group.id}
-          group={group}
-          canMoveUp={canMoveUp}
-          canMoveDown={canMoveDown}
-          handlers={groupHandlers}
-        >
-          {row}
-        </SpaceGroupContextMenu>
-      );
+      return row;
     },
     [
       activeSpaceGroupId,

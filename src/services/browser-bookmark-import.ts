@@ -143,6 +143,8 @@ const createFolder = (
   isLocked: false,
   isPinned: false,
   isCollapsed: false,
+  deletedAt: 0,
+  purgeAt: 0,
   isDirty: false,
   serverVersion: 0,
   createdAt,

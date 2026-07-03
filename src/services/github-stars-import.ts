@@ -136,6 +136,8 @@ export const buildGitHubStarsImportPlan = (
         isLocked: false,
         isPinned: false,
         isCollapsed: part.length > 300,
+        deletedAt: 0,
+        purgeAt: 0,
         isDirty: false,
         serverVersion: 0,
         createdAt: now,

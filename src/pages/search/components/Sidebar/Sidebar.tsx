@@ -35,6 +35,7 @@ import { ConfirmDialog } from "@src/components/ui/confirm-dialog";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@src/components/ui/dialog";
 import type { FolderDocType } from "@src/schemas/folder_schema";
 import type { SpaceGroupDocType } from "@src/schemas/space_group_schema";
+import type { BinEntry } from "@src/services/controllers/bin.controller";
 import { PUBLIC_SPACE_ID, PRIVATE_SPACE_ID } from "@src/common/spaces";
 import {
   type SidebarSpace,
@@ -98,6 +99,10 @@ export type SidebarHandlers = {
   moveSpaceToBin: (id: string) => Promise<void>;
   restoreSpaceFromBin: (id: string) => Promise<void>;
   deleteSpaceForever: (id: string) => Promise<void>;
+  restoreFolderFromBin: (id: string) => Promise<void>;
+  deleteFolderForever: (id: string) => Promise<void>;
+  restoreItemFromBin: (id: string) => Promise<void>;
+  deleteItemForever: (id: string) => Promise<void>;
   reorderSpaceGroups: (orderedIds: string[]) => Promise<void>;
   renameSpaceGroup: (id: string, name: string) => Promise<void>;
   deleteSpaceGroup: (id: string, mode: "moveToUngrouped" | "deleteContents") => Promise<void>;
@@ -120,7 +125,7 @@ export type SidebarProps = {
   activeSpaceId: string;
   activeSpaceGroupId: string | null;
   selectedFolderId: string | "all";
-  binSpaces: SidebarSpace[];
+  binEntries: BinEntry[];
   now: number;
   handlers: SidebarHandlers;
   /** Incremented by the page (e.g. Settings → Open bin) to open the Bin view. */
@@ -235,7 +240,7 @@ export const Sidebar = React.memo(function Sidebar({
   activeSpaceId,
   activeSpaceGroupId,
   selectedFolderId,
-  binSpaces,
+  binEntries,
   now,
   handlers,
   openBinNonce,
@@ -247,7 +252,7 @@ export const Sidebar = React.memo(function Sidebar({
   const [deleteSpaceGroupState, setDeleteSpaceGroupState] = React.useState<
     { group: SpaceGroupDocType; mode: "moveToUngrouped" | "deleteContents" } | null
   >(null);
-  const [deleteBinSpaceState, setDeleteBinSpaceState] = React.useState<{ space: SidebarSpace } | null>(null);
+  const [deleteBinEntryState, setDeleteBinEntryState] = React.useState<{ entry: BinEntry } | null>(null);
   const [binViewOpen, setBinViewOpen] = React.useState(false);
 
   // Allow the page (Settings → Open bin) to open the Bin view.
@@ -665,23 +670,35 @@ export const Sidebar = React.memo(function Sidebar({
     }
   }, [deleteSpaceGroupState, handlers]);
 
-  const confirmDeleteBinSpace = React.useCallback(async () => {
-    if (!deleteBinSpaceState) return;
-    const { space } = deleteBinSpaceState;
-    setDeleteBinSpaceState(null);
+  const confirmDeleteBinEntry = React.useCallback(async () => {
+    if (!deleteBinEntryState) return;
+    const { entry } = deleteBinEntryState;
+    setDeleteBinEntryState(null);
     try {
-      await handlers.deleteSpaceForever(space.id);
+      if (entry.kind === "space") {
+        await handlers.deleteSpaceForever(entry.id);
+      } else if (entry.kind === "folder") {
+        await handlers.deleteFolderForever(entry.id);
+      } else {
+        await handlers.deleteItemForever(entry.id);
+      }
     } catch (deleteError) {
-      console.error("[Sidebar] purge space failed", deleteError);
+      console.error("[Sidebar] purge bin entry failed", deleteError);
     }
-  }, [deleteBinSpaceState, handlers]);
+  }, [deleteBinEntryState, handlers]);
 
-  const restoreBinSpace = React.useCallback(
-    async (space: SidebarSpace) => {
+  const restoreBinEntry = React.useCallback(
+    async (entry: BinEntry) => {
       try {
-        await handlers.restoreSpaceFromBin(space.id);
+        if (entry.kind === "space") {
+          await handlers.restoreSpaceFromBin(entry.id);
+        } else if (entry.kind === "folder") {
+          await handlers.restoreFolderFromBin(entry.id);
+        } else {
+          await handlers.restoreItemFromBin(entry.id);
+        }
       } catch (restoreError) {
-        console.error("[Sidebar] restore space failed", restoreError);
+        console.error("[Sidebar] restore bin entry failed", restoreError);
       }
     },
     [handlers]
@@ -1075,7 +1092,7 @@ export const Sidebar = React.memo(function Sidebar({
         onMoveDown: () => void moveSpaceGroupDown(group),
         onShare: () => handlers.shareSpaceGroup(group),
         onDelete: () =>
-          setDeleteSpaceGroupState({ group, mode: "moveToUngrouped" }),
+          setDeleteSpaceGroupState({ group, mode: "deleteContents" }),
       };
 
       const row = (
@@ -1319,9 +1336,9 @@ export const Sidebar = React.memo(function Sidebar({
           >
             <Trash2 size={14} className="shrink-0 text-foreground-tertiary" />
             <span className="min-w-0 flex-1 truncate">Bin</span>
-            {binSpaces.length > 0 && (
+            {binEntries.length > 0 && (
               <span className="shrink-0 rounded-full bg-background-page-secondary px-1.5 py-0.5 text-[10px] font-medium text-foreground-tertiary">
-                {binSpaces.length}
+                {binEntries.length}
               </span>
             )}
           </button>
@@ -1331,10 +1348,10 @@ export const Sidebar = React.memo(function Sidebar({
       <BinView
         open={binViewOpen}
         onOpenChange={setBinViewOpen}
-        spaces={binSpaces}
+        entries={binEntries}
         now={now}
-        onRestore={(space) => void restoreBinSpace(space)}
-        onRequestDelete={(space) => setDeleteBinSpaceState({ space })}
+        onRestore={(entry) => void restoreBinEntry(entry)}
+        onRequestDelete={(entry) => setDeleteBinEntryState({ entry })}
       />
 
       {/* Delete tab group confirm */}
@@ -1342,18 +1359,20 @@ export const Sidebar = React.memo(function Sidebar({
         open={!!deleteFolderState}
         onOpenChange={(open) => !open && setDeleteFolderState(null)}
         title={
-          deleteFolderState ? `Delete "${deleteFolderState.folder.name}"?` : ""
+          deleteFolderState ? `Move "${deleteFolderState.folder.name}" to Bin?` : ""
         }
         description={
           deleteFolderState?.itemCount === null
             ? "Counting items…"
-            : `This removes the tab group from the sidebar${
-                deleteFolderState?.alsoDeleteItems && deleteFolderState?.itemCount
-                  ? ` and permanently deletes ${deleteFolderState.itemCount} item(s) inside.`
-                  : ". Items inside stay searchable under \"All tab groups.\""
+            : `This moves the tab group and every nested tab group or folder inside it to Bin${
+                deleteFolderState?.alsoDeleteItems
+                  ? `. ${deleteFolderState.itemCount} saved tab${
+                      deleteFolderState.itemCount === 1 ? "" : "s"
+                    } inside will be removed from search and can be recovered from Bin.`
+                  : ". Saved tabs inside stay searchable under \"All tab groups.\""
               }`
         }
-        confirmLabel="Delete"
+        confirmLabel="Move to Bin"
         variant="danger"
         onConfirm={confirmDeleteFolder}
       />
@@ -1363,7 +1382,7 @@ export const Sidebar = React.memo(function Sidebar({
         open={!!deleteSpaceState}
         onOpenChange={(open) => !open && setDeleteSpaceState(null)}
         title={deleteSpaceState ? `Move "${deleteSpaceState.space.name}" to bin?` : ""}
-        description="Removed from search and the sidebar. Recover from Bin for up to 30 days, then it's permanently deleted."
+        description="This moves the space to Bin with every tab group, folder, and saved item inside. It is removed from search and the sidebar now, recoverable for 30 days, then permanently deleted."
         confirmLabel="Move to Bin"
         variant="danger"
         onConfirm={confirmDeleteSpace}
@@ -1378,27 +1397,35 @@ export const Sidebar = React.memo(function Sidebar({
         title={deleteSpaceGroupState ? `Delete "${deleteSpaceGroupState.group.name}"?` : ""}
         description={
           deleteSpaceGroupState?.mode === "deleteContents"
-            ? "This will permanently delete the group and every space and tab group inside."
+            ? "This moves every space in the group to Bin, including all tab groups, folders, and saved items inside. Spaces are recoverable for 30 days, then permanently deleted."
             : "Spaces inside will move to Ungrouped. Their tab groups are kept."
         }
-        confirmLabel="Delete group"
+        confirmLabel={
+          deleteSpaceGroupState?.mode === "deleteContents" ? "Move group to Bin" : "Delete group"
+        }
         variant="danger"
         onConfirm={confirmDeleteSpaceGroup}
       />
 
-      {/* Delete bin space forever confirm */}
+      {/* Delete bin entry forever confirm */}
       <ConfirmDialog
-        open={!!deleteBinSpaceState}
-        onOpenChange={(open) => !open && setDeleteBinSpaceState(null)}
+        open={!!deleteBinEntryState}
+        onOpenChange={(open) => !open && setDeleteBinEntryState(null)}
         title={
-          deleteBinSpaceState
-            ? `Permanently delete "${deleteBinSpaceState.space.name}"?`
+          deleteBinEntryState
+            ? `Permanently delete "${deleteBinEntryState.entry.name}"?`
             : ""
         }
-        description="This cannot be undone. The space and all of its tab groups and items will be removed immediately."
+        description={
+          deleteBinEntryState?.entry.kind === "space"
+            ? "This cannot be undone. The space and all of its tab groups, folders, and saved items will be removed immediately."
+            : deleteBinEntryState?.entry.kind === "folder"
+              ? "This cannot be undone. The folder or tab group and every nested folder and saved item inside will be removed immediately."
+              : "This cannot be undone. This saved tab will be removed immediately."
+        }
         confirmLabel="Delete forever"
         variant="danger"
-        onConfirm={confirmDeleteBinSpace}
+        onConfirm={confirmDeleteBinEntry}
       />
 
       {/* New tab group inline dialog */}

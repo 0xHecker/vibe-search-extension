@@ -798,7 +798,9 @@ export class SpacesController {
     return { success: true, purgeAt };
   }
 
-  async restoreFromBin(payload: { id: string }): Promise<{ success: boolean }> {
+  async restoreFromBin(payload: {
+    id: string;
+  }): Promise<{ success: boolean; relocated?: boolean; message?: string }> {
     const db = await getDb();
     const id = (payload.id || "").trim();
     if (!id) return { success: false };
@@ -826,15 +828,30 @@ export class SpacesController {
       nextName = `${baseName} (restored ${index})`;
     }
     const patch: Partial<SpaceDocType> = { deletedAt: SPACE_NOT_BINNED, purgeAt: 0, updatedAt: now };
+    let relocated = false;
     if (nextName !== baseName) {
       patch.name = nextName;
       patch.slug = safeSlug(nextName, current.slug);
+    }
+    const originalGroupId = (current.spaceGroupId || "").trim();
+    if (originalGroupId && db.space_groups?.findOne) {
+      const groupDoc = await db.space_groups.findOne(originalGroupId).exec();
+      if (!groupDoc) {
+        patch.spaceGroupId = UNGROUPED_SPACE_GROUP_ID;
+        relocated = true;
+      }
     }
     await doc.patch(patch);
     try {
       chrome.runtime.sendMessage({ type: "DB_CHANGE", scope: "spaces" });
     } catch {}
-    return { success: true };
+    return {
+      success: true,
+      relocated,
+      message: relocated
+        ? "Heads up: the original space group is no longer available, so this space was restored to Ungrouped."
+        : undefined,
+    };
   }
 
   async listBinSpaces(): Promise<SpaceListItem[]> {

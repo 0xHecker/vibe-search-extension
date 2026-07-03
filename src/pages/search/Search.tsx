@@ -54,6 +54,7 @@ import {
   PUBLIC_SPACE_ID,
 } from "@src/common/spaces";
 import { Sidebar, type SidebarHandlers, type SidebarSpace } from "@src/pages/search/components/Sidebar/Sidebar";
+import type { BinEntry } from "@src/services/controllers/bin.controller";
 import { ShareDialog } from "@src/pages/search/components/share/ShareDialog";
 import { ImportSharedDialog } from "@src/pages/search/components/share/ImportSharedDialog";
 import { SettingsModal } from "@src/pages/search/components/settings/SettingsModal";
@@ -330,7 +331,7 @@ const SearchInner = () => {
   // writes and the background metadata pass.
   useBeforeUnloadGuard(browserBookmarksImporting || githubStarsImporting);
   const [folders, setFolders] = useState<FolderDocType[]>([]);
-  const [binSpaces, setBinSpaces] = useState<SpaceListItem[]>([]);
+  const [binEntries, setBinEntries] = useState<BinEntry[]>([]);
   const [items, setItems] = useState<ItemDocType[]>([]);
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -889,19 +890,19 @@ const SearchInner = () => {
     }
   }, []);
 
-  const loadBinSpaces = useCallback(async (): Promise<SpaceListItem[]> => {
+  const loadBinContents = useCallback(async (): Promise<BinEntry[]> => {
     try {
       const response = await chrome.runtime.sendMessage({
-        service: "spaces",
-        type: "listBinSpaces",
+        service: "bin",
+        type: "listContents",
         target: "offscreen",
       });
       if (!response?.success) return [];
-      const rows = (response.payload as SpaceListItem[]) || [];
-      setBinSpaces(rows);
+      const rows = (response.payload as BinEntry[]) || [];
+      setBinEntries(rows);
       return rows;
     } catch (loadError) {
-      console.error("Failed to load bin spaces:", loadError);
+      console.error("Failed to load bin contents:", loadError);
       return [];
     }
   }, []);
@@ -2322,8 +2323,8 @@ const SearchInner = () => {
   useEffect(() => {
     void loadSpaces();
     void loadSpaceGroups();
-    void loadBinSpaces();
-  }, [loadBinSpaces, loadSpaceGroups, loadSpaces]);
+    void loadBinContents();
+  }, [loadBinContents, loadSpaceGroups, loadSpaces]);
 
   useEffect(() => {
     chrome.storage.local.get("sidePanelOpen", (result) => {
@@ -2367,6 +2368,7 @@ const SearchInner = () => {
           searchScope: activeSpaceGroupId ? "global" : requestedScope,
           spaceIds: activeSpaceGroupId ? activeSpaceGroupSpaceIds : undefined,
         });
+        void loadBinContents();
       }
 
       if (msg.scope === "space_groups") {
@@ -2377,7 +2379,7 @@ const SearchInner = () => {
       if (msg.scope === "spaces") {
         void loadSpaces();
         void loadSpaceGroups();
-        void loadBinSpaces();
+        void loadBinContents();
         void loadFolders({
           activeSpaceId,
           searchScope: activeSpaceGroupId ? "global" : requestedScope,
@@ -2388,6 +2390,9 @@ const SearchInner = () => {
       }
 
       if (msg.scope === "items" || msg.scope === "folders") {
+        if (msg.scope === "items") {
+          void loadBinContents();
+        }
         scheduleTagReload();
         if (msg.scope === "items" && Array.isArray(msg.changedItemIds) && msg.changedItemIds.length > 0) {
           const changedIds: string[] = msg.changedItemIds.filter(
@@ -2517,20 +2522,15 @@ const SearchInner = () => {
 
   const [nowTick, setNowTick] = useState<number>(() => Date.now());
   useEffect(() => {
-    if (binSpaces.length === 0) return;
+    if (binEntries.length === 0) return;
     const timer = window.setInterval(() => setNowTick(Date.now()), 60_000);
     return () => window.clearInterval(timer);
-  }, [binSpaces.length]);
+  }, [binEntries.length]);
 
   const sidebarSpaces = useMemo<SidebarSpace[]>(
     () => spaces.map((space) => ({ ...space, deletedAt: (space as any).deletedAt ?? 0, purgeAt: (space as any).purgeAt ?? 0 })),
     [spaces]
   );
-  const sidebarBinSpaces = useMemo<SidebarSpace[]>(
-    () => binSpaces.map((space) => ({ ...space, deletedAt: (space as any).deletedAt ?? 0, purgeAt: (space as any).purgeAt ?? 0 })),
-    [binSpaces]
-  );
-
   const refreshSidebarFolders = useCallback(() => {
     void loadFolders({
       activeSpaceId,
@@ -2702,7 +2702,7 @@ const SearchInner = () => {
           showErrorToast(response?.error || "Could not delete tab group.");
           return;
         }
-        showSuccessToast("Tab group deleted.");
+        showSuccessToast("Tab group moved to Bin.");
       } catch (deleteError) {
         showErrorToast(deleteError instanceof Error ? deleteError.message : "Could not delete tab group.");
       }
@@ -2710,30 +2710,16 @@ const SearchInner = () => {
     },
     getFolderItemCount: async (ids) => {
       try {
-        const result = await sendMessageWithTimeout<{
+        const response = await sendMessageWithTimeout<{
           success?: boolean;
           payload?: Record<string, number>;
         }>({
-          service: "dbManager",
-          type: "getImportTargets",
+          service: "folders",
+          type: "countItemsInTree",
           target: "offscreen",
-          payload: {
-            accessContext: {
-              activeSpaceId,
-              searchScope: activeSpaceGroupId ? "global" : requestedScope,
-            },
-          },
+          payload: { ids },
         }, QUERY_REQUEST_TIMEOUT_MS);
-        const targets = (result?.payload as any) || {};
-        const counts: Record<string, number> = {};
-        for (const topLevel of (targets.spaces || [])) {
-          for (const folder of (topLevel.folders || [])) {
-            if (ids.includes(folder.id)) {
-              counts[folder.id] = folder.itemCount ?? (folder.recentItems?.length ?? 0);
-            }
-          }
-        }
-        return counts;
+        return response?.payload || {};
       } catch {
         return {};
       }
@@ -2812,7 +2798,7 @@ const SearchInner = () => {
         showErrorToast(binError instanceof Error ? binError.message : "Could not move space to bin.");
       }
       void loadSpaces();
-      void loadBinSpaces();
+      void loadBinContents();
     },
     restoreSpaceFromBin: async (id) => {
       try {
@@ -2826,12 +2812,15 @@ const SearchInner = () => {
           showErrorToast(response?.error || "Could not restore space.");
           return;
         }
-        showSuccessToast("Space restored.");
+        const result = response.payload as { message?: string; relocated?: boolean } | undefined;
+        showSuccessToast(result?.message || "Space restored.", {
+          tempo: result?.relocated ? "long" : "default",
+        });
       } catch (restoreError) {
         showErrorToast(restoreError instanceof Error ? restoreError.message : "Could not restore space.");
       }
       void loadSpaces();
-      void loadBinSpaces();
+      void loadBinContents();
     },
     deleteSpaceForever: async (id) => {
       try {
@@ -2850,7 +2839,91 @@ const SearchInner = () => {
         showErrorToast(deleteError instanceof Error ? deleteError.message : "Could not delete space.");
       }
       void loadSpaces();
-      void loadBinSpaces();
+      void loadBinContents();
+    },
+    restoreFolderFromBin: async (id) => {
+      try {
+        const response = await chrome.runtime.sendMessage({
+          service: "folders",
+          type: "restoreFromBin",
+          target: "offscreen",
+          payload: { id },
+        });
+        if (!response?.success) {
+          showErrorToast(response?.error || "Could not restore folder.");
+          return;
+        }
+        const result = response.payload as { message?: string; relocated?: boolean } | undefined;
+        showSuccessToast(result?.message || "Folder restored.", {
+          tempo: result?.relocated ? "long" : "default",
+        });
+      } catch (restoreError) {
+        showErrorToast(restoreError instanceof Error ? restoreError.message : "Could not restore folder.");
+      }
+      refreshSidebarFolders();
+      void loadBinContents();
+      scheduleQueryRefresh("high");
+    },
+    deleteFolderForever: async (id) => {
+      try {
+        const response = await chrome.runtime.sendMessage({
+          service: "folders",
+          type: "deleteForever",
+          target: "offscreen",
+          payload: { id },
+        });
+        if (!response?.success) {
+          showErrorToast(response?.error || "Could not delete folder.");
+          return;
+        }
+        showSuccessToast("Folder permanently deleted.");
+      } catch (deleteError) {
+        showErrorToast(deleteError instanceof Error ? deleteError.message : "Could not delete folder.");
+      }
+      refreshSidebarFolders();
+      void loadBinContents();
+      scheduleQueryRefresh("high");
+    },
+    restoreItemFromBin: async (id) => {
+      try {
+        const response = await chrome.runtime.sendMessage({
+          service: "items",
+          type: "restoreFromBin",
+          target: "offscreen",
+          payload: { id },
+        });
+        if (!response?.success) {
+          showErrorToast(response?.error || "Could not restore saved tab.");
+          return;
+        }
+        const result = response.payload as { message?: string; relocated?: boolean } | undefined;
+        showSuccessToast(result?.message || "Saved tab restored.", {
+          tempo: result?.relocated ? "long" : "default",
+        });
+      } catch (restoreError) {
+        showErrorToast(restoreError instanceof Error ? restoreError.message : "Could not restore saved tab.");
+      }
+      void loadBinContents();
+      scheduleQueryRefresh("high");
+    },
+    deleteItemForever: async (id) => {
+      try {
+        const response = await chrome.runtime.sendMessage({
+          service: "items",
+          type: "deleteForever",
+          target: "offscreen",
+          payload: { id },
+        });
+        if (!response?.success) {
+          showErrorToast(response?.error || "Could not delete saved tab.");
+          return;
+        }
+        showSuccessToast("Saved tab permanently deleted.");
+      } catch (deleteError) {
+        showErrorToast(deleteError instanceof Error ? deleteError.message : "Could not delete saved tab.");
+      }
+      void loadBinContents();
+      scheduleQueryRefresh("high");
     },
     reorderSpaceGroups: async (orderedIds) => {
       try {
@@ -2897,7 +2970,7 @@ const SearchInner = () => {
         }
         showSuccessToast(
           mode === "deleteContents"
-            ? "Space group and its contents deleted."
+            ? "Space group moved to bin. Restore spaces from Bin within 30 days."
             : "Space group deleted. Spaces moved to Ungrouped."
         );
       } catch (deleteError) {
@@ -2905,6 +2978,7 @@ const SearchInner = () => {
       }
       void loadSpaceGroups();
       void loadSpaces();
+      void loadBinContents();
     },
     newSpace: (groupId) => {
       setCreateSpaceError(null);
@@ -2981,10 +3055,9 @@ const SearchInner = () => {
     activeSpaceGroupId,
     activeSpaceGroupSpaceIds,
     activeSpaceId,
-    binSpaces,
     handleSelectSpace,
     handleSelectSpaceGroup,
-    loadBinSpaces,
+    loadBinContents,
     loadFolders,
     loadSpaceGroups,
     loadSpaces,
@@ -3056,7 +3129,7 @@ const SearchInner = () => {
             activeSpaceId={activeSpaceId}
             activeSpaceGroupId={activeSpaceGroupId}
             selectedFolderId={selectedFolderId}
-            binSpaces={sidebarBinSpaces}
+            binEntries={binEntries}
             now={nowTick}
             openBinNonce={binNonce}
             handlers={sidebarHandlers}
@@ -3108,7 +3181,7 @@ const SearchInner = () => {
         onDataChanged={() => {
           void loadSpaces();
           void loadSpaceGroups();
-          void loadBinSpaces();
+          void loadBinContents();
           refreshSidebarFolders();
           setRefreshToken((value) => value + 1);
         }}

@@ -188,10 +188,12 @@ export async function buildShareSnapshotFromMixed(
     raw: doc.toMutableJSON() as SpaceDocType,
     sanitized: sanitizeSpace(doc.toMutableJSON() as SpaceDocType),
   }));
-  const allFolders = folderDocs.map((doc) => ({
-    raw: doc.toMutableJSON() as FolderDocType,
-    sanitized: sanitizeFolder(doc.toMutableJSON() as FolderDocType),
-  }));
+  const allFolders = folderDocs
+    .map((doc) => ({
+      raw: doc.toMutableJSON() as FolderDocType,
+      sanitized: sanitizeFolder(doc.toMutableJSON() as FolderDocType),
+    }))
+    .filter((folder) => (folder.raw.deletedAt || 0) === 0);
   const warnings: ShareSnapshotWarning[] = [];
   const allItems = itemDocs.map((doc) => ({
     raw: doc.toMutableJSON() as ItemDocType,
@@ -209,14 +211,19 @@ export async function buildShareSnapshotFromMixed(
     }
   }
 
-  // Resolve target folder ids: directly selected + folders inside target spaces.
-  const targetFolderIds = new Set<string>();
-  for (const folderId of input.selection.folderIds) targetFolderIds.add(folderId);
+  // Resolve folders whose contents are explicitly selected.
+  const contentFolderIds = new Set<string>();
+  for (const folderId of input.selection.folderIds) contentFolderIds.add(folderId);
   for (const folder of allFolders) {
-    if (targetSpaceIds.has(folder.raw.spaceId)) targetFolderIds.add(folder.raw.id);
+    if (targetSpaceIds.has(folder.raw.spaceId)) contentFolderIds.add(folder.raw.id);
   }
 
-  // Resolve target item ids: directly selected + items in target folders.
+  // Resolve all folder ids included in the snapshot: content folders plus
+  // lightweight containers for directly selected items.
+  const targetFolderIds = new Set<string>();
+  for (const folderId of contentFolderIds) targetFolderIds.add(folderId);
+
+  // Resolve directly selected item ids.
   const targetItemIds = new Set<string>();
   for (const itemId of input.selection.itemIds) targetItemIds.add(itemId);
 
@@ -237,14 +244,14 @@ export async function buildShareSnapshotFromMixed(
     return true;
   });
 
-  // Items: directly selected + items whose folder is included.
+  // Items: directly selected + items whose folder contents are included.
   const includedItems = allItems.filter((item) => {
     if (targetItemIds.has(item.raw.id)) {
       if (item.raw.folderId && targetFolderIds.has(item.raw.folderId)) return true;
       // Item selected but its folder wasn't resolved — keep it anyway with undefined folderId.
       return true;
     }
-    return item.raw.folderId ? targetFolderIds.has(item.raw.folderId) : false;
+    return item.raw.folderId ? contentFolderIds.has(item.raw.folderId) : false;
   });
 
   // Spaces: any space that owns an included folder.
@@ -329,7 +336,9 @@ export async function buildLocalExportSnapshot(
   const spaces = spaceDocs.map((doc) => sanitizeSpace(doc.toMutableJSON() as SpaceDocType));
   const spaceIds = new Set(spaces.map((space) => space.id));
   const folders = folderDocs
-    .map((doc) => sanitizeFolder(doc.toMutableJSON() as FolderDocType))
+    .map((doc) => doc.toMutableJSON() as FolderDocType)
+    .filter((folder) => (folder.deletedAt || 0) === 0)
+    .map((folder) => sanitizeFolder(folder))
     .filter((folder) => !folder.spaceId || spaceIds.has(folder.spaceId));
   const folderIds = new Set(folders.map((folder) => folder.id));
 
@@ -386,6 +395,8 @@ export async function importSharedSnapshot(
     isLocked: false,
     isPinned: false,
     isCollapsed: false,
+    deletedAt: 0,
+    purgeAt: 0,
     isDirty: true,
     serverVersion: 0,
     createdAt: now,
@@ -411,6 +422,8 @@ export async function importSharedSnapshot(
       isLocked: false,
       isPinned: false,
       isCollapsed: false,
+      deletedAt: 0,
+      purgeAt: 0,
       isDirty: true,
       serverVersion: 0,
       createdAt: now,
@@ -564,6 +577,8 @@ export async function mergeBackupSnapshot(
         parentId: source.parentId && sourceFolderIds.has(source.parentId) ? source.parentId : null,
         type: source.type === "tab_group" ? "tab_group" : "folder",
         sortOrder: normalizeNumber(source.sortOrder) ?? existing.sortOrder,
+        deletedAt: 0,
+        purgeAt: 0,
         isDirty: true,
         updatedAt: Math.max(existing.updatedAt, normalizeNumber(snapshot.createdAt) || now),
       };
@@ -579,6 +594,8 @@ export async function mergeBackupSnapshot(
       isLocked: false,
       isPinned: false,
       isCollapsed: false,
+      deletedAt: 0,
+      purgeAt: 0,
       isDirty: true,
       serverVersion: 0,
       createdAt: now,

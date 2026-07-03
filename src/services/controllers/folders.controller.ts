@@ -4,8 +4,10 @@ import { ItemDocType } from "@src/schemas/item_schema";
 import { v4 as uuidv4 } from "uuid";
 import { databaseManager } from "@src/services/db-manager";
 import { appendUnorderedIds } from "@src/utils/ordered-ids";
-import { PRIVATE_SPACE_ID, PUBLIC_SPACE_ID } from "@src/common/spaces";
+import { PRIVATE_SPACE_ID, PUBLIC_SPACE_ID, computeBinPurgeAt } from "@src/common/spaces";
 import { spaceSessionService } from "@src/services/space-session.service";
+import { deleteAllMediaForItem } from "@src/services/media-storage";
+import { resolveRestoreSpace, restoreFallbackMessage } from "@src/services/bin-restore-location";
 
 export class FoldersController {
   [key: string]: any;
@@ -30,6 +32,28 @@ export class FoldersController {
     const spaceId = this.resolveSpaceId(doc.get("spaceId") as string | undefined);
     this.assertSpaceUnlocked(spaceId);
     return doc;
+  }
+
+  private collectFolderTreeIds(folders: FolderDocType[], rootId: string): Set<string> {
+    const ids = new Set<string>([rootId]);
+    let changed = true;
+    while (changed) {
+      changed = false;
+      for (const folder of folders) {
+        const parentId = folder.parentId || null;
+        if (parentId && ids.has(parentId) && !ids.has(folder.id)) {
+          ids.add(folder.id);
+          changed = true;
+        }
+      }
+    }
+    return ids;
+  }
+
+  private async removeDeletedItemTombstone(db: any, id: string): Promise<void> {
+    if (!db.deleted_items?.findOne) return;
+    const tombstone = await db.deleted_items.findOne(id).exec();
+    if (tombstone) await tombstone.remove();
   }
 
   async getById(payload: { id: string; skipLockCheck?: boolean }): Promise<FolderDocType | null> {
@@ -69,6 +93,8 @@ export class FoldersController {
       isLocked: false,
       isPinned: false,
       isCollapsed: false,
+      deletedAt: 0,
+      purgeAt: 0,
       isDirty: false,
       serverVersion: 0,
       createdAt: now,
@@ -124,8 +150,8 @@ export class FoldersController {
   }
 
   /**
-   * Deletes a folder and optionally soft-deletes all items inside it.
-   * Respects the folder's locked state; locked folders will not be deleted.
+   * Deletes a folder tree and optionally soft-deletes all items inside it.
+   * Respects the root folder's locked state; locked folders will not be deleted.
    */
   async delete(payload: {
     id: string;
@@ -137,21 +163,165 @@ export class FoldersController {
     const current = doc.toMutableJSON();
     if (current.isLocked) return { success: false, error: "LOCKED" };
 
+    const folderDocs = await db.folders.find({ selector: { spaceId: { $eq: current.spaceId } } }).exec();
+    const folders = folderDocs.map((folderDoc: any) => folderDoc.toMutableJSON() as FolderDocType);
+    const folderIds = this.collectFolderTreeIds(folders, payload.id);
+
+    const now = Date.now();
+    const purgeAt = computeBinPurgeAt(now);
     const alsoDeleteItems = payload.alsoDeleteItems !== false;
     if (alsoDeleteItems) {
       const items = await db.items
-        .find({ selector: { folderId: { $eq: payload.id }, deletedAt: { $eq: 0 } } })
+        .find({ selector: { folderId: { $in: Array.from(folderIds) }, deletedAt: { $eq: 0 } } })
         .exec();
       for (const item of items) {
         await databaseManager.deleteItem({ id: item.primary });
       }
     }
 
-    await doc.remove();
+    for (const folderDoc of folderDocs) {
+      if (folderIds.has(folderDoc.primary)) {
+        await folderDoc.patch({ deletedAt: now, purgeAt, updatedAt: now });
+      }
+    }
     try {
       chrome.runtime.sendMessage({ type: "DB_CHANGE", scope: "folders" });
     } catch {}
     return { success: true };
+  }
+
+  async restoreFromBin(payload: {
+    id: string;
+  }): Promise<{ success: boolean; restoredItems: number; error?: string; relocated?: boolean; message?: string }> {
+    const db = await getDb();
+    const doc = await this.getFolderWithAccess(db, payload.id);
+    if (!doc) return { success: false, restoredItems: 0, error: "NOT_FOUND" };
+
+    const current = doc.toMutableJSON() as FolderDocType;
+    if ((current.deletedAt || 0) === 0) return { success: true, restoredItems: 0 };
+
+    const restoreSpace = await resolveRestoreSpace(db, current.spaceId || PUBLIC_SPACE_ID);
+    let targetParentId = current.parentId || null;
+    let relocated = restoreSpace.relocated;
+    const parentId = current.parentId || null;
+    if (!relocated && parentId) {
+      const parentDoc = await db.folders.findOne(parentId).exec();
+      const parentDeletedAt = (parentDoc?.get("deletedAt") as number | undefined) || 0;
+      relocated = !parentDoc || parentDeletedAt > 0;
+    }
+    if (relocated) {
+      targetParentId = null;
+    }
+
+    const folderDocs = await db.folders.find({ selector: { spaceId: { $eq: current.spaceId } } }).exec();
+    const folders = folderDocs.map((folderDoc: any) => folderDoc.toMutableJSON() as FolderDocType);
+    const folderIds = this.collectFolderTreeIds(folders, payload.id);
+    const now = Date.now();
+
+    for (const folderDoc of folderDocs) {
+      if (folderIds.has(folderDoc.primary)) {
+        await folderDoc.patch({
+          spaceId: restoreSpace.space.id,
+          parentId: folderDoc.primary === payload.id ? targetParentId : (folderDoc.get("parentId") as string | null),
+          deletedAt: 0,
+          purgeAt: 0,
+          updatedAt: now,
+        });
+      }
+    }
+
+    const itemDocs = await db.items
+      .find({ selector: { folderId: { $in: Array.from(folderIds) }, deletedAt: { $gt: 0 } } })
+      .exec();
+    for (const itemDoc of itemDocs) {
+      await itemDoc.patch({
+        spaceId: restoreSpace.space.id,
+        deletedAt: 0,
+        updatedAt: now,
+        isDirty: true,
+      });
+      await this.removeDeletedItemTombstone(db, itemDoc.primary);
+    }
+
+    if (restoreSpace.created) {
+      try {
+        chrome.runtime.sendMessage({ type: "DB_CHANGE", scope: "spaces" });
+      } catch {}
+    }
+    try {
+      chrome.runtime.sendMessage({ type: "DB_CHANGE", scope: "folders" });
+    } catch {}
+    try {
+      chrome.runtime.sendMessage({ type: "DB_CHANGE", scope: "items" });
+    } catch {}
+
+    return {
+      success: true,
+      restoredItems: itemDocs.length,
+      relocated,
+      message: relocated ? restoreFallbackMessage(restoreSpace.space.name) : undefined,
+    };
+  }
+
+  async deleteForever(payload: {
+    id: string;
+  }): Promise<{ success: boolean; removedItems: number; removedFolders: number; error?: string }> {
+    const db = await getDb();
+    const doc = await this.getFolderWithAccess(db, payload.id);
+    if (!doc) return { success: false, removedItems: 0, removedFolders: 0, error: "NOT_FOUND" };
+
+    const current = doc.toMutableJSON() as FolderDocType;
+    if (current.isLocked) return { success: false, removedItems: 0, removedFolders: 0, error: "LOCKED" };
+
+    const folderDocs = await db.folders.find({ selector: { spaceId: { $eq: current.spaceId } } }).exec();
+    const folders = folderDocs.map((folderDoc: any) => folderDoc.toMutableJSON() as FolderDocType);
+    const folderIds = this.collectFolderTreeIds(folders, payload.id);
+
+    const itemDocs = await db.items
+      .find({ selector: { folderId: { $in: Array.from(folderIds) } } })
+      .exec();
+    for (const itemDoc of itemDocs) {
+      await deleteAllMediaForItem(itemDoc.primary);
+      await this.removeDeletedItemTombstone(db, itemDoc.primary);
+      await itemDoc.remove();
+    }
+
+    for (const folderDoc of folderDocs) {
+      if (folderIds.has(folderDoc.primary)) {
+        await folderDoc.remove();
+      }
+    }
+
+    try {
+      chrome.runtime.sendMessage({ type: "DB_CHANGE", scope: "folders" });
+    } catch {}
+    try {
+      chrome.runtime.sendMessage({ type: "DB_CHANGE", scope: "items" });
+    } catch {}
+
+    return { success: true, removedItems: itemDocs.length, removedFolders: folderIds.size };
+  }
+
+  async countItemsInTree(payload: { ids: string[] }): Promise<Record<string, number>> {
+    const db = await getDb();
+    const ids = Array.from(new Set((payload.ids || []).map((id) => id.trim()).filter(Boolean)));
+    const counts: Record<string, number> = {};
+    for (const id of ids) {
+      const doc = await this.getFolderWithAccess(db, id);
+      if (!doc) {
+        counts[id] = 0;
+        continue;
+      }
+      const root = doc.toMutableJSON() as FolderDocType;
+      const folderDocs = await db.folders.find({ selector: { spaceId: { $eq: root.spaceId } } }).exec();
+      const folders = folderDocs.map((folderDoc: any) => folderDoc.toMutableJSON() as FolderDocType);
+      const folderIds = this.collectFolderTreeIds(folders, id);
+      const items = await db.items
+        .find({ selector: { folderId: { $in: Array.from(folderIds) }, deletedAt: { $eq: 0 } } })
+        .exec();
+      counts[id] = items.length;
+    }
+    return counts;
   }
 
   async reorder(payload: {
@@ -489,6 +659,8 @@ export class FoldersController {
       isLocked: !!sourceFolder.isLocked,
       isPinned: !!sourceFolder.isPinned,
       isCollapsed: !!sourceFolder.isCollapsed,
+      deletedAt: 0,
+      purgeAt: 0,
       isDirty: false,
       serverVersion: 0,
       createdAt: now,

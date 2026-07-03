@@ -318,7 +318,7 @@ class DatabaseManager {
       : baseAllowedSpaceIds;
     if (allowedSpaceIds.length === 0) return [];
     const allFolders = await db.folders
-      .find({ selector: { spaceId: { $in: allowedSpaceIds } } })
+      .find({ selector: { spaceId: { $in: allowedSpaceIds }, deletedAt: { $eq: 0 } } })
       .exec();
     return allFolders.map((folder) => folder.toMutableJSON());
   }
@@ -977,6 +977,8 @@ class DatabaseManager {
       isLocked: payload.isLocked ?? false,
       isPinned: payload.isPinned ?? false,
       isCollapsed: false,
+      deletedAt: 0,
+      purgeAt: 0,
       isDirty: false,
       serverVersion: 0,
       createdAt: now,

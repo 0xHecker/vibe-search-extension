@@ -13,6 +13,22 @@ export type SpaceGroupListItem = SpaceGroupDocType;
 export class SpaceGroupsController {
   [key: string]: any;
 
+  private collectSpaceGroupTreeIds(groups: SpaceGroupDocType[], rootId: string): Set<string> {
+    const ids = new Set<string>([rootId]);
+    let changed = true;
+    while (changed) {
+      changed = false;
+      for (const group of groups) {
+        const parentId = group.parentGroupId || null;
+        if (parentId && ids.has(parentId) && !ids.has(group.id)) {
+          ids.add(group.id);
+          changed = true;
+        }
+      }
+    }
+    return ids;
+  }
+
   async listSpaceGroups(): Promise<SpaceGroupListItem[]> {
     const db = await getDb();
     const docs = await db.space_groups.find().exec();
@@ -115,13 +131,16 @@ export class SpaceGroupsController {
   }): Promise<{ success: boolean; affectedSpaces: number }> {
     const db = await getDb();
     const id = (payload.id || "").trim();
-    const mode = payload.mode || "moveToUngrouped";
+    const mode = payload.mode || "deleteContents";
     if (!id) return { success: false, affectedSpaces: 0 };
     const groupDoc = await db.space_groups.findOne(id).exec();
     if (!groupDoc) return { success: false, affectedSpaces: 0 };
 
+    const groupDocs = await db.space_groups.find().exec();
+    const groups = groupDocs.map((doc) => doc.toMutableJSON() as SpaceGroupDocType);
+    const targetGroupIds = this.collectSpaceGroupTreeIds(groups, id);
     const children = await db.spaces
-      .find({ selector: { spaceGroupId: { $eq: id } } })
+      .find({ selector: { spaceGroupId: { $in: Array.from(targetGroupIds) } } })
       .exec();
     const affectedSpaces = children.length;
     const now = Date.now();
@@ -130,9 +149,10 @@ export class SpaceGroupsController {
       for (const child of children) {
         const spaceId = child.primary;
         try {
-          await spacesController.deleteSpaceForever({ id: spaceId });
+          await spacesController.moveToBin({ id: spaceId });
+          await child.patch({ spaceGroupId: UNGROUPED_SPACE_GROUP_ID, updatedAt: now });
         } catch (childError) {
-          console.error("[SpaceGroups] failed to delete group child", childError);
+          console.error("[SpaceGroups] failed to move group child to bin", childError);
         }
       }
     } else {
@@ -144,7 +164,14 @@ export class SpaceGroupsController {
       } catch {}
     }
 
-    await groupDoc.remove();
+    for (const doc of groupDocs) {
+      if (targetGroupIds.has(doc.primary)) {
+        await doc.remove();
+      }
+    }
+    try {
+      chrome.runtime.sendMessage({ type: "DB_CHANGE", scope: "spaces" });
+    } catch {}
     this.notifyChanged();
     return { success: true, affectedSpaces };
   }

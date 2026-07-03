@@ -58,6 +58,7 @@ interface TabGroupProps {
   folder: FolderDocType;
   items: ItemDocType[];
   allFolders: FolderDocType[];
+  treeItemCount?: number;
   spaces: SpaceMoveOption[];
   viewMode: "list" | "grid";
   debugScoresByItemId?: Record<string, QueryRankDebugScore>;
@@ -70,6 +71,8 @@ interface TabGroupProps {
 const TabGroupContent = ({
   folder,
   items,
+  allFolders,
+  treeItemCount,
   spaces,
   viewMode,
   debugScoresByItemId,
@@ -101,6 +104,21 @@ const TabGroupContent = ({
   const { isSelectionMode, selectedIds, toggleSelectAll } = useSelection();
   const groupAllSelected = items.length > 0 && items.every((i) => selectedIds.has(i.id));
   const groupSomeSelected = !groupAllSelected && items.some((i) => selectedIds.has(i.id));
+  const nestedFolderCount = useMemo(() => {
+    const folderIds = new Set<string>([folder.id]);
+    let changed = true;
+    while (changed) {
+      changed = false;
+      for (const candidate of allFolders) {
+        if (candidate.parentId && folderIds.has(candidate.parentId) && !folderIds.has(candidate.id)) {
+          folderIds.add(candidate.id);
+          changed = true;
+        }
+      }
+    }
+    return Math.max(0, folderIds.size - 1);
+  }, [allFolders, folder.id]);
+  const deleteItemCount = treeItemCount ?? items.length;
   const {
     attributes,
     listeners,
@@ -320,8 +338,8 @@ const TabGroupContent = ({
 
   const handleDeleteGroup = async () => {
     await withToast({
-      loading: "Deleting tab group...",
-      success: "Tab group deleted.",
+      loading: "Moving tab group to Bin...",
+      success: "Tab group moved to Bin.",
       error: (err) => resolveToastErrorMessage(err, "Failed to delete tab group."),
       action: async () => {
         const response = await chrome.runtime.sendMessage({
@@ -867,13 +885,17 @@ const TabGroupContent = ({
         <ConfirmDialog
           open={isDeleteDialogOpen}
           onOpenChange={setIsDeleteDialogOpen}
-          title={isLocked ? "Tab group is locked" : "Delete this tab group?"}
+          title={isLocked ? "Tab group is locked" : "Move this tab group to Bin?"}
           description={
             isLocked
               ? "Unlock this group before deleting it."
-              : `All ${items.length} tabs saved in "${title}" will be permanently removed. This action cannot be undone.`
+              : `This moves "${title}"${
+                  nestedFolderCount > 0
+                    ? `, ${nestedFolderCount} nested tab group${nestedFolderCount === 1 ? "" : "s"} or folder${nestedFolderCount === 1 ? "" : "s"},`
+                    : ""
+                } and ${deleteItemCount} saved tab${deleteItemCount === 1 ? "" : "s"} inside to Bin. They are removed from search and can be recovered from Bin.`
           }
-          confirmLabel={isLocked ? "Close" : "Delete tab group"}
+          confirmLabel={isLocked ? "Close" : "Move to Bin"}
           cancelLabel={isLocked ? undefined : "Cancel"}
           variant={isLocked ? "warning" : "danger"}
           isConfirmDisabled={isLocked}
@@ -888,6 +910,7 @@ export const TabGroup = memo(({
   folder,
   items,
   allFolders,
+  treeItemCount,
   spaces,
   viewMode,
   debugScoresByItemId,
@@ -901,6 +924,7 @@ export const TabGroup = memo(({
       folder={folder}
       items={items}
       allFolders={allFolders}
+      treeItemCount={treeItemCount}
       spaces={spaces}
       viewMode={viewMode}
       debugScoresByItemId={debugScoresByItemId}

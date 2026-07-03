@@ -36,6 +36,11 @@ import { MAX_GRID_QUERY_LIMIT, splitLookaheadPage } from "@src/search-core/pagin
 import { PRIVATE_SPACE_ID, PUBLIC_SPACE_ID } from "@src/common/spaces";
 import { spaceSessionService } from "@src/services/space-session.service";
 import {
+  createRestoreTabGroup,
+  resolveRestoreSpace,
+  restoreFallbackMessage,
+} from "@src/services/bin-restore-location";
+import {
   queryRankerService,
   RANK_REQUEST_SUPERSEDED,
   SupersededRankRequestError,
@@ -258,6 +263,12 @@ export class ItemsController {
       if (v !== undefined) copy[k] = v;
     });
     return copy as T;
+  }
+
+  private async removeDeletedItemTombstone(db: any, id: string): Promise<void> {
+    if (!db.deleted_items?.findOne) return;
+    const tombstone = await db.deleted_items.findOne(id).exec();
+    if (tombstone) await tombstone.remove();
   }
 
   markSearchIndexDirty() {
@@ -1130,6 +1141,8 @@ export class ItemsController {
         isLocked: !!sourceFolder.isLocked,
         isPinned: !!sourceFolder.isPinned,
         isCollapsed: !!sourceFolder.isCollapsed,
+        deletedAt: 0,
+        purgeAt: 0,
         isDirty: false,
         serverVersion: 0,
         createdAt: sourceFolder.createdAt || now,
@@ -1319,6 +1332,8 @@ export class ItemsController {
         isLocked: !!sourceFolder.isLocked,
         isPinned: !!sourceFolder.isPinned,
         isCollapsed: !!sourceFolder.isCollapsed,
+        deletedAt: 0,
+        purgeAt: 0,
         isDirty: false,
         serverVersion: 0,
         createdAt: sourceFolder.createdAt || now,
@@ -2645,6 +2660,88 @@ export class ItemsController {
     for (const id of idsToDelete) {
       await databaseManager.deleteItem({ id });
     }
+
+    try {
+      chrome.runtime.sendMessage({ type: "DB_CHANGE", scope: "items" });
+    } catch {}
+
+    return { success: true };
+  }
+
+  async restoreFromBin(payload: {
+    id: string;
+  }): Promise<{ success: boolean; error?: string; relocated?: boolean; message?: string }> {
+    const db = await getDb();
+    const id = (payload.id || "").trim();
+    if (!id) return { success: false, error: "NOT_FOUND" };
+
+    const doc = await db.items.findOne(id).exec();
+    if (!doc) return { success: false, error: "NOT_FOUND" };
+
+    const item = doc.toMutableJSON() as ItemDocType;
+    this.assertSpaceUnlocked((item.spaceId as string | undefined) || PUBLIC_SPACE_ID);
+    if ((item.deletedAt || 0) === 0) return { success: true };
+
+    const restoreSpace = await resolveRestoreSpace(db, item.spaceId || PUBLIC_SPACE_ID);
+    let targetFolderId = item.folderId;
+    let relocated = restoreSpace.relocated || !item.folderId;
+    if (!relocated && item.folderId && db.folders?.findOne) {
+      const folderDoc = await db.folders.findOne(item.folderId).exec();
+      const folderDeletedAt = (folderDoc?.get("deletedAt") as number | undefined) || 0;
+      relocated = !folderDoc || folderDeletedAt > 0;
+    }
+
+    if (relocated) {
+      const fallbackFolder = await createRestoreTabGroup(db, {
+        spaceId: restoreSpace.space.id,
+        userId: item.userId,
+      });
+      targetFolderId = fallbackFolder.id;
+    }
+
+    await doc.patch({
+      folderId: targetFolderId,
+      spaceId: restoreSpace.space.id,
+      deletedAt: 0,
+      updatedAt: Date.now(),
+      isDirty: true,
+    });
+    await this.removeDeletedItemTombstone(db, id);
+
+    if (restoreSpace.created) {
+      try {
+        chrome.runtime.sendMessage({ type: "DB_CHANGE", scope: "spaces" });
+      } catch {}
+    }
+    if (relocated) {
+      try {
+        chrome.runtime.sendMessage({ type: "DB_CHANGE", scope: "folders" });
+      } catch {}
+    }
+    try {
+      chrome.runtime.sendMessage({ type: "DB_CHANGE", scope: "items" });
+    } catch {}
+
+    return {
+      success: true,
+      relocated,
+      message: relocated ? restoreFallbackMessage(restoreSpace.space.name) : undefined,
+    };
+  }
+
+  async deleteForever(payload: { id: string }): Promise<{ success: boolean; error?: string }> {
+    const db = await getDb();
+    const id = (payload.id || "").trim();
+    if (!id) return { success: false, error: "NOT_FOUND" };
+
+    const doc = await db.items.findOne(id).exec();
+    if (!doc) return { success: false, error: "NOT_FOUND" };
+    const item = doc.toMutableJSON() as ItemDocType;
+    this.assertSpaceUnlocked((item.spaceId as string | undefined) || PUBLIC_SPACE_ID);
+
+    await deleteAllMediaForItem(id);
+    await this.removeDeletedItemTombstone(db, id);
+    await doc.remove();
 
     try {
       chrome.runtime.sendMessage({ type: "DB_CHANGE", scope: "items" });

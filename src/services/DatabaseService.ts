@@ -5,6 +5,7 @@ import { wrappedValidateZSchemaStorage } from "rxdb/plugins/validate-z-schema";
 import { RxDBLocalDocumentsPlugin } from "rxdb/plugins/local-documents";
 import { RxDBQueryBuilderPlugin } from "rxdb/plugins/query-builder";
 import { RxDBMigrationSchemaPlugin } from "rxdb/plugins/migration-schema";
+import { withDexieRequiredIndexes } from "@src/services/rxdb-dexie-required-indexes";
 
 if (import.meta.env.MODE === "development") {
   addRxPlugin(RxDBDevModePlugin);
@@ -52,8 +53,14 @@ export type MyDatabase = RxDatabase<MyDatabaseCollections>;
 
 let dbPromise: Promise<MyDatabase> | null = null;
 
+const ensureFolderBinFields = (oldDoc: any) => {
+  oldDoc.deletedAt = oldDoc.deletedAt || 0;
+  oldDoc.purgeAt = oldDoc.purgeAt || 0;
+  return oldDoc;
+};
+
 const createDatabase = async () => {
-  let storage: RxStorage<any, any> = getRxStorageDexie();
+  let storage: RxStorage<any, any> = withDexieRequiredIndexes(getRxStorageDexie());
   if (import.meta.env.MODE === "development") {
     storage = wrappedValidateZSchemaStorage({ storage });
   }
@@ -76,6 +83,14 @@ const createDatabase = async () => {
     },
     folders: {
       schema: folderSchema,
+      // v0 -> v1: tab groups/folders gain a soft-delete state so they can
+      // move to Bin before purge instead of disappearing immediately.
+      migrationStrategies: {
+        1: ensureFolderBinFields,
+        // v1 -> v2: recover from dev builds that created a v1 folder schema
+        // with Dexie-normalized required indexes before the source schema settled.
+        2: ensureFolderBinFields,
+      },
     },
     spaces: {
       schema: spaceSchema,

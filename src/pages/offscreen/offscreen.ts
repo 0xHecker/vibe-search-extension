@@ -8,6 +8,7 @@ import { foldersController } from "@src/services/controllers/folders.controller"
 import { tagsController } from "@src/services/controllers/tags.controller";
 import { spacesController } from "@src/services/controllers/spaces.controller";
 import { spaceGroupsController } from "@src/services/controllers/space-groups.controller";
+import { binController } from "@src/services/controllers/bin.controller";
 import { vectorPipelineCoordinator } from "@src/services/vector-pipeline-coordinator";
 import { queryRankerService } from "@src/services/query-ranker.service";
 import { browserBookmarkImportService } from "@src/services/browser-bookmark-import";
@@ -284,6 +285,8 @@ router.registerService("items", itemsController, {
     "moveToFolder",
     "reorder",
     "delete",
+    "restoreFromBin",
+    "deleteForever",
     "update",
     "updateMedia",
     "removeMedia",
@@ -301,12 +304,18 @@ router.registerService("folders", foldersController, {
     "setCollapsed",
     "rename",
     "delete",
+    "restoreFromBin",
+    "deleteForever",
+    "countItemsInTree",
     "reorder",
     "moveToSpace",
     "copyToSpace",
     "moveToParent",
     "mergeInto",
   ],
+});
+router.registerService("bin", binController, {
+  methods: ["listContents"],
 });
 router.registerService("tags", tagsController, {
   methods: [

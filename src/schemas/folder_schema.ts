@@ -11,6 +11,8 @@ export type FolderDocType = {
   isPinned: boolean;
   isCollapsed: boolean;
   encryptionKey?: string;
+  deletedAt: number;
+  purgeAt: number;
   isDirty: boolean;
   serverVersion: number;
   createdAt: number;
@@ -20,7 +22,7 @@ export type FolderDocType = {
 
 export const folderSchema: RxJsonSchema<FolderDocType> = {
   title: "folder schema",
-  version: 0,
+  version: 2,
   description: "Describes a folder for organizing items or a group of tabs",
   primaryKey: "id",
   type: "object",
@@ -53,6 +55,20 @@ export const folderSchema: RxJsonSchema<FolderDocType> = {
     // Security
     isLocked: { type: "boolean", default: false },
     encryptionKey: { type: "string" }, // Stores a derived key, not the raw password
+    deletedAt: {
+      type: "integer",
+      minimum: 0,
+      maximum: Number.MAX_SAFE_INTEGER - 1,
+      multipleOf: 1,
+      default: 0,
+    },
+    purgeAt: {
+      type: "integer",
+      minimum: 0,
+      maximum: Number.MAX_SAFE_INTEGER - 1,
+      multipleOf: 1,
+      default: 0,
+    },
     // Sync fields
     isDirty: { type: "boolean", default: false },
     serverVersion: { type: "number", default: 0 },
@@ -83,6 +99,18 @@ export const folderSchema: RxJsonSchema<FolderDocType> = {
     "isPinned",
     "isCollapsed",
     "sortOrder",
+    "deletedAt",
+    "purgeAt",
   ],
-  indexes: ["isDirty", "userId", "spaceId", "type", "isPinned", "isCollapsed", "sortOrder"],
+  indexes: [
+    "isDirty",
+    "userId",
+    "spaceId",
+    "type",
+    "isPinned",
+    "isCollapsed",
+    "sortOrder",
+    "deletedAt",
+    "purgeAt",
+  ],
 };

@@ -836,20 +836,20 @@ export const GridItem = memo(({
           open={isDeleteDialogOpen}
           onOpenChange={setIsDeleteDialogOpen}
           title={
-            deleteScope === "all" ? "Delete this tab everywhere?" : "Delete from this tab group?"
+            deleteScope === "all" ? "Move this tab to Bin everywhere?" : "Move this tab to Bin?"
           }
           description={
             deleteScope === "all"
-              ? `This will delete "${item.title}" from every tab group. This action cannot be undone.`
-              : `This will remove "${item.title}" from this tab group. You can't undo this action.`
+              ? `This moves "${item.title}" to Bin from every tab group. It is removed from search and can be recovered from Bin.`
+              : `This moves "${item.title}" from this tab group to Bin. It is removed from search and can be recovered from Bin.`
           }
-          confirmLabel={deleteScope === "all" ? "Delete from all groups" : "Delete tab"}
+          confirmLabel="Move to Bin"
           variant="danger"
           onConfirm={async () => {
             await withToast({
-              loading: "Deleting tab...",
+              loading: "Moving tab to Bin...",
               success:
-                deleteScope === "all" ? "Tab deleted from all groups." : "Tab deleted from group.",
+                deleteScope === "all" ? "Tab moved to Bin from all groups." : "Tab moved to Bin.",
               error: (err) => resolveToastErrorMessage(err, "Failed to delete tab."),
               action: async () => {
                 const response = await chrome.runtime.sendMessage({

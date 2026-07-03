@@ -7,6 +7,11 @@ import {
 import { setupOffscreenDocument } from "@src/services/offscreen-helper";
 import { PRIVATE_SPACE_ID, PUBLIC_SPACE_ID } from "@src/common/spaces";
 import { OPEN_ON_NEW_TAB_STORAGE_KEY } from "@src/common/new-tab-pref";
+import {
+  importSettingsPatchFromPayload,
+  normalizeImportSettings,
+  type ImportSettings,
+} from "@src/common/import-settings";
 import type { ImportTargetSpace } from "@src/services/db-manager";
 import type { FolderDocType } from "@src/schemas/folder_schema";
 import type { ItemDocType } from "@src/schemas/item_schema";
@@ -107,7 +112,6 @@ const PROCESS_STATUS_HISTORY_MAX = 120;
 type OffscreenResponse<T> = { success?: boolean; payload?: T; error?: string };
 type ImportMode = "save" | "shot" | "extract";
 type ImportTarget = { mode: ImportMode; spaceId?: string; folderId?: string; itemId?: string; screenshotMode?: "visible" | "region"; extractIntent?: boolean };
-type ImportSettings = { reviewBeforeSave: boolean };
 type ImportRetryAction = "RETRY_IMPORT";
 type ImportClickContext = {
   pageUrl: string | null;
@@ -463,10 +467,11 @@ const setStorageValue = async <T>(key: string, value: T): Promise<void> => {
 };
 const getImportSettings = async (): Promise<ImportSettings> => {
   const raw = await getStorageValue<Partial<ImportSettings>>(IMPORT_SETTINGS_KEY, {});
-  return { reviewBeforeSave: raw.reviewBeforeSave === true };
+  return normalizeImportSettings(raw);
 };
-const setImportSettings = async (reviewBeforeSave: boolean): Promise<ImportSettings> => {
-  const next = { reviewBeforeSave: reviewBeforeSave === true };
+const setImportSettings = async (patch: Partial<ImportSettings>): Promise<ImportSettings> => {
+  const raw = await getStorageValue<Partial<ImportSettings>>(IMPORT_SETTINGS_KEY, {});
+  const next = normalizeImportSettings({ ...raw, ...patch });
   await setStorageValue(IMPORT_SETTINGS_KEY, next);
   return next;
 };
@@ -3370,7 +3375,7 @@ const handleImportControlMessage = async (message: any, sender: chrome.runtime.M
     return { success: true, payload: listRecentProcessStatuses(max) };
   }
   if (message.type === "IMPORT_SET_SETTINGS") {
-    return { success: true, payload: await setImportSettings(message?.payload?.reviewBeforeSave === true) };
+    return { success: true, payload: await setImportSettings(importSettingsPatchFromPayload(message?.payload)) };
   }
   if (message.type === "IMPORT_LIST_DRAFTS") {
     const drafts = await filterAccessibleDrafts(await loadDrafts());

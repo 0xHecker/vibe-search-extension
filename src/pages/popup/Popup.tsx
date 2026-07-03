@@ -32,6 +32,7 @@ import {
 import type { ItemDocType } from "@src/schemas/item_schema";
 import { inferSource } from "@src/utils/infer-source";
 import type { FolderDocType } from "@src/schemas/folder_schema";
+import { DEFAULT_IMPORT_SETTINGS, type ImportSettings } from "@src/common/import-settings";
 
 type TabSaveScope =
   | "current_window"
@@ -39,10 +40,6 @@ type TabSaveScope =
   | "left_of_current"
   | "right_of_current"
   | "all_windows";
-
-type ImportSettings = {
-  reviewBeforeSave: boolean;
-};
 
 type ImportDraftSummary = {
   id: string;
@@ -220,6 +217,22 @@ const resolveDraftPreviewImages = (draft: ImportDraft | null): string[] => {
 };
 
 const mapChecked = (value: boolean | "indeterminate"): boolean => value === true;
+
+const isSaveableBrowserTab = (tab: chrome.tabs.Tab): tab is chrome.tabs.Tab & { url: string } =>
+  typeof tab.url === "string" &&
+  tab.url.length > 0 &&
+  !tab.url.startsWith("chrome://") &&
+  !tab.url.startsWith("chrome-extension://");
+
+const closeSavedBrowserTabs = async (tabs: chrome.tabs.Tab[]): Promise<number> => {
+  const tabIds = tabs
+    .filter(isSaveableBrowserTab)
+    .map((tab) => tab.id)
+    .filter((tabId): tabId is number => typeof tabId === "number");
+
+  const results = await Promise.allSettled(tabIds.map((tabId) => chrome.tabs.remove(tabId)));
+  return results.filter((result) => result.status === "fulfilled").length;
+};
 
 const useBackground = () => {
   const call = React.useCallback(async <T,>(type: string, payload?: unknown): Promise<T> => {
@@ -752,9 +765,7 @@ const SaveTabsPopup = () => {
   const [scope, setScope] = React.useState<TabSaveScope>("current_window");
   const [isSaving, setIsSaving] = React.useState(false);
   const [status, setStatus] = React.useState<string | null>(null);
-  const [importSettings, setImportSettings] = React.useState<ImportSettings>({
-    reviewBeforeSave: false,
-  });
+  const [importSettings, setImportSettings] = React.useState<ImportSettings>(DEFAULT_IMPORT_SETTINGS);
   const [draftCount, setDraftCount] = React.useState(0);
   const [pastedUrl, setPastedUrl] = React.useState("");
 
@@ -784,10 +795,7 @@ const SaveTabsPopup = () => {
   const buildItemsFromTabs = (tabs: chrome.tabs.Tab[], folderId: string, spaceId: string) => {
     const now = Date.now();
     return tabs
-      .filter(
-        (tab) =>
-          tab.url && !tab.url.startsWith("chrome://") && !tab.url.startsWith("chrome-extension://")
-      )
+      .filter(isSaveableBrowserTab)
       .map(
         (tab, index) =>
           ({
@@ -871,7 +879,12 @@ const SaveTabsPopup = () => {
         throw new Error(response?.error || "Failed to save items");
       }
 
-      setStatus(`Saved ${items.length} tabs to "${folder.name}".`);
+      const closedCount = importSettings.closeTabsAfterSave ? await closeSavedBrowserTabs(tabs) : 0;
+      setStatus(
+        importSettings.closeTabsAfterSave
+          ? `Saved ${items.length} tabs to "${folder.name}" and closed ${closedCount}.`
+          : `Saved ${items.length} tabs to "${folder.name}".`
+      );
       setFolderName("");
     } catch (error) {
       setStatus(error instanceof Error ? error.message : "Something went wrong");

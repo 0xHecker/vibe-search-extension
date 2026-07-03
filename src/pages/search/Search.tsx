@@ -3154,7 +3154,7 @@ const SearchInner = () => {
       data-theme={theme}
       className={cn(
         "min-h-dvh bg-background-page relative transition-[padding] duration-400 ease-in-out",
-        isOpen && "md:pl-[272px] 2xl:pl-0"
+        isOpen && "md:pl-[272px]"
       )}
     >
       <div>

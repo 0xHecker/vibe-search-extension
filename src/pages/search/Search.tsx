@@ -2540,6 +2540,7 @@ const SearchInner = () => {
     if (hasActiveQuery && queryAnalysis.directives.page === undefined) {
       if (resultMeta.page <= 1) return;
       setCursorPage((value) => Math.max(1, value - 1));
+      setRefreshToken((value) => value + 1);
       window.scrollTo({ top: 0, behavior: "smooth" });
       return;
     }
@@ -2552,12 +2553,15 @@ const SearchInner = () => {
     setCursorHistory(cursorHistory.slice(0, -1));
     setCursorAfter(previousCursor);
     setCursorPage((value) => Math.max(1, value - 1));
+    setRefreshToken((value) => value + 1);
+    window.scrollTo({ top: 0, behavior: "smooth" });
   };
 
   const goNextPage = () => {
     if (hasActiveQuery && queryAnalysis.directives.page === undefined) {
       if (!resultMeta.hasMore) return;
       setCursorPage((value) => value + 1);
+      setRefreshToken((value) => value + 1);
       window.scrollTo({ top: 0, behavior: "smooth" });
       return;
     }
@@ -2569,6 +2573,8 @@ const SearchInner = () => {
     setCursorHistory((previous) => [...previous, cursorAfter]);
     setCursorAfter(resultMeta.nextCursor);
     setCursorPage((value) => value + 1);
+    setRefreshToken((value) => value + 1);
+    window.scrollTo({ top: 0, behavior: "smooth" });
   };
 
   const [nowTick, setNowTick] = useState<number>(() => Date.now());

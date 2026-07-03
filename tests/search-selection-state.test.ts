@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import {
   buildFolderLoadKey,
   buildSearchSelectionSearch,
+  getVisibleSelectionState,
   resolveFolderSelectionContext,
 } from "../src/pages/search/selection-state";
 
@@ -41,5 +42,19 @@ describe("search selection state", () => {
         spaceIds: ["space-b", "space-a"],
       })
     ).toBe("space-a|global|space-a,space-b");
+  });
+
+  test("selection state is scoped to the visible page", () => {
+    const pageItems = [{ id: "page-1" }, { id: "page-2" }];
+
+    expect(getVisibleSelectionState(pageItems, new Set(["page-1", "hidden-1"]))).toEqual({
+      allVisibleSelected: false,
+      someVisibleSelected: true,
+    });
+
+    expect(getVisibleSelectionState(pageItems, new Set(["page-1", "page-2", "hidden-1"]))).toEqual({
+      allVisibleSelected: true,
+      someVisibleSelected: false,
+    });
   });
 });

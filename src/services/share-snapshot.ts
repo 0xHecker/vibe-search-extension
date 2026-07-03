@@ -217,6 +217,20 @@ export async function buildShareSnapshotFromMixed(
   for (const folder of allFolders) {
     if (targetSpaceIds.has(folder.raw.spaceId)) contentFolderIds.add(folder.raw.id);
   }
+  let expandedFolderSet = true;
+  while (expandedFolderSet) {
+    expandedFolderSet = false;
+    for (const folder of allFolders) {
+      if (
+        folder.raw.parentId &&
+        contentFolderIds.has(folder.raw.parentId) &&
+        !contentFolderIds.has(folder.raw.id)
+      ) {
+        contentFolderIds.add(folder.raw.id);
+        expandedFolderSet = true;
+      }
+    }
+  }
 
   // Resolve all folder ids included in the snapshot: content folders plus
   // lightweight containers for directly selected items.
@@ -384,39 +398,23 @@ export async function importSharedSnapshot(
   const db = await getDb();
   const now = Date.now();
   const targetSpaceId = await resolveTargetSpaceId(db, payload.targetSpaceId);
-  const rootFolder: FolderDocType = {
-    id: crypto.randomUUID(),
-    name: normalizeTitle(payload.rootFolderName, snapshot.title || "Shared import"),
-    userId: "",
-    spaceId: targetSpaceId,
-    parentId: null,
-    type: "folder",
-    sortOrder: now,
-    isLocked: false,
-    isPinned: false,
-    isCollapsed: false,
-    deletedAt: 0,
-    purgeAt: 0,
-    isDirty: true,
-    serverVersion: 0,
-    createdAt: now,
-    updatedAt: now,
-  };
-
   const folderIdMap = new Map<string, string>();
-  const importedFolders: FolderDocType[] = [rootFolder];
+  const importedFolders: FolderDocType[] = [];
   const sourceFolders = [...snapshot.folders].sort((a, b) => (a.sortOrder || 0) - (b.sortOrder || 0));
   for (const folder of sourceFolders) {
     folderIdMap.set(folder.id, crypto.randomUUID());
   }
+  let rootFolderId = "";
   for (const folder of sourceFolders) {
     const newId = folderIdMap.get(folder.id) || crypto.randomUUID();
+    const parentId = folder.parentId ? folderIdMap.get(folder.parentId) || null : null;
+    if (!rootFolderId && parentId === null) rootFolderId = newId;
     importedFolders.push({
       id: newId,
       name: normalizeTitle(folder.name, "Imported folder"),
       userId: "",
       spaceId: targetSpaceId,
-      parentId: folder.parentId ? folderIdMap.get(folder.parentId) || rootFolder.id : rootFolder.id,
+      parentId,
       type: folder.type === "tab_group" ? "tab_group" : "folder",
       sortOrder: Number.isFinite(folder.sortOrder) ? Math.max(0, Math.floor(folder.sortOrder as number)) : now,
       isLocked: false,
@@ -430,12 +428,34 @@ export async function importSharedSnapshot(
       updatedAt: now,
     });
   }
+  if (!rootFolderId) {
+    const fallbackRoot: FolderDocType = {
+      id: crypto.randomUUID(),
+      name: normalizeTitle(payload.rootFolderName, snapshot.title || "Shared import"),
+      userId: "",
+      spaceId: targetSpaceId,
+      parentId: null,
+      type: "tab_group",
+      sortOrder: now,
+      isLocked: false,
+      isPinned: false,
+      isCollapsed: false,
+      deletedAt: 0,
+      purgeAt: 0,
+      isDirty: true,
+      serverVersion: 0,
+      createdAt: now,
+      updatedAt: now,
+    };
+    importedFolders.push(fallbackRoot);
+    rootFolderId = fallbackRoot.id;
+  }
 
   const itemIdMap = new Map<string, string>();
   const importedItems = snapshot.items.map((item, index) => {
     const newId = crypto.randomUUID();
     itemIdMap.set(item.id, newId);
-    const folderId = item.folderId ? folderIdMap.get(item.folderId) || rootFolder.id : rootFolder.id;
+    const folderId = item.folderId ? folderIdMap.get(item.folderId) || rootFolderId : rootFolderId;
     return toImportedItem(item, newId, folderId, targetSpaceId, now + index);
   });
 
@@ -480,7 +500,7 @@ export async function importSharedSnapshot(
   if (importedTags.length > 0 || importedItemTags.length > 0) sendDbChange("tags");
 
   return {
-    rootFolderId: rootFolder.id,
+    rootFolderId,
     folderCount: importedFolders.length,
     itemCount: importedItems.length,
     tagCount: importedTags.length,

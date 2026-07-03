@@ -791,10 +791,17 @@ const rememberHoverSaveTarget = (tabId: number, url: string, title?: string): vo
 
 const collectContext = (info: chrome.contextMenus.OnClickData, tab?: chrome.tabs.Tab): ImportClickContext => {
   const hoverTarget = getHoverSaveTarget(tab?.id);
+  const pageUrl = normalizeHttpUrl(info.pageUrl || null);
+  const nativeLinkUrl = normalizeHttpUrl(info.linkUrl || null);
+  const hoverLinkUrl = hoverTarget?.url || null;
+  const linkUrl =
+    hoverLinkUrl && nativeLinkUrl && pageUrl && nativeLinkUrl === pageUrl && hoverLinkUrl !== pageUrl
+      ? hoverLinkUrl
+      : nativeLinkUrl || hoverLinkUrl;
   return {
-    pageUrl: normalizeHttpUrl(info.pageUrl || null),
+    pageUrl,
     frameUrl: normalizeHttpUrl(info.frameUrl || null),
-    linkUrl: normalizeHttpUrl(info.linkUrl || null) || hoverTarget?.url || null,
+    linkUrl,
     mediaUrl: normalizeHttpUrl(info.srcUrl || null),
     mediaType: info.mediaType || null,
     selectionText: normalizeSelectionText(info.selectionText || ""),
@@ -1027,16 +1034,21 @@ const extractContentFromPage = async (
           return "";
         };
         const youtubeVideoId = (): string | null => {
+          const href = clickedUrl || "";
+          const clickedWatchMatch = /[?&]v=([^&#]+)/.exec(href);
+          if (clickedWatchMatch?.[1]) return clickedWatchMatch[1];
+          const clickedShortMatch = /\/shorts\/([^/?#]+)/.exec(href);
+          if (clickedShortMatch?.[1]) return clickedShortMatch[1];
+
           const path = window.location.pathname;
           if (path.startsWith("/shorts/")) {
             return path.split("/shorts/")[1]?.split(/[?#/]/)[0] || null;
           }
           const fromSearch = new URLSearchParams(window.location.search).get("v");
           if (fromSearch) return fromSearch;
-          const href = clickedUrl || window.location.href;
-          const watchMatch = /[?&]v=([^&#]+)/.exec(href);
+          const watchMatch = /[?&]v=([^&#]+)/.exec(window.location.href);
           if (watchMatch?.[1]) return watchMatch[1];
-          const shortMatch = /\/shorts\/([^/?#]+)/.exec(href);
+          const shortMatch = /\/shorts\/([^/?#]+)/.exec(window.location.href);
           return shortMatch?.[1] || null;
         };
         const visibleScore = (el: Element): number => {
@@ -1071,7 +1083,8 @@ const extractContentFromPage = async (
 
           const videoId = youtubeVideoId();
           if (!videoId) return null;
-          const isShort = window.location.pathname.startsWith("/shorts/");
+          const clickedIsShort = /\/shorts\/[^/?#]+/.test(clickedUrl || "");
+          const isShort = clickedIsShort || (!clickedUrl && window.location.pathname.startsWith("/shorts/"));
           const canonicalUrl = isShort
             ? `https://www.youtube.com/shorts/${videoId}`
             : `https://www.youtube.com/watch?v=${videoId}`;

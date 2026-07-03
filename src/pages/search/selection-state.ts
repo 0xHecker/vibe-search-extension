@@ -6,10 +6,19 @@ type SpaceLike = {
   spaceGroupId?: string | null;
 };
 
+type SelectableItemLike = {
+  id: string;
+};
+
 export type FolderSelectionContext = {
   activeSpaceId: string;
   activeSpaceGroupId: string | null;
   selectedFolderId: string;
+};
+
+export type VisibleSelectionState = {
+  allVisibleSelected: boolean;
+  someVisibleSelected: boolean;
 };
 
 export const buildFolderLoadKey = (input: {
@@ -66,4 +75,15 @@ export const buildSearchSelectionSearch = (input: {
     params.delete("folder");
   }
   return params.toString();
+};
+
+export const getVisibleSelectionState = (
+  items: readonly SelectableItemLike[],
+  selectedIds: ReadonlySet<string>
+): VisibleSelectionState => {
+  const allVisibleSelected = items.length > 0 && items.every((item) => selectedIds.has(item.id));
+  const someVisibleSelected =
+    !allVisibleSelected && items.some((item) => selectedIds.has(item.id));
+
+  return { allVisibleSelected, someVisibleSelected };
 };

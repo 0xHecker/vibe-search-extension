@@ -48,6 +48,7 @@ import {
   showSuccessToast,
   withToast,
 } from "@src/utils/toast-feedback";
+import { getVisibleSelectionState } from "@src/pages/search/selection-state";
 
 interface BulkActionsBarProps {
   items?: ItemDocType[];
@@ -79,8 +80,7 @@ export const BulkActionsBar = ({ items = [], folders, spaces, activeSpaceId, onS
   const selectedItems = getSelectedItems();
   const selectedItemIds = Array.from(selectedIds);
   const selectedLabel = `${selectedCount} tab${selectedCount === 1 ? "" : "s"}`;
-  const allVisibleSelected = items.length > 0 && items.every((i) => selectedIds.has(i.id));
-  const someVisibleSelected = !allVisibleSelected && items.some((i) => selectedIds.has(i.id));
+  const { allVisibleSelected, someVisibleSelected } = getVisibleSelectionState(items, selectedIds);
 
   const assertResponseSuccess = (response: any, fallbackMessage: string) => {
     if (response?.success === false || response?.payload?.success === false) {

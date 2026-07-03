@@ -65,6 +65,11 @@ import {
   useDefaultSearchMode,
   useDefaultSearchScope,
 } from "@src/pages/search/search-preferences";
+import {
+  buildFolderLoadKey,
+  buildSearchSelectionSearch,
+  resolveFolderSelectionContext,
+} from "@src/pages/search/selection-state";
 import { SearchResults } from "@src/pages/search/components/SearchResults";
 import { SearchControlsBar } from "@src/pages/search/components/SearchControls";
 import { GITHUB_TOKEN_STORAGE_KEY } from "@src/pages/search/components/settings/sections/TokensSection";
@@ -368,6 +373,8 @@ const SearchInner = () => {
       return "all";
     }
   });
+  const pendingUrlFolderIdRef = useRef<string | null>(selectedFolderId !== "all" ? selectedFolderId : null);
+  const [loadedFolderKey, setLoadedFolderKey] = useState<string | null>(null);
   const [resultMeta, setResultMeta] = useState<{
     total: number;
     totalIsExact: boolean;
@@ -403,6 +410,7 @@ const SearchInner = () => {
   const [retryingProcessId, setRetryingProcessId] = useState<string | null>(null);
 
   const requestIdRef = useRef(0);
+  const folderLoadRequestRef = useRef(0);
   const refreshTimerRef = useRef<number | null>(null);
   const createSpaceGroupIdRef = useRef<string | null | undefined>(undefined);
   const tagReloadTimerRef = useRef<number | null>(null);
@@ -550,6 +558,16 @@ const SearchInner = () => {
   // Browsing (no query) shows the space you're standing in; searching resolves
   // the scope (Everywhere by default) and ignores sidebar boundaries.
   const requestedScope: QueryScope = hasActiveQuery ? effectiveScope : "current";
+  const currentFolderLoadKey = useMemo(
+    () =>
+      buildFolderLoadKey({
+        activeSpaceId,
+        searchScope: activeSpaceGroupId ? "global" : requestedScope,
+        spaceIds: activeSpaceGroupId ? activeSpaceGroupSpaceIds : undefined,
+      }),
+    [activeSpaceGroupId, activeSpaceGroupSpaceIds, activeSpaceId, requestedScope]
+  );
+  const hasLoadedCurrentFolders = loadedFolderKey === currentFolderLoadKey;
   const requestedScopeLabel = useMemo(() => {
     switch (effectiveScope) {
       case "current":
@@ -813,10 +831,33 @@ const SearchInner = () => {
 
   useEffect(() => {
     if (selectedFolderId === "all") return;
-    if (!activeSpaceFolders.some((folder) => folder.id === selectedFolderId)) {
-      setSelectedFolderId("all");
+    const selectedFolder = folders.find((folder) => folder.id === selectedFolderId);
+    if (selectedFolder) {
+      pendingUrlFolderIdRef.current = null;
+      const selectedSpaceId = selectedFolder.spaceId || PUBLIC_SPACE_ID;
+      const isInActiveContext = activeSpaceGroupId
+        ? activeSpaceGroupSpaceIds.includes(selectedSpaceId)
+        : activeSpaceId === selectedSpaceId;
+      if (!isInActiveContext && spaces.some((space) => space.id === selectedSpaceId)) {
+        setActiveSpaceId(selectedSpaceId);
+        setActiveSpaceGroupId(null);
+      }
+      return;
     }
-  }, [activeSpaceFolders, selectedFolderId]);
+    if (!hasLoadedCurrentFolders) return;
+    if (activeSpaceId === PRIVATE_SPACE_ID && (!privateSpace || !privateSpace.access.isUnlocked)) return;
+    pendingUrlFolderIdRef.current = null;
+    setSelectedFolderId("all");
+  }, [
+    activeSpaceGroupId,
+    activeSpaceGroupSpaceIds,
+    activeSpaceId,
+    folders,
+    hasLoadedCurrentFolders,
+    privateSpace,
+    selectedFolderId,
+    spaces,
+  ]);
 
   useEffect(() => {
     setCursorAfter(null);
@@ -914,6 +955,13 @@ const SearchInner = () => {
   }) => {
     const contextActiveSpaceId = context?.activeSpaceId ?? activeSpaceId;
     const contextSearchScope = context?.searchScope ?? requestedScope;
+    const resolvedSearchScope = context?.spaceIds?.length ? "global" : contextSearchScope;
+    const loadKey = buildFolderLoadKey({
+      activeSpaceId: contextActiveSpaceId,
+      searchScope: resolvedSearchScope,
+      spaceIds: context?.spaceIds,
+    });
+    const requestId = ++folderLoadRequestRef.current;
     try {
       const foldersResponse = await chrome.runtime.sendMessage({
         service: "dbManager",
@@ -922,23 +970,25 @@ const SearchInner = () => {
         payload: {
           accessContext: {
             activeSpaceId: contextActiveSpaceId,
-            searchScope: context?.spaceIds?.length ? "global" : contextSearchScope,
+            searchScope: resolvedSearchScope,
           },
           spaceIds: context?.spaceIds,
         },
       });
 
       if (foldersResponse?.success) {
+        if (requestId !== folderLoadRequestRef.current) return;
         const next = sortFolders((foldersResponse.payload as FolderDocType[]) || []).map((folder) => ({
           ...folder,
           spaceId: folder.spaceId || PUBLIC_SPACE_ID,
         }));
         setFolders(next);
+        setLoadedFolderKey(loadKey);
       }
     } catch (loadError) {
       console.error("Failed to load folders:", loadError);
     }
-  }, [activeSpaceId, requestedScope]);
+  }, [activeSpaceId, isPrivateUnlocked, requestedScope]);
 
   const loadTags = useCallback(async () => {
     try {
@@ -963,7 +1013,7 @@ const SearchInner = () => {
     } catch (loadError) {
       console.error("Failed to load tags:", loadError);
     }
-  }, [activeSpaceId, requestedScope]);
+  }, [activeSpaceId, isPrivateUnlocked, requestedScope]);
 
   const scheduleTagReload = useCallback(() => {
     if (tagReloadTimerRef.current !== null) {
@@ -1056,6 +1106,8 @@ const SearchInner = () => {
   const handleSelectSpace = useCallback(
     async (space: SpaceListItem) => {
       if (space.isPrivate && !space.access.isUnlocked) {
+        setActiveSpaceGroupId(null);
+        setSelectedFolderId("all");
         setUnlockDialogMode(space.access.requiresPassword ? "setup" : "unlock");
         resetUnlockDialogState();
         setUnlockDialogOpen(true);
@@ -1233,10 +1285,15 @@ const SearchInner = () => {
       }
 
       await loadSpaces();
+      const shouldPreservePrivateFolder =
+        activeSpaceId === PRIVATE_SPACE_ID && selectedFolderId !== "all";
       setActiveSpaceId(PRIVATE_SPACE_ID);
-      setSelectedFolderId("all");
+      if (!shouldPreservePrivateFolder) {
+        setSelectedFolderId("all");
+      }
       setUnlockDialogOpen(false);
       resetUnlockDialogState();
+      setRefreshToken((value) => value + 1);
       upsertProcessStatus({
         id: "private-space",
         label: "Private space",
@@ -1274,6 +1331,8 @@ const SearchInner = () => {
     unlockAnswer2,
     unlockPassword,
     unlockConfirmPassword,
+    activeSpaceId,
+    selectedFolderId,
     upsertProcessStatus,
   ]);
 
@@ -1527,13 +1586,16 @@ const SearchInner = () => {
       const rows = await loadSpaces();
       const privateRow = rows.find((space) => space.id === PRIVATE_SPACE_ID);
       if (activeSpaceId === PRIVATE_SPACE_ID && privateRow && !privateRow.access.isUnlocked) {
-        setActiveSpaceId(PUBLIC_SPACE_ID);
-        setSelectedFolderId("all");
+        if (!unlockDialogOpen) {
+          setUnlockDialogMode(privateRow.access.requiresPassword ? "setup" : "unlock");
+          resetUnlockDialogState();
+          setUnlockDialogOpen(true);
+        }
         upsertProcessStatus({
           id: "private-space",
           label: "Private space",
           state: "success",
-          detail: "Private space auto-locked after inactivity.",
+          detail: "Private space is locked. Unlock it to keep browsing this private folder.",
           updatedAt: Date.now(),
         });
       }
@@ -1550,7 +1612,7 @@ const SearchInner = () => {
         accessPollTimerRef.current = null;
       }
     };
-  }, [activeSpaceId, loadSpaces, upsertProcessStatus]);
+  }, [activeSpaceId, loadSpaces, resetUnlockDialogState, unlockDialogOpen, upsertProcessStatus]);
 
   const scheduleQueryRefresh = useCallback(
     (priority: "high" | "low" = "high") => {
@@ -1590,15 +1652,6 @@ const SearchInner = () => {
     }
     scheduleQueryRefresh("high");
   }, [activeSpaceId, scheduleQueryRefresh]);
-
-  // Keep ?space= query param in sync so reload stays in the same space.
-  useEffect(() => {
-    try {
-      const url = new URL(window.location.href);
-      url.searchParams.set("space", activeSpaceId);
-      window.history.replaceState(window.history.state, "", url.toString());
-    } catch {}
-  }, [activeSpaceId]);
 
   useEffect(() => {
     visibleItemIdsRef.current = new Set(items.map((item) => item.id));
@@ -1657,14 +1710,12 @@ const SearchInner = () => {
   // same place. replaceState avoids polluting history or triggering navigation.
   useEffect(() => {
     try {
-      const params = new URLSearchParams(window.location.search);
-      if (activeSpaceId && activeSpaceId !== PUBLIC_SPACE_ID) params.set("space", activeSpaceId);
-      else params.delete("space");
-      if (activeSpaceGroupId) params.set("group", activeSpaceGroupId);
-      else params.delete("group");
-      if (selectedFolderId && selectedFolderId !== "all") params.set("folder", selectedFolderId);
-      else params.delete("folder");
-      const qs = params.toString();
+      const qs = buildSearchSelectionSearch({
+        currentSearch: window.location.search,
+        activeSpaceId,
+        activeSpaceGroupId,
+        selectedFolderId,
+      });
       window.history.replaceState(
         window.history.state,
         "",
@@ -2314,7 +2365,7 @@ const SearchInner = () => {
       searchScope: activeSpaceGroupId ? "global" : requestedScope,
       spaceIds: activeSpaceGroupId ? activeSpaceGroupSpaceIds : undefined,
     });
-  }, [activeSpaceGroupId, activeSpaceGroupSpaceIds, activeSpaceId, loadFolders, requestedScope]);
+  }, [activeSpaceGroupId, activeSpaceGroupSpaceIds, activeSpaceId, isPrivateUnlocked, loadFolders, requestedScope]);
 
   useEffect(() => {
     loadTags();
@@ -2551,6 +2602,14 @@ const SearchInner = () => {
       // same trigger the space / space-group handlers use. Without this the
       // folder shows whatever was already loaded — often nothing — until a
       // full page reload re-runs the query.
+      pendingUrlFolderIdRef.current = null;
+      if (folderId !== "all") {
+        const context = resolveFolderSelectionContext(folderId, folders, spaces);
+        if (context) {
+          setActiveSpaceId(context.activeSpaceId);
+          setActiveSpaceGroupId(null);
+        }
+      }
       setSelectedFolderId(folderId);
       setRefreshToken((value) => value + 1);
     },
@@ -3055,6 +3114,7 @@ const SearchInner = () => {
     activeSpaceGroupId,
     activeSpaceGroupSpaceIds,
     activeSpaceId,
+    folders,
     handleSelectSpace,
     handleSelectSpaceGroup,
     loadBinContents,
@@ -3066,6 +3126,7 @@ const SearchInner = () => {
     requestedScope,
     resetUnlockDialogState,
     sendMessageWithTimeout,
+    spaces,
     setBrowserBookmarksDialogOpen,
     setBrowserBookmarksError,
     setChangePasswordConfirm,

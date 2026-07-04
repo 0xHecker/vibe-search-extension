@@ -279,6 +279,7 @@ router.registerService("items", itemsController, {
     "queryLocal",
     "addToFolder",
     "addMany",
+    "getPendingMetadataUrls",
     "refetchMetadata",
     "moveToSpace",
     "copyToSpace",

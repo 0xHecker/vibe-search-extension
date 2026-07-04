@@ -25,6 +25,7 @@ import { appendOcrTextToTextContent } from "@src/services/ocr-text";
 import { isYouTubeShortsUrl } from "@src/utils/media-embed";
 import { vectorStoreService } from "@src/services/vector-store.service";
 import { localSearchIndexService } from "@src/services/local-search-index.service";
+import { hasVectorReference } from "@src/search-core/embedding-state";
 import { appendUnorderedIds } from "@src/utils/ordered-ids";
 import { isMetadataFetchableUrl } from "@src/utils/metadata-url";
 import {
@@ -888,6 +889,7 @@ export class ItemsController {
         const meta = metaMap[fresh.get("url") as string];
         const current = fresh.toMutableJSON() as ItemDocType;
         const forceRefresh = shouldForceRefreshItem(current.url);
+        const wasMetadataPending = current.isMetaFetched !== true;
 
         const patchData: Partial<ItemDocType> = {};
         if (!meta) {
@@ -946,6 +948,17 @@ export class ItemsController {
           patchData.isMetaFetched = true;
         }
 
+        if (wasMetadataPending && current.isEmbedded) {
+          if (hasVectorReference(current)) {
+            patchData.isDirty = true;
+          } else {
+            patchData.vector_index = -1;
+            patchData.vector_indexes = [];
+            patchData.isEmbedded = false;
+            patchData.isDirty = false;
+          }
+        }
+
         try {
           await fresh.patch(patchData);
           break;
@@ -962,6 +975,22 @@ export class ItemsController {
     this.triggerBackgroundProcessing("TRIGGER_EMBEDDING");
 
     return { updated: itemsToUpdate.length };
+  }
+
+  async getPendingMetadataUrls(payload?: { limit?: number }): Promise<{ urls: string[] }> {
+    const db = await getDb();
+    const limit = Math.max(1, Math.min(1000, Math.floor(Number(payload?.limit) || 500)));
+    const docs = await db.items
+      .find({ selector: { isMetaFetched: false, deletedAt: { $eq: 0 } }, limit })
+      .exec();
+    const urls = Array.from(
+      new Set(
+        docs
+          .map((doc) => (doc.get("url") as string | undefined) || "")
+          .filter((url) => isMetadataFetchableUrl(url))
+      )
+    );
+    return { urls };
   }
 
   private normalizeUrl(input: string): string | null {

@@ -113,6 +113,10 @@ type ProcessStatusItem = {
   updatedAt: number;
 };
 
+const PROCESS_STATUS_SUCCESS_TTL_MS = 15 * 60 * 1000;
+const PROCESS_STATUS_PROCESSING_TTL_MS = 45 * 60 * 1000;
+const PROCESS_STATUS_PRUNE_INTERVAL_MS = 60 * 1000;
+
 const SOURCE_OPTIONS: ItemDocType["source"][] = [
   "web",
   "twitter",
@@ -188,10 +192,17 @@ const normalizeProcessStatusPayload = (payload: unknown): ProcessStatusItem | nu
     updatedAt: typeof row.updatedAt === "number" && Number.isFinite(row.updatedAt) ? row.updatedAt : Date.now(),
   };
 };
+const isProcessStatusFresh = (row: ProcessStatusItem, now = Date.now()): boolean => {
+  if (row.state === "success") return now - row.updatedAt <= PROCESS_STATUS_SUCCESS_TTL_MS;
+  if (row.state === "processing") return now - row.updatedAt <= PROCESS_STATUS_PROCESSING_TTL_MS;
+  return true;
+};
 const upsertProcessStatusList = (list: ProcessStatusItem[], next: ProcessStatusItem, max = 8): ProcessStatusItem[] => {
   const map = new Map<string, ProcessStatusItem>(list.map((entry) => [entry.id, entry]));
   map.set(next.id, next);
+  const now = Date.now();
   return [...map.values()]
+    .filter((entry) => isProcessStatusFresh(entry, now))
     .sort((a, b) => b.updatedAt - a.updatedAt)
     .slice(0, max);
 };
@@ -265,6 +276,7 @@ const useProcessStatusFeed = (call: <T>(type: string, payload?: unknown) => Prom
           ? rows
               .map((row) => normalizeProcessStatusPayload(row))
               .filter((row): row is ProcessStatusItem => !!row)
+              .filter((row) => isProcessStatusFresh(row))
               .slice(0, 8)
           : [];
         setStatuses(normalized);
@@ -280,8 +292,12 @@ const useProcessStatusFeed = (call: <T>(type: string, payload?: unknown) => Prom
       setStatuses((current) => upsertProcessStatusList(current, normalized, 8));
     };
     chrome.runtime.onMessage.addListener(listener);
+    const pruneTimer = window.setInterval(() => {
+      setStatuses((current) => current.filter((row) => isProcessStatusFresh(row)));
+    }, PROCESS_STATUS_PRUNE_INTERVAL_MS);
     return () => {
       active = false;
+      window.clearInterval(pruneTimer);
       chrome.runtime.onMessage.removeListener(listener);
     };
   }, [call]);

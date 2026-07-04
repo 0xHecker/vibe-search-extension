@@ -108,6 +108,8 @@ const SHARE_URL_HOSTS = new Set([
 
 const LOCAL_IMPORT_HOST = "local.vibesearch.invalid";
 const PROCESS_STATUS_HISTORY_MAX = 120;
+const PROCESS_STATUS_SUCCESS_TTL_MS = 15 * 60 * 1000;
+const PROCESS_STATUS_PROCESSING_TTL_MS = 45 * 60 * 1000;
 
 type OffscreenResponse<T> = { success?: boolean; payload?: T; error?: string };
 type ImportMode = "save" | "shot" | "extract";
@@ -391,6 +393,8 @@ const resolveMediaType = (
   return null;
 };
 
+const recentProcessStatuses = new Map<string, ProcessStatusRecord>();
+
 const sendProcessStatus = (
   id: string,
   label: string,
@@ -407,6 +411,7 @@ const sendProcessStatus = (
     updatedAt: Date.now(),
   };
   recentProcessStatuses.set(id, payload);
+  pruneRecentProcessStatuses();
   if (recentProcessStatuses.size > PROCESS_STATUS_HISTORY_MAX) {
     const trim = [...recentProcessStatuses.values()]
       .sort((a, b) => b.updatedAt - a.updatedAt)
@@ -421,10 +426,23 @@ const sendProcessStatus = (
     });
   } catch {}
 };
-const listRecentProcessStatuses = (max = 24): ProcessStatusRecord[] =>
-  [...recentProcessStatuses.values()]
+const isProcessStatusFresh = (row: ProcessStatusRecord, now = Date.now()): boolean => {
+  if (row.state === "success") return now - row.updatedAt <= PROCESS_STATUS_SUCCESS_TTL_MS;
+  if (row.state === "processing") return now - row.updatedAt <= PROCESS_STATUS_PROCESSING_TTL_MS;
+  return true;
+};
+const pruneRecentProcessStatuses = () => {
+  const now = Date.now();
+  for (const [id, row] of recentProcessStatuses.entries()) {
+    if (!isProcessStatusFresh(row, now)) recentProcessStatuses.delete(id);
+  }
+};
+const listRecentProcessStatuses = (max = 24): ProcessStatusRecord[] => {
+  pruneRecentProcessStatuses();
+  return [...recentProcessStatuses.values()]
     .sort((a, b) => b.updatedAt - a.updatedAt)
     .slice(0, Math.max(1, Math.min(200, max)));
+};
 
 // Publish a live "Metadata" row so a bulk import shows exactly how much
 // enrichment is left. The pipeline already paces and retries requests; this
@@ -590,7 +608,6 @@ const toTabSnapshot = (tab?: chrome.tabs.Tab): TabSnapshot | undefined => {
 };
 
 const failedImportAttempts = new Map<string, FailedImportAttempt>();
-const recentProcessStatuses = new Map<string, ProcessStatusRecord>();
 const rememberFailedImportAttempt = (statusId: string, attempt: FailedImportAttempt) => {
   failedImportAttempts.set(statusId, attempt);
   const entries = [...failedImportAttempts.entries()].sort(
@@ -629,6 +646,27 @@ const sendForwardedToOffscreen = async <T = unknown>(request: {
   })) as OffscreenResponse<T>;
   if (!response?.success) throw new Error(response?.error || `${request.service}.${request.type} failed`);
   return response.payload as T;
+};
+
+const retryPendingLocalMetadataUrls = async (): Promise<number> => {
+  const result = await sendForwardedToOffscreen<{ urls?: string[] }>({
+    service: "items",
+    type: "getPendingMetadataUrls",
+    payload: { limit: 500 },
+  });
+  const urls = Array.isArray(result?.urls)
+    ? result.urls.filter((url) => typeof url === "string" && isMetadataFetchableUrl(url))
+    : [];
+  if (urls.length === 0) return 0;
+
+  sendProcessStatus(
+    "metadata-queue",
+    "Metadata",
+    "processing",
+    `Retrying metadata for ${urls.length.toLocaleString()} pending links...`
+  );
+  scheduleForProcessing(urls, false);
+  return urls.length;
 };
 
 let browserBookmarkImportInFlight: Promise<BrowserBookmarkImportResult> | null = null;
@@ -3623,6 +3661,7 @@ chrome.runtime.onInstalled.addListener(() => {
   chrome.alarms.create(EMBEDDING_ALARM_NAME, { periodInMinutes: 5 });
   chrome.alarms.create(METADATA_RETRY_ALARM_NAME, { periodInMinutes: 30 });
   void retryStoredFailedMetadataUrls().catch(() => {});
+  void retryPendingLocalMetadataUrls().catch(() => {});
   scheduleContextMenuRefresh("high");
 });
 
@@ -3635,6 +3674,7 @@ chrome.runtime.onStartup.addListener(() => {
       isForwarded: true,
     });
     await retryStoredFailedMetadataUrls();
+    await retryPendingLocalMetadataUrls();
   })().catch(() => {});
   scheduleContextMenuRefresh("high");
 });
@@ -3657,6 +3697,7 @@ chrome.alarms.onAlarm.addListener((alarm) => {
       });
     } else if (alarm.name === METADATA_RETRY_ALARM_NAME) {
       await retryStoredFailedMetadataUrls();
+      await retryPendingLocalMetadataUrls();
     } else if (alarm.name === "opfs-promote-alarm") {
       triggerOpfsPromotion();
     }

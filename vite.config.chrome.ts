@@ -17,6 +17,8 @@ const manifest: ManifestV3Export = {
 
 if (isDev) {
   manifest.name = "Vibesearch (Dev)";
+} else {
+  delete (manifest as any).key;
 }
 
 const chromeConfig = defineConfig({

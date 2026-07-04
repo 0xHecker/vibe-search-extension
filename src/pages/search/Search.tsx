@@ -107,6 +107,8 @@ const SPACE_ACTIVITY_TOUCH_THROTTLE_MS = 12_000;
 const SPACE_ACCESS_POLL_MS = 20_000;
 const PROCESS_STATUS_MAX_ENTRIES = 80;
 const PROCESS_STATUS_SUCCESS_TTL_MS = 15 * 60 * 1000;
+const PROCESS_STATUS_PROCESSING_TTL_MS = 45 * 60 * 1000;
+const PROCESS_STATUS_PRUNE_INTERVAL_MS = 60 * 1000;
 const QUERY_REQUEST_TIMEOUT_MS = 20_000;
 const VECTOR_QUERY_MIN_CHARS = 3;
 /** Flat search shows up to this many per page; crossing it reveals the pager. */
@@ -114,6 +116,12 @@ const SEARCH_PAGE_SIZE = 100;
 const SEARCH_DEBUG_STORAGE_KEY = "vibe.search.debug";
 const SEARCH_DEBUG_QUERY_PARAM = "debugSearch";
 const DEFAULT_QUERY_LIMIT = MAX_GRID_QUERY_LIMIT;
+
+const isProcessStatusFresh = (row: SearchProcessStatusItem, now = Date.now()): boolean => {
+  if (row.state === "success") return now - row.updatedAt <= PROCESS_STATUS_SUCCESS_TTL_MS;
+  if (row.state === "processing") return now - row.updatedAt <= PROCESS_STATUS_PROCESSING_TTL_MS;
+  return true;
+};
 
 type SpaceListItem = Pick<
   SpaceDocType,
@@ -466,14 +474,26 @@ const SearchInner = () => {
       };
       const now = Date.now();
       const entries = Object.values(next)
-        .filter(
-          (row) => row.state !== "success" || now - row.updatedAt <= PROCESS_STATUS_SUCCESS_TTL_MS
-        )
+        .filter((row) => isProcessStatusFresh(row, now))
         .sort((a, b) => b.updatedAt - a.updatedAt)
         .slice(0, PROCESS_STATUS_MAX_ENTRIES);
       return Object.fromEntries(entries.map((row) => [row.id, row]));
     });
   }, []);
+
+  const pruneProcessStatuses = useCallback(() => {
+    setProcessStatusById((prev) => {
+      const now = Date.now();
+      const entries = Object.values(prev).filter((row) => isProcessStatusFresh(row, now));
+      if (entries.length === Object.keys(prev).length) return prev;
+      return Object.fromEntries(entries.map((row) => [row.id, row]));
+    });
+  }, []);
+
+  useEffect(() => {
+    const timer = window.setInterval(pruneProcessStatuses, PROCESS_STATUS_PRUNE_INTERVAL_MS);
+    return () => window.clearInterval(timer);
+  }, [pruneProcessStatuses]);
 
   const clearProcessStatus = useCallback((statusId: string) => {
     setProcessStatusById((prev) => {

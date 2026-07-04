@@ -1241,7 +1241,7 @@ export const Sidebar = React.memo(function Sidebar({
 
   return (
     <SidePanel className="rounded-xl shadow-sm shadow-foreground-muted/60">
-      <div className="flex h-full w-full flex-col gap-2 overflow-y-auto p-2 scrollbar-subtle">
+      <div className="flex h-full w-full flex-col gap-2 overflow-y-auto overflow-x-hidden p-2 scrollbar-subtle">
         <div className="flex items-center gap-2">{addMenu}</div>
 
         <div className="px-1 pt-1 text-[10px] font-semibold uppercase tracking-[0.08em] text-foreground-tertiary">

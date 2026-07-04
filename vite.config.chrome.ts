@@ -17,15 +17,6 @@ const manifest: ManifestV3Export = {
 
 if (isDev) {
   manifest.name = "Vibesearch (Dev)";
-  manifest.action = {
-    ...manifest.action,
-    default_icon: {
-      "32": "public/dev-icon-32.png",
-    },
-  };
-  manifest.icons = {
-    "128": "public/dev-icon-128.png",
-  };
 }
 
 const chromeConfig = defineConfig({

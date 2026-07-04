@@ -3234,7 +3234,7 @@ const SearchInner = () => {
         onClick={() => setSettingsOpen(true)}
         aria-label="Open settings"
         title="Settings"
-        className="group fixed bottom-5 left-5 z-40 grid size-10 place-items-center rounded-full border border-border-neutral-faded bg-background-neutral text-foreground-secondary shadow-lg shadow-black/10 backdrop-blur transition-[transform,color,box-shadow] duration-150 hover:text-foreground-neutral focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-border-neutral/80 focus-visible:ring-offset-1"
+        className="group fixed bottom-5 left-5 z-40 grid size-10 place-items-center rounded-full border border-border-neutral-faded bg-background-neutral text-foreground-secondary shadow-lg shadow-black/10 backdrop-blur transition-[transform,color,box-shadow] duration-150 hover:text-foreground-neutral focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-border-neutral/80 focus-visible:ring-offset-1 cursor-pointer"
       >
         <Settings className="size-[18px] transition-transform duration-300 group-hover:rotate-45" />
       </button>
